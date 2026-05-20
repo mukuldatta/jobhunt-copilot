@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import tempfile
@@ -176,28 +176,33 @@ async def get_dashboard_stats():
 # --- Manual triggers ---
 
 @app.post("/scrape/trigger")
-async def trigger_scrape(body: ScrapeRequest = ScrapeRequest()):
+async def trigger_scrape(background_tasks: BackgroundTasks, body: ScrapeRequest = ScrapeRequest()):
     agent = ScraperAgent()
     agent.max_jobs_per_source = min(body.max_jobs, 100)
-    jobs = await agent.scrape_all()
-    return {"message": f"Scrape complete", "scraped": len(jobs)}
+    background_tasks.add_task(agent.scrape_all)
+    return {"message": "Scrape started in background. Refresh jobs in a few minutes."}
 
 
 @app.post("/score/trigger")
-async def trigger_scoring():
+async def trigger_scoring(background_tasks: BackgroundTasks):
     from db.mongodb import get_unscored_jobs, update_job as _update_job
-    agent = ScorerAgent()
-    unscored = await get_unscored_jobs()
-    scored = 0
-    for job in unscored:
-        try:
-            result = await agent.score(job)
-            await _update_job(job["job_id"], {
-                "match_score": result["match_score"],
-                "score_breakdown": result["score_breakdown"],
-                "gap_analysis": result["gap_analysis"],
-            })
-            scored += 1
-        except Exception as e:
-            print(f"Score error: {e}")
-    return {"message": f"Scoring complete", "scored": scored}
+
+    async def _run_scoring():
+        agent = ScorerAgent()
+        unscored = await get_unscored_jobs()
+        scored = 0
+        for job in unscored:
+            try:
+                result = await agent.score(job)
+                await _update_job(job["job_id"], {
+                    "match_score": result["match_score"],
+                    "score_breakdown": result["score_breakdown"],
+                    "gap_analysis": result["gap_analysis"],
+                })
+                scored += 1
+            except Exception as e:
+                print(f"Score error: {e}")
+        print(f"Background scoring complete: {scored} jobs scored")
+
+    background_tasks.add_task(_run_scoring)
+    return {"message": "Scoring started in background. Refresh jobs in a few minutes."}

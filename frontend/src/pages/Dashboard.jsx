@@ -19,8 +19,11 @@ export default function Dashboard() {
     setScraping(true)
     try {
       await triggerScrape({ max_jobs: 50 })
-      const r = await getStats()
-      setStats(r.data)
+      // Scraping runs in background — poll stats after 3 minutes
+      setTimeout(async () => {
+        const r = await getStats()
+        setStats(r.data)
+      }, 180000)
     } catch (e) {
       console.error(e)
     } finally {
@@ -32,8 +35,11 @@ export default function Dashboard() {
     setScoring(true)
     try {
       await triggerScoring()
-      const r = await getStats()
-      setStats(r.data)
+      // Scoring runs in background — poll stats after 30 seconds
+      setTimeout(async () => {
+        const r = await getStats()
+        setStats(r.data)
+      }, 30000)
     } catch (e) {
       console.error(e)
     } finally {
@@ -68,7 +74,7 @@ export default function Dashboard() {
         <div className="flex gap-2">
           <button onClick={handleScrape} disabled={scraping}
             className="px-4 py-2 bg-accent text-bg text-sm font-medium rounded hover:bg-accent/90 disabled:opacity-50 transition-colors">
-            {scraping ? 'Scraping...' : 'Scrape Now'}
+            {scraping ? 'Starting...' : 'Scrape Now'}
           </button>
           <button onClick={handleScore} disabled={scoring}
             className="px-4 py-2 bg-border text-textPrimary text-sm font-medium rounded hover:bg-border/80 disabled:opacity-50 transition-colors">
