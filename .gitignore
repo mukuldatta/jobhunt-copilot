@@ -30,3 +30,4 @@ Thumbs.db
 # Playwright browsers (downloaded at build time by Docker)
 /ms-playwright/
 .claude/
+CLAUDE.md
