@@ -183,50 +183,6 @@ async def trigger_scrape(body: ScrapeRequest = ScrapeRequest()):
     return {"message": f"Scrape complete", "scraped": len(jobs)}
 
 
-@app.get("/scrape/debug")
-async def debug_scrape():
-    """Test each scraping source with a single query and return raw counts."""
-    import httpx as _httpx
-    from bs4 import BeautifulSoup as _BS
-    results = {}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    async with _httpx.AsyncClient(headers=headers, timeout=20, follow_redirects=True) as client:
-        # Naukri
-        try:
-            resp = await client.get(
-                "https://www.naukri.com/jobapi/v3/search?noOfResults=5&urlType=search_by_keyword&searchType=adv&keyword=Software%20Engineer&location=Hyderabad&pageNo=1",
-                headers={**headers, "appid": "109", "systemid": "109", "Referer": "https://www.naukri.com/"},
-            )
-            data = resp.json() if resp.status_code == 200 else {}
-            results["naukri"] = {"status": resp.status_code, "job_count": len(data.get("jobDetails", [])), "total": data.get("noOfJobsRecommended", 0)}
-        except Exception as e:
-            results["naukri"] = {"error": str(e)}
-
-        # Indeed RSS
-        try:
-            resp = await client.get("https://www.indeed.com/rss?q=Software+Engineer&l=Remote&sort=date&fromage=3")
-            soup = _BS(resp.text, "xml")
-            results["indeed"] = {"status": resp.status_code, "item_count": len(soup.find_all("item"))}
-        except Exception as e:
-            results["indeed"] = {"error": str(e)}
-
-        # Dice
-        try:
-            resp = await client.get(
-                "https://job-search-api.svc.dhigroupinc.com/v1/dice/jobs/search?q=Software%20Engineer&countryCode2=US&page=1&pageSize=5&filters.postedDate=THREE_DAYS&filters.workplaceTypes=Remote&language=en",
-                headers={**headers, "x-api-key": "1YAt0R9wBg4WfsF9VB2778F5CHLAPMVH3IFTtM6e"},
-            )
-            data = resp.json() if resp.status_code == 200 else {}
-            results["dice"] = {"status": resp.status_code, "job_count": len(data.get("data", [])), "total": data.get("totalCount", 0)}
-        except Exception as e:
-            results["dice"] = {"error": str(e)}
-
-    return results
-
-
 @app.post("/score/trigger")
 async def trigger_scoring():
     from db.mongodb import get_unscored_jobs, update_job as _update_job
