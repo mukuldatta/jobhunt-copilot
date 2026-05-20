@@ -14,7 +14,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium && playwright install-deps chromium
 
 COPY backend/ ./backend/
-COPY resume/ ./resume/
 
 WORKDIR /app/backend
 EXPOSE 8000
