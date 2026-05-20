@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.eggs/
+*.egg-info/
+venv/
+env/
+.venv/
+
+# Environment — never commit secrets
+.env
+.env.local
+.env.production.local
+
+# Resume PDF — upload via /resume/upload after deploy
+resume/resume.pdf
+
+# Node
+node_modules/
+frontend/dist/
+frontend/.env.local
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Playwright browsers (downloaded at build time by Docker)
+/ms-playwright/
+.claude/
