@@ -85,3 +85,32 @@ def send_sms_alert(job: dict):
         print(f"SMS alert sent for {title} @ {company}")
     except Exception as e:
         print(f"SMS alert failed: {e}")
+
+
+def send_login_failure_alert(platform: str, count: int):
+    html = f"""
+    <div style="font-family: Inter, sans-serif; background: #0F1117; color: #E0E0E0; padding: 24px; border-radius: 8px;">
+        <h2 style="color: #FF5370;">⚠️ Login Failure Alert</h2>
+        <p>Auto-apply login to <strong style="color: #FFC107;">{platform.title()}</strong> has failed
+        <strong style="color: #FF5370;">{count} consecutive times</strong>.</p>
+        <p style="color: #9E9E9E;">Auto-apply is now paused for this platform to avoid account lockout.</p>
+        <p>Please check your credentials in Railway environment variables:<br>
+        <code style="color: #4FC3F7;">{platform.upper()}_EMAIL</code> and
+        <code style="color: #4FC3F7;">{platform.upper()}_PASSWORD</code></p>
+        <div style="margin-top: 24px;">
+            <a href="https://railway.app" style="background: #4FC3F7; color: #0F1117; padding: 12px 24px; border-radius: 4px; text-decoration: none;">Open Railway Dashboard</a>
+        </div>
+    </div>
+    """
+    message = Mail(
+        from_email=os.environ.get("SENDGRID_FROM_EMAIL"),
+        to_emails=os.environ.get("MY_EMAIL"),
+        subject=f"⚠️ JobHunt Copilot: {platform.title()} login failing ({count} times)",
+        html_content=html,
+    )
+    try:
+        sg = SendGridAPIClient(os.environ.get("SENDGRID_API_KEY"))
+        sg.send(message)
+        print(f"Login failure alert sent for {platform} (count={count})")
+    except Exception as e:
+        print(f"Login failure alert email failed: {e}")

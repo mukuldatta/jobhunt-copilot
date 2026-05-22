@@ -4,6 +4,8 @@ import tempfile
 from playwright.async_api import async_playwright
 from agents.tailor_agent import TailorAgent
 from utils.pdf_generator import generate_resume_pdf
+from services.alert_service import send_login_failure_alert
+from db.mongodb import increment_login_failure, reset_login_failures
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -77,10 +79,15 @@ class ApplyAgent:
                 await page.wait_for_load_state("networkidle", timeout=15000)
 
                 if "checkpoint" in page.url or "login" in page.url:
+                    count = await increment_login_failure("linkedin")
+                    if count >= 5:
+                        send_login_failure_alert("linkedin", count)
                     return {
                         "status": "login_failed",
-                        "message": "LinkedIn login failed. Check credentials or disable 2FA temporarily.",
+                        "message": f"LinkedIn login failed (attempt {count}). Check credentials or disable 2FA temporarily.",
                     }
+
+                await reset_login_failures("linkedin")
 
                 # Navigate to job
                 await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
@@ -213,6 +220,17 @@ class ApplyAgent:
                 await page.fill('input[placeholder*="Password"]', naukri_password)
                 await page.click('button[type="submit"]')
                 await page.wait_for_load_state("networkidle", timeout=15000)
+
+                if "nlogin" in page.url or "login" in page.url:
+                    count = await increment_login_failure("naukri")
+                    if count >= 5:
+                        send_login_failure_alert("naukri", count)
+                    return {
+                        "status": "login_failed",
+                        "message": f"Naukri login failed (attempt {count}). Check NAUKRI_EMAIL and NAUKRI_PASSWORD.",
+                    }
+
+                await reset_login_failures("naukri")
 
                 # Navigate to job
                 await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)

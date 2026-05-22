@@ -161,6 +161,35 @@ async def cache_sponsorship(company: str, status: str):
     )
 
 
+# --- Login Failure Tracking ---
+
+async def increment_login_failure(platform: str) -> int:
+    db = get_db()
+    from datetime import datetime
+    result = await db.login_failures.find_one_and_update(
+        {"platform": platform},
+        {"$inc": {"count": 1}, "$set": {"last_failed_at": datetime.utcnow()}},
+        upsert=True,
+        return_document=True,
+    )
+    return result.get("count", 1) if result else 1
+
+
+async def reset_login_failures(platform: str):
+    db = get_db()
+    await db.login_failures.update_one(
+        {"platform": platform},
+        {"$set": {"count": 0}},
+        upsert=True,
+    )
+
+
+async def get_login_failures(platform: str) -> int:
+    db = get_db()
+    doc = await db.login_failures.find_one({"platform": platform})
+    return doc.get("count", 0) if doc else 0
+
+
 # --- Stats ---
 
 async def get_stats() -> dict:
