@@ -2,12 +2,14 @@ import { useState } from 'react'
 import ScoreGauge from './ScoreGauge'
 import ResumeModal from './ResumeModal'
 import OutreachModal from './OutreachModal'
-import { markApplied } from '../api'
+import { markApplied, autoApply } from '../api'
 
 export default function JobCard({ job, onStatusChange }) {
   const [resumeOpen, setResumeOpen] = useState(false)
   const [outreachOpen, setOutreachOpen] = useState(false)
   const [applying, setApplying] = useState(false)
+  const [autoApplying, setAutoApplying] = useState(false)
+  const [autoApplyMsg, setAutoApplyMsg] = useState('')
 
   const sponsorColor = {
     strong: 'text-success',
@@ -25,6 +27,20 @@ export default function JobCard({ job, onStatusChange }) {
       console.error(e)
     } finally {
       setApplying(false)
+    }
+  }
+
+  async function handleAutoApply() {
+    setAutoApplying(true)
+    setAutoApplyMsg('Starting auto-apply...')
+    try {
+      await autoApply(job.job_id)
+      setAutoApplyMsg('Running in background — check Railway logs for result.')
+      onStatusChange?.(job.job_id, 'applied')
+    } catch (e) {
+      setAutoApplyMsg('Auto-apply failed. Try manual apply.')
+    } finally {
+      setAutoApplying(false)
     }
   }
 
@@ -68,11 +84,18 @@ export default function JobCard({ job, onStatusChange }) {
             className="text-xs px-3 py-1.5 bg-border text-textSecondary rounded hover:text-textPrimary transition-colors">
             Outreach
           </button>
+          <button onClick={handleAutoApply} disabled={autoApplying || job.status === 'applied'}
+            className="text-xs px-3 py-1.5 bg-warning/10 text-warning rounded hover:bg-warning/20 transition-colors disabled:opacity-40">
+            {autoApplying ? 'Applying...' : 'Auto Apply'}
+          </button>
           <button onClick={handleApply} disabled={applying || job.status === 'applied'}
             className="text-xs px-3 py-1.5 bg-success/10 text-success rounded hover:bg-success/20 transition-colors disabled:opacity-40">
             {job.status === 'applied' ? 'Applied' : applying ? 'Marking...' : 'Mark Applied'}
           </button>
         </div>
+        {autoApplyMsg && (
+          <p className="mt-2 text-xs text-textSecondary">{autoApplyMsg}</p>
+        )}
       </div>
 
       {resumeOpen && <ResumeModal job={job} onClose={() => setResumeOpen(false)} />}

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { tailorResume, generateCoverLetter } from '../api'
+import { tailorResume, generateCoverLetter, downloadTailoredPdf } from '../api'
 
 export default function ResumeModal({ job, onClose }) {
   const [tab, setTab] = useState('resume')
@@ -78,6 +78,13 @@ export default function ResumeModal({ job, onClose }) {
         </div>
 
         <div className="px-6 py-4 border-t border-border flex justify-end gap-2">
+          {tab === 'resume' && (
+            <button
+              onClick={() => downloadTailoredPdf(job.job_id)}
+              className="px-4 py-2 text-sm bg-success/10 text-success rounded hover:bg-success/20 transition-colors">
+              Download PDF
+            </button>
+          )}
           <button
             onClick={() => copyToClipboard(tab === 'resume' ? resumeText : coverText)}
             className="px-4 py-2 text-sm bg-accent/10 text-accent rounded hover:bg-accent/20 transition-colors">

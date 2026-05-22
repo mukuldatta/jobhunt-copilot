@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import tempfile
@@ -18,11 +19,13 @@ from models.schemas import (
     ApplicationStatusUpdate, ScrapeRequest,
 )
 from utils.resume_parser import parse_resume_pdf
+from utils.pdf_generator import generate_resume_pdf
 from agents.scraper_agent import ScraperAgent
 from agents.scorer_agent import ScorerAgent
 from agents.tailor_agent import TailorAgent
 from agents.cover_letter_agent import CoverLetterAgent
 from agents.outreach_agent import OutreachAgent
+from agents.apply_agent import ApplyAgent
 from services.scheduler import setup_scheduler, scheduler
 
 load_dotenv()
@@ -111,6 +114,45 @@ async def tailor_resume(job_id: str):
     agent = TailorAgent()
     tailored = await agent.tailor(job)
     return {"tailored_resume": tailored}
+
+
+@app.get("/jobs/{job_id}/tailor-pdf")
+async def download_tailored_pdf(job_id: str):
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    agent = TailorAgent()
+    tailored_text = await agent.tailor(job)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.close()
+    generate_resume_pdf(tailored_text, tmp.name)
+    filename = f"resume_{job.get('company', 'job').replace(' ', '_')}.pdf"
+    return FileResponse(tmp.name, media_type="application/pdf", filename=filename)
+
+
+@app.post("/jobs/{job_id}/auto-apply")
+async def auto_apply(job_id: str, background_tasks: BackgroundTasks):
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    async def _run_apply():
+        agent = ApplyAgent()
+        result = await agent.apply(job)
+        status = result.get("status")
+        print(f"AutoApply [{job_id}]: {status} — {result.get('message', '')}")
+        if status == "applied":
+            from datetime import datetime
+            await update_job(job_id, {"status": "applied"})
+            await insert_application({
+                "job_id": job_id,
+                "status": "applied",
+                "applied_at": datetime.utcnow(),
+                "notes": "Auto-applied via ApplyAgent",
+            })
+
+    background_tasks.add_task(_run_apply)
+    return {"message": "Auto-apply started in background. Check Railway logs for result."}
 
 
 @app.post("/jobs/{job_id}/cover-letter")

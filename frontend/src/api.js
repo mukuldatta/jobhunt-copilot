@@ -24,6 +24,12 @@ export const uploadResume = (file) => {
   return api.post('/resume/upload', form, { headers: { 'Content-Type': 'multipart/form-data' } })
 }
 
+export const downloadTailoredPdf = (jobId) => {
+  const base = import.meta.env.VITE_API_URL || '/api'
+  window.open(`${base}/jobs/${jobId}/tailor-pdf`, '_blank')
+}
+export const autoApply = (jobId) => api.post(`/jobs/${jobId}/auto-apply`)
+
 export const getStats = () => api.get('/stats')
 export const triggerScrape = (data) => api.post('/scrape/trigger', data)
 export const triggerScoring = () => api.post('/score/trigger')
