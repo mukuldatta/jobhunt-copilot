@@ -22,7 +22,9 @@ class ApplyAgent:
     def __init__(self):
         self.linkedin_email = os.environ.get("LINKEDIN_EMAIL", "")
         self.linkedin_password = os.environ.get("LINKEDIN_PASSWORD", "")
-        self.user_name = os.environ.get("USER_FULL_NAME", "Venkata Naga Santosh Mukul Mokkapati")
+        first = os.environ.get("USER_FIRST_NAME", "Mukul")
+        last = os.environ.get("USER_LAST_NAME", "Mokkapati")
+        self.user_name = f"{first} {last}"
         self.user_email = os.environ.get("MY_EMAIL", "mukulmokkapati@gmail.com")
         self.user_phone = os.environ.get("MY_PHONE", "")
 
