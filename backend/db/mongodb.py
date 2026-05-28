@@ -32,14 +32,39 @@ async def insert_job(job: dict) -> bool:
     return True
 
 
-async def get_jobs(skip: int = 0, limit: int = 50, min_score: int = None, status: str = None) -> list:
+async def get_jobs(
+    skip: int = 0,
+    limit: int = 50,
+    min_score: int = None,
+    status: str = None,
+    source: str = None,
+    sponsorship: str = None,
+    sort_by: str = "date_desc",
+    search: str = None,
+) -> list:
     db = get_db()
     query = {}
     if min_score is not None:
         query["match_score"] = {"$gte": min_score}
     if status:
         query["status"] = status
-    cursor = db.jobs.find(query).sort("scraped_at", -1).skip(skip).limit(limit)
+    if source:
+        query["source"] = source
+    if sponsorship:
+        query["sponsorship_status"] = sponsorship
+    if search:
+        query["$or"] = [
+            {"title": {"$regex": search, "$options": "i"}},
+            {"company": {"$regex": search, "$options": "i"}},
+        ]
+    sort_map = {
+        "date_desc": ("scraped_at", -1),
+        "date_asc": ("scraped_at", 1),
+        "score_desc": ("match_score", -1),
+        "score_asc": ("match_score", 1),
+    }
+    sort_field, sort_dir = sort_map.get(sort_by, ("scraped_at", -1))
+    cursor = db.jobs.find(query).sort(sort_field, sort_dir).skip(skip).limit(limit)
     jobs = []
     async for job in cursor:
         job["id"] = str(job.pop("_id"))
