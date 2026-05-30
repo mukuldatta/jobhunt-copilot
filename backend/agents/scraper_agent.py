@@ -157,7 +157,7 @@ class ScraperAgent:
         return jobs
 
     async def _scrape_naukri_playwright(self, browser) -> list:
-        """Fallback: intercept XHR responses from the real Naukri search page."""
+        """Fallback: load real Naukri page and extract jobs via XHR + page state + HTML."""
         jobs = []
         for query in INDIA_QUERIES:
             if len(jobs) >= self.max_jobs_per_source:
@@ -170,16 +170,21 @@ class ScraperAgent:
                 page, context = await self._new_page(browser)
 
                 async def on_response(response, _c=captured):
-                    # Match any naukri.com JSON response that might contain jobs
-                    if ("naukri.com" in response.url and response.status == 200
-                            and "jobapi" in response.url or "jobDetails" in response.url):
-                        try:
-                            data = await response.json()
-                            items = data.get("jobDetails", [])
-                            if items:
-                                _c.extend(items)
-                        except Exception:
-                            pass
+                    # Catch any successful JSON response from naukri.com
+                    if response.status == 200 and "naukri.com" in response.url:
+                        ct = response.headers.get("content-type", "")
+                        if "json" in ct:
+                            try:
+                                data = await response.json()
+                                # Handle both top-level and nested jobDetails
+                                items = (data.get("jobDetails")
+                                         or data.get("data", {}).get("jobDetails")
+                                         or [])
+                                if items:
+                                    print(f"      XHR hit: {len(items)} items from {response.url[:80]}")
+                                    _c.extend(items)
+                            except Exception:
+                                pass
 
                 page.on("response", on_response)
 
@@ -187,28 +192,105 @@ class ScraperAgent:
                     slug = query.lower().replace(" ", "-")
                     city_slug = city.lower()
                     url = f"https://www.naukri.com/{slug}-jobs-in-{city_slug}"
-                    # domcontentloaded fires fast; then wait briefly for XHR
                     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    # Give XHR calls up to 8s to fire, but don't fail if networkidle never comes
                     try:
                         await page.wait_for_load_state("networkidle", timeout=8000)
                     except Exception:
                         pass
-                    await asyncio.sleep(random.uniform(2, 3))
-                    print(f"    Naukri Playwright '{query}' {city}: {len(captured)} captured")
+                    await asyncio.sleep(random.uniform(2, 4))
 
-                    for item in captured[:20]:
-                        try:
-                            job = self._parse_naukri_item(item, city)
-                            if job and is_relevant_job(job["title"]):
-                                jobs.append(job)
-                        except Exception:
-                            continue
+                    # If XHR interception got nothing, try page-embedded state
+                    if not captured:
+                        captured = await self._extract_naukri_page_state(page)
+
+                    # If still nothing, parse rendered HTML
+                    if not captured:
+                        html = await page.content()
+                        html_jobs = self._parse_naukri_html(html, city)
+                        print(f"    Naukri HTML '{query}' {city}: {len(html_jobs)} jobs")
+                        jobs.extend(html_jobs[:20])
+                    else:
+                        print(f"    Naukri Playwright '{query}' {city}: {len(captured)} captured")
+                        for item in captured[:20]:
+                            try:
+                                job = self._parse_naukri_item(item, city)
+                                if job and is_relevant_job(job["title"]):
+                                    jobs.append(job)
+                            except Exception:
+                                continue
                 except Exception as e:
                     print(f"    Naukri Playwright error '{query}' {city}: {e}")
                 finally:
                     await context.close()
 
+        return jobs
+
+    async def _extract_naukri_page_state(self, page) -> list:
+        """Try to pull jobDetails from Naukri's embedded page state."""
+        try:
+            items = await page.evaluate("""() => {
+                // Next.js embedded data
+                const nd = window.__NEXT_DATA__;
+                if (nd) {
+                    const jobs = nd?.props?.pageProps?.jobDetails
+                        || nd?.props?.pageProps?.initialState?.jobSearch?.jobDetails
+                        || nd?.props?.pageProps?.dehydratedState?.jobDetails;
+                    if (jobs && jobs.length) return jobs;
+                }
+                // Legacy Naukri global
+                if (window.initialState?.jobDetails) return window.initialState.jobDetails;
+                if (window.__INITIAL_STATE__?.jobDetails) return window.__INITIAL_STATE__.jobDetails;
+                return [];
+            }""")
+            return items or []
+        except Exception:
+            return []
+
+    def _parse_naukri_html(self, html: str, city: str) -> list:
+        """Parse job cards from Naukri's rendered HTML."""
+        soup = BeautifulSoup(html, "lxml")
+        jobs = []
+        # Naukri job cards: article tags or divs with data-job-id
+        cards = (soup.select("article[data-job-id]")
+                 or soup.select("div[data-job-id]")
+                 or soup.select(".jobTuple")
+                 or soup.select(".cust-job-tuple"))
+        for card in cards[:25]:
+            try:
+                title_el = card.select_one("a.title, h2.title a, .title a, [class*='title'] a")
+                company_el = card.select_one("a.subTitle, .subTitle, [class*='companyInfo'] a, [class*='company']")
+                loc_el = card.select_one(".locWdth, [class*='location'], [class*='loc']")
+
+                title = title_el.get_text(strip=True) if title_el else ""
+                company = company_el.get_text(strip=True) if company_el else "Unknown"
+                location = loc_el.get_text(strip=True) if loc_el else city
+                url = title_el.get("href", "") if title_el else ""
+                if url and not url.startswith("http"):
+                    url = "https://www.naukri.com" + url
+
+                if not title or not is_relevant_job(title):
+                    continue
+
+                jobs.append({
+                    "job_id": generate_job_id(url, title, company),
+                    "title": title,
+                    "company": company,
+                    "location": f"{location}, India" if "india" not in location.lower() else location,
+                    "description": "",
+                    "url": url,
+                    "posted_at": datetime.utcnow(),
+                    "scraped_at": datetime.utcnow(),
+                    "source": "naukri",
+                    "region": "india",
+                    "sponsorship_status": "contract",
+                    "contract_type": extract_contract_type(title, ""),
+                    "match_score": None,
+                    "score_breakdown": None,
+                    "gap_analysis": [],
+                    "status": "new",
+                })
+            except Exception:
+                continue
         return jobs
 
     def _parse_naukri_item(self, item: dict, city: str) -> dict:
