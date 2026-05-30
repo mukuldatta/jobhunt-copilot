@@ -85,14 +85,80 @@ class ScraperAgent:
         await page.add_init_script(STEALTH_JS)
         return page, context
 
-    # ── NAUKRI (India Primary) — Playwright network interception ─────────────
-    # Strategy: load the real Naukri search page in a browser so it handles
-    # cookies/auth automatically, then intercept the XHR calls it makes to
-    # its internal JSON API — those responses contain structured job data.
+    # ── NAUKRI (India Primary) ───────────────────────────────────────────────
+    # Strategy 1: direct httpx call to Naukri's internal search API (fast).
+    # Strategy 2: Playwright XHR interception fallback if httpx is blocked.
 
     async def _scrape_naukri(self, browser) -> list:
         jobs = []
 
+        # Try direct API first — much faster than Playwright
+        try:
+            jobs = await self._scrape_naukri_api()
+            print(f"  Naukri API: {len(jobs)} jobs")
+            if jobs:
+                return jobs[:self.max_jobs_per_source]
+        except Exception as e:
+            print(f"  Naukri API failed ({e}), falling back to Playwright")
+
+        # Playwright XHR interception fallback
+        jobs = await self._scrape_naukri_playwright(browser)
+        return jobs[:self.max_jobs_per_source]
+
+    async def _scrape_naukri_api(self) -> list:
+        """Call Naukri's internal search API directly via httpx."""
+        naukri_headers = {
+            "appid": "109",
+            "systemid": "Naukri",
+            "Content-Type": "application/json",
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": "application/json",
+            "Referer": "https://www.naukri.com/",
+        }
+        jobs = []
+        async with httpx.AsyncClient(headers=naukri_headers, timeout=20, follow_redirects=True) as client:
+            for query in INDIA_QUERIES:
+                if len(jobs) >= self.max_jobs_per_source:
+                    break
+                for city in INDIA_LOCATIONS:
+                    if len(jobs) >= self.max_jobs_per_source:
+                        break
+                    try:
+                        params = {
+                            "noOfResults": "20",
+                            "urlType": "search_by_keyword",
+                            "searchType": "adv",
+                            "keyword": query,
+                            "location": city,
+                            "experience": "3",
+                            "k": query,
+                            "l": city,
+                        }
+                        resp = await client.get(
+                            "https://www.naukri.com/jobapi/v3/search", params=params
+                        )
+                        print(f"    Naukri API '{query}' {city}: HTTP {resp.status_code}")
+                        if resp.status_code != 200:
+                            await asyncio.sleep(random.uniform(2, 3))
+                            continue
+                        data = resp.json()
+                        items = data.get("jobDetails", [])
+                        print(f"    Naukri API '{query}' {city}: {len(items)} items")
+                        for item in items[:20]:
+                            try:
+                                job = self._parse_naukri_item(item, city)
+                                if job and is_relevant_job(job["title"]):
+                                    jobs.append(job)
+                            except Exception:
+                                continue
+                        await asyncio.sleep(random.uniform(2, 3))
+                    except Exception as e:
+                        print(f"    Naukri API error '{query}' {city}: {e}")
+        return jobs
+
+    async def _scrape_naukri_playwright(self, browser) -> list:
+        """Fallback: intercept XHR responses from the real Naukri search page."""
+        jobs = []
         for query in INDIA_QUERIES:
             if len(jobs) >= self.max_jobs_per_source:
                 break
@@ -103,11 +169,15 @@ class ScraperAgent:
                 captured = []
                 page, context = await self._new_page(browser)
 
-                async def on_response(response, _captured=captured):
-                    if "jobapi" in response.url and response.status == 200:
+                async def on_response(response, _c=captured):
+                    # Match any naukri.com JSON response that might contain jobs
+                    if ("naukri.com" in response.url and response.status == 200
+                            and "jobapi" in response.url or "jobDetails" in response.url):
                         try:
                             data = await response.json()
-                            _captured.extend(data.get("jobDetails", []))
+                            items = data.get("jobDetails", [])
+                            if items:
+                                _c.extend(items)
                         except Exception:
                             pass
 
@@ -117,9 +187,15 @@ class ScraperAgent:
                     slug = query.lower().replace(" ", "-")
                     city_slug = city.lower()
                     url = f"https://www.naukri.com/{slug}-jobs-in-{city_slug}"
-                    await page.goto(url, wait_until="networkidle", timeout=30000)
-                    await asyncio.sleep(random.uniform(2, 4))
-                    print(f"    Naukri '{query}' {city}: {len(captured)} captured")
+                    # domcontentloaded fires fast; then wait briefly for XHR
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    # Give XHR calls up to 8s to fire, but don't fail if networkidle never comes
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(random.uniform(2, 3))
+                    print(f"    Naukri Playwright '{query}' {city}: {len(captured)} captured")
 
                     for item in captured[:20]:
                         try:
@@ -129,11 +205,11 @@ class ScraperAgent:
                         except Exception:
                             continue
                 except Exception as e:
-                    print(f"    Naukri error '{query}' {city}: {e}")
+                    print(f"    Naukri Playwright error '{query}' {city}: {e}")
                 finally:
                     await context.close()
 
-        return jobs[:self.max_jobs_per_source]
+        return jobs
 
     def _parse_naukri_item(self, item: dict, city: str) -> dict:
         title = item.get("title", "").strip()
