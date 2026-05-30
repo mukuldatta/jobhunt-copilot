@@ -15,6 +15,12 @@ const STATUS_FILTERS = [
   { label: 'Skipped', value: 'skipped' },
 ]
 
+const REGION_FILTERS = [
+  { label: 'All Regions', value: null },
+  { label: '🇮🇳 India', value: 'india' },
+  { label: '🇺🇸 United States', value: 'us' },
+]
+
 const SOURCE_FILTERS = [
   { label: 'All Sources', value: null },
   { label: 'LinkedIn', value: 'linkedin' },
@@ -63,6 +69,7 @@ export default function Jobs() {
   const [loading, setLoading] = useState(true)
   const [minScore, setMinScore] = useState(null)
   const [status, setStatus] = useState(null)
+  const [region, setRegion] = useState(null)
   const [source, setSource] = useState(null)
   const [sponsorship, setSponsorship] = useState(null)
   const [sortBy, setSortBy] = useState('date_desc')
@@ -78,6 +85,7 @@ export default function Jobs() {
       limit,
       min_score: minScore,
       status,
+      region: region || undefined,
       source,
       sponsorship,
       sort_by: sortBy,
@@ -86,7 +94,7 @@ export default function Jobs() {
       .then(r => setJobs(r.data.jobs))
       .catch(console.error)
       .finally(() => setLoading(false))
-  }, [minScore, status, source, sponsorship, sortBy, search, page])
+  }, [minScore, status, region, source, sponsorship, sortBy, search, page])
 
   function handleStatusChange(jobId, newStatus) {
     setJobs(prev => prev.map(j => j.job_id === jobId ? { ...j, status: newStatus } : j))
@@ -101,6 +109,7 @@ export default function Jobs() {
   function resetFilters() {
     setMinScore(null)
     setStatus(null)
+    setRegion(null)
     setSource(null)
     setSponsorship(null)
     setSortBy('date_desc')
@@ -109,8 +118,8 @@ export default function Jobs() {
     setPage(0)
   }
 
-  const hasActiveFilters = minScore !== null || status !== null || source !== null ||
-    sponsorship !== null || sortBy !== 'date_desc' || search !== ''
+  const hasActiveFilters = minScore !== null || status !== null || region !== null ||
+    source !== null || sponsorship !== null || sortBy !== 'date_desc' || search !== ''
 
   return (
     <div>
@@ -150,6 +159,9 @@ export default function Jobs() {
 
       {/* Filters */}
       <div className="bg-card border border-border rounded-lg p-4 mb-6 flex flex-col gap-4">
+        <FilterGroup label="Region" options={REGION_FILTERS} value={region}
+          onChange={v => { setRegion(v); setPage(0) }} />
+        <div className="border-t border-border" />
         <div className="flex gap-6 flex-wrap">
           <FilterGroup label="Score" options={SCORE_FILTERS} value={minScore}
             onChange={v => { setMinScore(v); setPage(0) }} />

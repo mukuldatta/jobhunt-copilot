@@ -32,6 +32,9 @@ async def insert_job(job: dict) -> bool:
     return True
 
 
+_INDIA_CITIES = "India|Hyderabad|Bangalore|Bengaluru|Pune|Chennai|Mumbai|Delhi|Noida|Gurugram|Gurgaon"
+
+
 async def get_jobs(
     skip: int = 0,
     limit: int = 50,
@@ -41,6 +44,7 @@ async def get_jobs(
     sponsorship: str = None,
     sort_by: str = "date_desc",
     search: str = None,
+    region: str = None,
 ) -> list:
     db = get_db()
     query = {}
@@ -57,6 +61,16 @@ async def get_jobs(
             {"title": {"$regex": search, "$options": "i"}},
             {"company": {"$regex": search, "$options": "i"}},
         ]
+    if region == "india":
+        query["$and"] = query.pop("$and", []) + [{"$or": [
+            {"region": "india"},
+            {"location": {"$regex": _INDIA_CITIES, "$options": "i"}},
+        ]}]
+    elif region == "us":
+        query["$and"] = query.pop("$and", []) + [{"$or": [
+            {"region": "us"},
+            {"region": {"$exists": False}, "location": {"$not": {"$regex": _INDIA_CITIES, "$options": "i"}}},
+        ]}]
     sort_map = {
         "date_desc": ("scraped_at", -1),
         "date_asc": ("scraped_at", 1),

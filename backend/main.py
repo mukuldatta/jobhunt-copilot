@@ -97,10 +97,12 @@ async def list_jobs(
     sponsorship: str = Query(None),
     sort_by: str = Query("date_desc"),
     search: str = Query(None),
+    region: str = Query(None),
 ):
     jobs = await get_jobs(
         skip=skip, limit=limit, min_score=min_score, status=status,
         source=source, sponsorship=sponsorship, sort_by=sort_by, search=search,
+        region=region,
     )
     return {"jobs": jobs, "count": len(jobs)}
 
