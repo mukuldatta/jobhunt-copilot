@@ -47,14 +47,10 @@ class ScraperAgent:
     async def scrape_all(self) -> list:
         all_jobs = []
 
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            naukri_jobs = await self._scrape_naukri(browser)
-            all_jobs.extend(naukri_jobs)
-            print(f"  Naukri: {len(naukri_jobs)} jobs")
-            await browser.close()
+        # Naukri blocks all cloud/datacenter IPs at CDN level — skipped.
+        print("  Naukri: skipped (IP blocked by Naukri CDN on cloud hosts)")
 
-        # httpx-based sources (no browser needed)
+        # httpx-based India sources
         indeed_india = await self._scrape_indeed_india()
         all_jobs.extend(indeed_india)
         print(f"  Indeed India: {len(indeed_india)} jobs")
