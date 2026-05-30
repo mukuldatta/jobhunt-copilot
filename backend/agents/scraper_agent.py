@@ -49,14 +49,16 @@ class ScraperAgent:
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
-
             naukri_jobs = await self._scrape_naukri(browser)
             all_jobs.extend(naukri_jobs)
             print(f"  Naukri: {len(naukri_jobs)} jobs")
-
             await browser.close()
 
-        # LinkedIn guest API works without a browser
+        # httpx-based sources (no browser needed)
+        indeed_india = await self._scrape_indeed_india()
+        all_jobs.extend(indeed_india)
+        print(f"  Indeed India: {len(indeed_india)} jobs")
+
         linkedin_india = await self._scrape_linkedin_guest(region="india")
         all_jobs.extend(linkedin_india)
         print(f"  LinkedIn India: {len(linkedin_india)} jobs")
@@ -106,54 +108,78 @@ class ScraperAgent:
         return jobs[:self.max_jobs_per_source]
 
     async def _scrape_naukri_api(self) -> list:
-        """Call Naukri's internal search API directly via httpx."""
-        naukri_headers = {
-            "appid": "109",
-            "systemid": "Naukri",
-            "Content-Type": "application/json",
-            "User-Agent": HEADERS["User-Agent"],
-            "Accept": "application/json",
-            "Referer": "https://www.naukri.com/",
-        }
+        """
+        Load Naukri in Playwright to get valid Akamai session cookies, then
+        call the internal search API via page.evaluate() (same-origin fetch —
+        cookies included automatically, no CORS issues).
+        """
         jobs = []
-        async with httpx.AsyncClient(headers=naukri_headers, timeout=20, follow_redirects=True) as client:
-            for query in INDIA_QUERIES:
-                if len(jobs) >= self.max_jobs_per_source:
-                    break
-                for city in INDIA_LOCATIONS:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            page, context = await self._new_page(browser)
+            try:
+                # Seed cookies by loading the homepage
+                await page.goto("https://www.naukri.com", wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+                for query in INDIA_QUERIES:
                     if len(jobs) >= self.max_jobs_per_source:
                         break
-                    try:
-                        params = {
-                            "noOfResults": "20",
-                            "urlType": "search_by_keyword",
-                            "searchType": "adv",
-                            "keyword": query,
-                            "location": city,
-                            "experience": "3",
-                            "k": query,
-                            "l": city,
-                        }
-                        resp = await client.get(
-                            "https://www.naukri.com/jobapi/v3/search", params=params
-                        )
-                        print(f"    Naukri API '{query}' {city}: HTTP {resp.status_code}")
-                        if resp.status_code != 200:
-                            await asyncio.sleep(random.uniform(2, 3))
-                            continue
-                        data = resp.json()
-                        items = data.get("jobDetails", [])
-                        print(f"    Naukri API '{query}' {city}: {len(items)} items")
-                        for item in items[:20]:
-                            try:
-                                job = self._parse_naukri_item(item, city)
-                                if job and is_relevant_job(job["title"]):
-                                    jobs.append(job)
-                            except Exception:
+                    for city in INDIA_LOCATIONS:
+                        if len(jobs) >= self.max_jobs_per_source:
+                            break
+                        try:
+                            params = {
+                                "noOfResults": 20,
+                                "urlType": "search_by_keyword",
+                                "searchType": "adv",
+                                "keyword": query,
+                                "location": city,
+                                "experience": 3,
+                                "k": query,
+                                "l": city,
+                                "sort": "r",
+                                "src": "jobsearchDesk",
+                            }
+                            qs = "&".join(f"{k}={v}" for k, v in params.items())
+                            data = await page.evaluate(f"""
+                                async () => {{
+                                    const resp = await fetch('/jobapi/v3/search?{qs}', {{
+                                        headers: {{
+                                            'appid': '109',
+                                            'clientid': 'd3skt0p',
+                                            'systemid': 'Naukri',
+                                            'gid': 'LOCATION,INDUSTRY,EDUCATION,FAREA_ROLE',
+                                            'content-type': 'application/json',
+                                        }}
+                                    }});
+                                    if (!resp.ok) return {{'error': resp.status}};
+                                    return await resp.json();
+                                }}
+                            """)
+                            if not data or "error" in data:
+                                print(f"    Naukri in-page API '{query}' {city}: error {data}")
+                                await asyncio.sleep(random.uniform(2, 3))
                                 continue
-                        await asyncio.sleep(random.uniform(2, 3))
-                    except Exception as e:
-                        print(f"    Naukri API error '{query}' {city}: {e}")
+                            items = data.get("jobDetails", [])
+                            print(f"    Naukri in-page API '{query}' {city}: {len(items)} items")
+                            for item in items[:20]:
+                                try:
+                                    job = self._parse_naukri_item(item, city)
+                                    if job and is_relevant_job(job["title"]):
+                                        jobs.append(job)
+                                except Exception:
+                                    continue
+                            await asyncio.sleep(random.uniform(2, 3))
+                        except Exception as e:
+                            print(f"    Naukri in-page API error '{query}' {city}: {e}")
+            finally:
+                await context.close()
+                await browser.close()
         return jobs
 
     async def _scrape_naukri_playwright(self, browser) -> list:
@@ -198,6 +224,10 @@ class ScraperAgent:
                     except Exception:
                         pass
                     await asyncio.sleep(random.uniform(2, 4))
+
+                    page_title = await page.title()
+                    content_len = len(await page.content())
+                    print(f"    Naukri page: '{page_title}' ({content_len} chars)")
 
                     # If XHR interception got nothing, try page-embedded state
                     if not captured:
@@ -326,6 +356,93 @@ class ScraperAgent:
             "gap_analysis": [],
             "status": "new",
         }
+
+    # ── INDEED INDIA (httpx) ────────────────────────────────────────────────
+    # in.indeed.com is far less aggressive than Naukri about blocking servers.
+
+    async def _scrape_indeed_india(self) -> list:
+        jobs = []
+        headers = {
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-IN,en;q=0.9",
+            "Referer": "https://in.indeed.com/",
+        }
+        async with httpx.AsyncClient(headers=headers, timeout=20, follow_redirects=True) as client:
+            for query in INDIA_QUERIES[:6]:
+                if len(jobs) >= self.max_jobs_per_source:
+                    break
+                for city in INDIA_LOCATIONS:
+                    if len(jobs) >= self.max_jobs_per_source:
+                        break
+                    try:
+                        resp = await client.get(
+                            "https://in.indeed.com/jobs",
+                            params={"q": query, "l": city, "fromage": "3", "sort": "date"},
+                        )
+                        print(f"    Indeed India '{query}' {city}: HTTP {resp.status_code}")
+                        if resp.status_code != 200:
+                            await asyncio.sleep(random.uniform(2, 3))
+                            continue
+                        new_jobs = self._parse_indeed_india_html(resp.text, city)
+                        print(f"    Indeed India '{query}' {city}: {len(new_jobs)} jobs")
+                        jobs.extend(new_jobs)
+                        await asyncio.sleep(random.uniform(2, 3))
+                    except Exception as e:
+                        print(f"    Indeed India error '{query}' {city}: {e}")
+        return jobs[:self.max_jobs_per_source]
+
+    def _parse_indeed_india_html(self, html: str, city: str) -> list:
+        soup = BeautifulSoup(html, "lxml")
+        jobs = []
+        # Indeed job cards — try multiple selector strategies
+        cards = (soup.select("div.job_seen_beacon")
+                 or soup.select("div[data-jk]")
+                 or soup.select("li.css-1ac2h1w")
+                 or soup.select("div.tapItem"))
+        for card in cards[:20]:
+            try:
+                title_el = (card.select_one("h2.jobTitle a span[title]")
+                            or card.select_one("h2.jobTitle a")
+                            or card.select_one("a[data-jk] span"))
+                company_el = (card.select_one("span.companyName")
+                              or card.select_one("[data-testid='company-name']")
+                              or card.select_one(".companyName"))
+                loc_el = (card.select_one("div.companyLocation")
+                          or card.select_one("[data-testid='text-location']")
+                          or card.select_one(".companyLocation"))
+                link_el = card.select_one("h2.jobTitle a, a[data-jk]")
+
+                title = (title_el.get("title") or title_el.get_text(strip=True)) if title_el else ""
+                company = company_el.get_text(strip=True) if company_el else "Unknown"
+                location = loc_el.get_text(strip=True) if loc_el else f"{city}, India"
+                href = link_el.get("href", "") if link_el else ""
+                url = f"https://in.indeed.com{href}" if href.startswith("/") else href
+
+                if not title or not is_relevant_job(title):
+                    continue
+
+                jobs.append({
+                    "job_id": generate_job_id(url, title, company),
+                    "title": title,
+                    "company": company,
+                    "location": location if location else f"{city}, India",
+                    "description": "",
+                    "url": url,
+                    "posted_at": datetime.utcnow(),
+                    "scraped_at": datetime.utcnow(),
+                    "source": "indeed",
+                    "region": "india",
+                    "sponsorship_status": "contract",
+                    "contract_type": extract_contract_type(title, ""),
+                    "match_score": None,
+                    "score_breakdown": None,
+                    "gap_analysis": [],
+                    "status": "new",
+                })
+            except Exception:
+                continue
+        return jobs
 
     # ── LINKEDIN Guest API (India + US) ──────────────────────────────────────
     # LinkedIn exposes a public guest jobs endpoint used for AJAX pagination.
