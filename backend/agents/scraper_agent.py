@@ -63,6 +63,10 @@ class ScraperAgent:
         all_jobs.extend(linkedin_us)
         print(f"  LinkedIn US: {len(linkedin_us)} jobs")
 
+        dice_jobs = await self._scrape_dice()
+        all_jobs.extend(dice_jobs)
+        print(f"  Dice: {len(dice_jobs)} jobs")
+
         saved = 0
         for job in all_jobs:
             if await insert_job(job):
@@ -439,6 +443,85 @@ class ScraperAgent:
             except Exception:
                 continue
         return jobs
+
+    # ── DICE (US) ────────────────────────────────────────────────────────────
+    # Dice has a public JSON search API — no auth needed, returns structured data.
+
+    async def _scrape_dice(self) -> list:
+        jobs = []
+        headers = {
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.dice.com/",
+        }
+        async with httpx.AsyncClient(headers=headers, timeout=20, follow_redirects=True) as client:
+            for query in US_QUERIES[:6]:
+                if len(jobs) >= self.max_jobs_per_source:
+                    break
+                try:
+                    params = {
+                        "q": query,
+                        "countryCode2": "US",
+                        "radius": "30",
+                        "radiusUnit": "mi",
+                        "page": "1",
+                        "pageSize": "20",
+                        "filters.postedDate": "THREE_DAYS",
+                        "filters.workFromHomeAvailability": "Remote",
+                        "language": "en",
+                    }
+                    resp = await client.get(
+                        "https://job-search-api.ssg.dice.com/v1/jobs",
+                        params=params,
+                    )
+                    print(f"    Dice '{query}': HTTP {resp.status_code}")
+                    if resp.status_code != 200:
+                        await asyncio.sleep(random.uniform(2, 3))
+                        continue
+                    data = resp.json()
+                    items = data.get("data", [])
+                    print(f"    Dice '{query}': {len(items)} jobs")
+                    for item in items:
+                        try:
+                            job = self._parse_dice_item(item)
+                            if job and is_relevant_job(job["title"]):
+                                jobs.append(job)
+                        except Exception:
+                            continue
+                    await asyncio.sleep(random.uniform(2, 3))
+                except Exception as e:
+                    print(f"    Dice error '{query}': {e}")
+        return jobs[:self.max_jobs_per_source]
+
+    def _parse_dice_item(self, item: dict) -> dict:
+        title = item.get("title", "").strip()
+        company = item.get("companyPageLink", {})
+        company = (company.get("text") if isinstance(company, dict) else None) or item.get("companyDisplay", "Unknown")
+        location = item.get("location", "Remote, US")
+        url = item.get("applyRedirectLink") or item.get("jobDetailUrl") or ""
+        if url and not url.startswith("http"):
+            url = "https://www.dice.com" + url
+        description = clean_description(item.get("jobDescription", "") or "")
+        employment = item.get("employmentType", [""])[0] if item.get("employmentType") else ""
+
+        return {
+            "job_id": generate_job_id(url, title, company),
+            "title": title,
+            "company": company,
+            "location": location,
+            "description": description,
+            "url": url,
+            "posted_at": datetime.utcnow(),
+            "scraped_at": datetime.utcnow(),
+            "source": "dice",
+            "region": "us",
+            "sponsorship_status": "unknown",
+            "contract_type": extract_contract_type(title, employment),
+            "match_score": None,
+            "score_breakdown": None,
+            "gap_analysis": [],
+            "status": "new",
+        }
 
     # ── LINKEDIN Guest API (India + US) ──────────────────────────────────────
     # LinkedIn exposes a public guest jobs endpoint used for AJAX pagination.

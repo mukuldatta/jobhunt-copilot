@@ -24,6 +24,8 @@ class ApplyAgent:
         self.linkedin_password = os.environ.get("LINKEDIN_PASSWORD", "")
         self.indeed_email = os.environ.get("INDEED_EMAIL", "")
         self.indeed_password = os.environ.get("INDEED_PASSWORD", "")
+        self.dice_email = os.environ.get("DICE_EMAIL", "")
+        self.dice_password = os.environ.get("DICE_PASSWORD", "")
         first = os.environ.get("USER_FIRST_NAME", "Mukul")
         last = os.environ.get("USER_LAST_NAME", "Mokkapati")
         self.user_name = f"{first} {last}"
@@ -51,6 +53,8 @@ class ApplyAgent:
             return await self._apply_naukri(job, pdf_path)
         elif source == "indeed":
             return await self._apply_indeed(job, pdf_path)
+        elif source == "dice":
+            return await self._apply_dice(job, pdf_path)
         else:
             return {
                 "status": "manual_required",
@@ -367,6 +371,109 @@ class ApplyAgent:
                     "status": "needs_review",
                     "url": page.url,
                     "message": "Clicked Apply on Indeed — may need additional steps.",
+                }
+
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+            finally:
+                await context.close()
+                await browser.close()
+
+    # ── Dice Apply ───────────────────────────────────────────────────────────
+
+    async def _apply_dice(self, job: dict, pdf_path: str = None) -> dict:
+        if not self.dice_email or not self.dice_password:
+            return {
+                "status": "credentials_missing",
+                "message": "Set DICE_EMAIL and DICE_PASSWORD in Railway environment variables.",
+            }
+
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 900},
+            )
+            page = await context.new_page()
+            await page.add_init_script(STEALTH_JS)
+
+            try:
+                # Login
+                await page.goto("https://www.dice.com/dashboard/login", wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                await page.fill('input[name="email"], input[type="email"]', self.dice_email)
+                await page.click('button[type="submit"]')
+                await asyncio.sleep(1)
+                pw_field = await page.query_selector('input[name="password"], input[type="password"]')
+                if pw_field:
+                    await pw_field.fill(self.dice_password)
+                    await page.click('button[type="submit"]')
+                await page.wait_for_load_state("networkidle", timeout=15000)
+
+                if "login" in page.url or "signin" in page.url:
+                    count = await increment_login_failure("dice")
+                    if count >= 5:
+                        send_login_failure_alert("dice", count)
+                    return {
+                        "status": "login_failed",
+                        "message": f"Dice login failed (attempt {count}). Check DICE_EMAIL and DICE_PASSWORD.",
+                    }
+
+                await reset_login_failures("dice")
+
+                # Navigate to job
+                await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(2)
+
+                # Dice Easy Apply button
+                apply_btn = await page.query_selector(
+                    'apply-button-wc, '
+                    'button[data-cy="apply-button"], '
+                    'a[data-cy="apply-button"], '
+                    'button[id*="apply"]'
+                )
+                if not apply_btn:
+                    return {
+                        "status": "manual_required",
+                        "url": job["url"],
+                        "message": "No Dice Easy Apply button found. Apply directly on the company site.",
+                    }
+
+                await apply_btn.click()
+                await asyncio.sleep(3)
+
+                # Upload resume if prompted
+                if pdf_path:
+                    upload = await page.query_selector('input[type="file"]')
+                    if upload:
+                        try:
+                            await upload.set_input_files(pdf_path)
+                            await asyncio.sleep(1)
+                        except Exception:
+                            pass
+
+                # Fill phone if empty
+                if self.user_phone:
+                    for sel in ['input[name*="phone"]', 'input[type="tel"]']:
+                        el = await page.query_selector(sel)
+                        if el and not await el.input_value():
+                            await el.fill(self.user_phone)
+                            break
+
+                # Submit
+                submit = await page.query_selector(
+                    'button[data-cy="submit-application"], '
+                    'button[type="submit"]'
+                )
+                if submit:
+                    await submit.click()
+                    await asyncio.sleep(2)
+                    return {"status": "applied", "message": "Application submitted via Dice Easy Apply."}
+
+                return {
+                    "status": "needs_review",
+                    "url": page.url,
+                    "message": "Clicked Apply on Dice — may need additional steps.",
                 }
 
             except Exception as e:
