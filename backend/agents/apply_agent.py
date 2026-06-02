@@ -22,6 +22,8 @@ class ApplyAgent:
     def __init__(self):
         self.linkedin_email = os.environ.get("LINKEDIN_EMAIL", "")
         self.linkedin_password = os.environ.get("LINKEDIN_PASSWORD", "")
+        self.indeed_email = os.environ.get("INDEED_EMAIL", "")
+        self.indeed_password = os.environ.get("INDEED_PASSWORD", "")
         first = os.environ.get("USER_FIRST_NAME", "Mukul")
         last = os.environ.get("USER_LAST_NAME", "Mokkapati")
         self.user_name = f"{first} {last}"
@@ -47,6 +49,8 @@ class ApplyAgent:
             return await self._apply_linkedin(job, pdf_path)
         elif source == "naukri":
             return await self._apply_naukri(job, pdf_path)
+        elif source == "indeed":
+            return await self._apply_indeed(job, pdf_path)
         else:
             return {
                 "status": "manual_required",
@@ -259,6 +263,110 @@ class ApplyAgent:
                     "status": "needs_review",
                     "url": page.url,
                     "message": "Clicked Apply on Naukri — may need profile completion or additional steps.",
+                }
+
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+            finally:
+                await context.close()
+                await browser.close()
+
+    # ── Indeed Apply ─────────────────────────────────────────────────────────
+
+    async def _apply_indeed(self, job: dict, pdf_path: str = None) -> dict:
+        if not self.indeed_email or not self.indeed_password:
+            return {
+                "status": "credentials_missing",
+                "message": "Set INDEED_EMAIL and INDEED_PASSWORD in Railway environment variables.",
+            }
+
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 900},
+            )
+            page = await context.new_page()
+            await page.add_init_script(STEALTH_JS)
+
+            try:
+                # Login
+                await page.goto("https://in.indeed.com/account/login", wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                await page.fill('input[name="__email"], input[type="email"]', self.indeed_email)
+                await page.click('button[type="submit"], button[data-testid="login-button"]')
+                await asyncio.sleep(2)
+                pw_field = await page.query_selector('input[name="__password"], input[type="password"]')
+                if pw_field:
+                    await pw_field.fill(self.indeed_password)
+                    await page.click('button[type="submit"]')
+                await page.wait_for_load_state("networkidle", timeout=15000)
+
+                if "login" in page.url or "signin" in page.url:
+                    count = await increment_login_failure("indeed")
+                    if count >= 5:
+                        send_login_failure_alert("indeed", count)
+                    return {
+                        "status": "login_failed",
+                        "message": f"Indeed login failed (attempt {count}). Check INDEED_EMAIL and INDEED_PASSWORD.",
+                    }
+
+                await reset_login_failures("indeed")
+
+                # Navigate to job
+                await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(2)
+
+                # Indeed "Easily apply" button
+                apply_btn = await page.query_selector(
+                    'button[data-testid="indeedApplyButton"], '
+                    'button[id="indeedApplyButton"], '
+                    'a[data-testid="apply-button"], '
+                    'span.indeed-apply-button'
+                )
+                if not apply_btn:
+                    return {
+                        "status": "manual_required",
+                        "url": job["url"],
+                        "message": "No Indeed Easy Apply button found. Apply directly on the company site.",
+                    }
+
+                await apply_btn.click()
+                await asyncio.sleep(3)
+
+                # Upload resume
+                if pdf_path:
+                    upload = await page.query_selector('input[type="file"][accept*="pdf"], input[type="file"]')
+                    if upload:
+                        try:
+                            await upload.set_input_files(pdf_path)
+                            await asyncio.sleep(1)
+                        except Exception:
+                            pass
+
+                # Fill phone if empty
+                if self.user_phone:
+                    for sel in ['input[name*="phone"]', 'input[type="tel"]']:
+                        el = await page.query_selector(sel)
+                        if el and not await el.input_value():
+                            await el.fill(self.user_phone)
+                            break
+
+                # Submit
+                submit = await page.query_selector(
+                    'button[data-testid*="submit"], '
+                    'button[aria-label*="Submit"], '
+                    'button[type="submit"]'
+                )
+                if submit:
+                    await submit.click()
+                    await asyncio.sleep(2)
+                    return {"status": "applied", "message": "Application submitted via Indeed Easy Apply."}
+
+                return {
+                    "status": "needs_review",
+                    "url": page.url,
+                    "message": "Clicked Apply on Indeed — may need additional steps.",
                 }
 
             except Exception as e:
