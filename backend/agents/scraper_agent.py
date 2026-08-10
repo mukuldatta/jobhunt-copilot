@@ -1,3 +1,4 @@
+import os
 import asyncio
 import random
 import httpx
@@ -25,14 +26,6 @@ US_QUERIES = [
 ]
 INDIA_LOCATIONS = ["Hyderabad", "Bangalore", "Pune"]
 
-# Hides headless browser signals from anti-bot detectors
-STEALTH_JS = """
-    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-    window.chrome = {runtime: {}};
-"""
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -47,10 +40,13 @@ class ScraperAgent:
     async def scrape_all(self) -> list:
         all_jobs = []
 
-        # Naukri blocks all cloud/datacenter IPs at CDN level — skipped.
-        print("  Naukri: skipped (IP blocked by Naukri CDN on cloud hosts)")
+        # India-only pipeline. Naukri is the primary source but sits behind
+        # Akamai + reCAPTCHA: it only loads in a *headed* real-Chrome browser on
+        # a residential IP, so this must run locally (not on a cloud host).
+        naukri_jobs = await self._scrape_naukri()
+        all_jobs.extend(naukri_jobs)
+        print(f"  Naukri: {len(naukri_jobs)} jobs")
 
-        # httpx-based India sources
         indeed_india = await self._scrape_indeed_india()
         all_jobs.extend(indeed_india)
         print(f"  Indeed India: {len(indeed_india)} jobs")
@@ -58,14 +54,6 @@ class ScraperAgent:
         linkedin_india = await self._scrape_linkedin_guest(region="india")
         all_jobs.extend(linkedin_india)
         print(f"  LinkedIn India: {len(linkedin_india)} jobs")
-
-        linkedin_us = await self._scrape_linkedin_guest(region="us")
-        all_jobs.extend(linkedin_us)
-        print(f"  LinkedIn US: {len(linkedin_us)} jobs")
-
-        dice_jobs = await self._scrape_dice()
-        all_jobs.extend(dice_jobs)
-        print(f"  Dice: {len(dice_jobs)} jobs")
 
         saved = 0
         for job in all_jobs:
@@ -75,57 +63,31 @@ class ScraperAgent:
         print(f"ScraperAgent: scraped {len(all_jobs)} total, {saved} new saved")
         return all_jobs
 
-    # ── Shared: new stealth browser page ────────────────────────────────────
+    # ── NAUKRI (India Primary) ──────────────────────────────────
+    # Naukri is behind Akamai Bot Manager + reCAPTCHA. The internal search API
+    # returns 406 "recaptcha required" for any script (even with browser-TLS
+    # impersonation), and headless browsers get a 403 "Access Denied". The ONLY
+    # reliable path is a HEADED real-Chrome browser on a residential IP, reading
+    # jobs from the rendered DOM. That means this runs locally, not on a cloud
+    # host. Set NAUKRI_DISABLED=1 to skip it (e.g. when deployed headless).
 
-    async def _new_page(self, browser):
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-        )
-        page = await context.new_page()
-        await page.add_init_script(STEALTH_JS)
-        return page, context
+    async def _scrape_naukri(self) -> list:
+        if os.getenv("NAUKRI_DISABLED", "").strip() in ("1", "true", "yes"):
+            print("  Naukri: skipped (NAUKRI_DISABLED set)")
+            return []
 
-    # ── NAUKRI (India Primary) ───────────────────────────────────────────────
-    # Strategy 1: direct httpx call to Naukri's internal search API (fast).
-    # Strategy 2: Playwright XHR interception fallback if httpx is blocked.
-
-    async def _scrape_naukri(self, browser) -> list:
         jobs = []
-
-        # Try direct API first — much faster than Playwright
-        try:
-            jobs = await self._scrape_naukri_api()
-            print(f"  Naukri API: {len(jobs)} jobs")
-            if jobs:
-                return jobs[:self.max_jobs_per_source]
-        except Exception as e:
-            print(f"  Naukri API failed ({e}), falling back to Playwright")
-
-        # Playwright XHR interception fallback
-        jobs = await self._scrape_naukri_playwright(browser)
-        return jobs[:self.max_jobs_per_source]
-
-    async def _scrape_naukri_api(self) -> list:
-        """
-        Load Naukri in Playwright to get valid Akamai session cookies, then
-        call the internal search API via page.evaluate() (same-origin fetch —
-        cookies included automatically, no CORS issues).
-        """
-        jobs = []
+        seen = set()
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            page, context = await self._new_page(browser)
+            browser = await self._launch_headed(pw)
+            if browser is None:
+                return []
+            context = await browser.new_context(
+                locale="en-IN",
+                viewport={"width": 1360, "height": 900},
+            )
+            page = await context.new_page()
             try:
-                # Seed cookies by loading the homepage
-                await page.goto("https://www.naukri.com", wait_until="domcontentloaded", timeout=30000)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=8000)
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
-
                 for query in INDIA_QUERIES:
                     if len(jobs) >= self.max_jobs_per_source:
                         break
@@ -133,216 +95,92 @@ class ScraperAgent:
                         if len(jobs) >= self.max_jobs_per_source:
                             break
                         try:
-                            params = {
-                                "noOfResults": 20,
-                                "urlType": "search_by_keyword",
-                                "searchType": "adv",
-                                "keyword": query,
-                                "location": city,
-                                "experience": 3,
-                                "k": query,
-                                "l": city,
-                                "sort": "r",
-                                "src": "jobsearchDesk",
-                            }
-                            qs = "&".join(f"{k}={v}" for k, v in params.items())
-                            data = await page.evaluate(f"""
-                                async () => {{
-                                    const resp = await fetch('/jobapi/v3/search?{qs}', {{
-                                        headers: {{
-                                            'appid': '109',
-                                            'clientid': 'd3skt0p',
-                                            'systemid': 'Naukri',
-                                            'gid': 'LOCATION,INDUSTRY,EDUCATION,FAREA_ROLE',
-                                            'content-type': 'application/json',
-                                        }}
-                                    }});
-                                    if (!resp.ok) return {{'error': resp.status}};
-                                    return await resp.json();
-                                }}
-                            """)
-                            if not data or "error" in data:
-                                print(f"    Naukri in-page API '{query}' {city}: error {data}")
-                                await asyncio.sleep(random.uniform(2, 3))
-                                continue
-                            items = data.get("jobDetails", [])
-                            print(f"    Naukri in-page API '{query}' {city}: {len(items)} items")
-                            for item in items[:20]:
-                                try:
-                                    job = self._parse_naukri_item(item, city)
-                                    if job and is_relevant_job(job["title"]):
-                                        jobs.append(job)
-                                except Exception:
+                            rows = await self._load_naukri_page(page, query, city)
+                            added = 0
+                            for row in rows:
+                                title = (row.get("title") or "").strip()
+                                url = (row.get("url") or "").strip()
+                                if not title or not url or url in seen:
                                     continue
-                            await asyncio.sleep(random.uniform(2, 3))
+                                if not is_relevant_job(title):
+                                    continue
+                                seen.add(url)
+                                jobs.append(self._naukri_row_to_job(row, city))
+                                added += 1
+                            print(f"    Naukri '{query}' {city}: {added} jobs")
+                            await asyncio.sleep(random.uniform(2, 4))
                         except Exception as e:
-                            print(f"    Naukri in-page API error '{query}' {city}: {e}")
+                            print(f"    Naukri error '{query}' {city}: {e}")
             finally:
                 await context.close()
                 await browser.close()
-        return jobs
+        return jobs[:self.max_jobs_per_source]
 
-    async def _scrape_naukri_playwright(self, browser) -> list:
-        """Fallback: load real Naukri page and extract jobs via XHR + page state + HTML."""
-        jobs = []
-        for query in INDIA_QUERIES:
-            if len(jobs) >= self.max_jobs_per_source:
-                break
-            for city in INDIA_LOCATIONS:
-                if len(jobs) >= self.max_jobs_per_source:
-                    break
-
-                captured = []
-                page, context = await self._new_page(browser)
-
-                async def on_response(response, _c=captured):
-                    # Catch any successful JSON response from naukri.com
-                    if response.status == 200 and "naukri.com" in response.url:
-                        ct = response.headers.get("content-type", "")
-                        if "json" in ct:
-                            try:
-                                data = await response.json()
-                                # Handle both top-level and nested jobDetails
-                                items = (data.get("jobDetails")
-                                         or data.get("data", {}).get("jobDetails")
-                                         or [])
-                                if items:
-                                    print(f"      XHR hit: {len(items)} items from {response.url[:80]}")
-                                    _c.extend(items)
-                            except Exception:
-                                pass
-
-                page.on("response", on_response)
-
-                try:
-                    slug = query.lower().replace(" ", "-")
-                    city_slug = city.lower()
-                    url = f"https://www.naukri.com/{slug}-jobs-in-{city_slug}"
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=8000)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(random.uniform(2, 4))
-
-                    page_title = await page.title()
-                    content_len = len(await page.content())
-                    print(f"    Naukri page: '{page_title}' ({content_len} chars)")
-
-                    # If XHR interception got nothing, try page-embedded state
-                    if not captured:
-                        captured = await self._extract_naukri_page_state(page)
-
-                    # If still nothing, parse rendered HTML
-                    if not captured:
-                        html = await page.content()
-                        html_jobs = self._parse_naukri_html(html, city)
-                        print(f"    Naukri HTML '{query}' {city}: {len(html_jobs)} jobs")
-                        jobs.extend(html_jobs[:20])
-                    else:
-                        print(f"    Naukri Playwright '{query}' {city}: {len(captured)} captured")
-                        for item in captured[:20]:
-                            try:
-                                job = self._parse_naukri_item(item, city)
-                                if job and is_relevant_job(job["title"]):
-                                    jobs.append(job)
-                            except Exception:
-                                continue
-                except Exception as e:
-                    print(f"    Naukri Playwright error '{query}' {city}: {e}")
-                finally:
-                    await context.close()
-
-        return jobs
-
-    async def _extract_naukri_page_state(self, page) -> list:
-        """Try to pull jobDetails from Naukri's embedded page state."""
+    async def _launch_headed(self, pw):
+        """Headed real Chrome beats Akamai; fall back to headed Chromium."""
         try:
-            items = await page.evaluate("""() => {
-                // Next.js embedded data
-                const nd = window.__NEXT_DATA__;
-                if (nd) {
-                    const jobs = nd?.props?.pageProps?.jobDetails
-                        || nd?.props?.pageProps?.initialState?.jobSearch?.jobDetails
-                        || nd?.props?.pageProps?.dehydratedState?.jobDetails;
-                    if (jobs && jobs.length) return jobs;
-                }
-                // Legacy Naukri global
-                if (window.initialState?.jobDetails) return window.initialState.jobDetails;
-                if (window.__INITIAL_STATE__?.jobDetails) return window.__INITIAL_STATE__.jobDetails;
-                return [];
-            }""")
-            return items or []
+            return await pw.chromium.launch(headless=False, channel="chrome")
+        except Exception as e:
+            print(f"    Naukri: real Chrome unavailable ({e}); trying headed Chromium")
+        try:
+            return await pw.chromium.launch(headless=False)
+        except Exception as e:
+            print(f"    Naukri: headed browser unavailable ({e}); skipping Naukri")
+            return None
+
+    async def _load_naukri_page(self, page, query: str, city: str) -> list:
+        slug = query.lower().replace(" ", "-")
+        url = f"https://www.naukri.com/{slug}-jobs-in-{city.lower()}"
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=12000)
         except Exception:
+            pass
+        # Wait for job cards to render; Akamai block pages never show them.
+        try:
+            await page.wait_for_selector("div.srp-jobtuple-wrapper", timeout=12000)
+        except Exception:
+            title = await page.title()
+            if "access denied" in title.lower():
+                print(f"    Naukri BLOCKED on '{query}' {city} (Access Denied) "
+                      f"— need a residential IP + headed browser")
             return []
+        await asyncio.sleep(random.uniform(1.5, 3))
+        return await page.evaluate("""() => {
+            const out = [];
+            document.querySelectorAll('div.srp-jobtuple-wrapper').forEach(c => {
+                const g = (s) => { const e = c.querySelector(s); return e ? e.textContent.trim() : ""; };
+                const a = c.querySelector('a.title');
+                out.push({
+                    title: g('a.title'),
+                    url: a ? a.href : "",
+                    company: g('a.comp-name, span.comp-name'),
+                    exp: g('span.expwdth'),
+                    loc: g('span.locWdth, span.loc-wrap span, span.location'),
+                    desc: g('span.job-desc'),
+                });
+            });
+            return out;
+        }""")
 
-    def _parse_naukri_html(self, html: str, city: str) -> list:
-        """Parse job cards from Naukri's rendered HTML."""
-        soup = BeautifulSoup(html, "lxml")
-        jobs = []
-        # Naukri job cards: article tags or divs with data-job-id
-        cards = (soup.select("article[data-job-id]")
-                 or soup.select("div[data-job-id]")
-                 or soup.select(".jobTuple")
-                 or soup.select(".cust-job-tuple"))
-        for card in cards[:25]:
-            try:
-                title_el = card.select_one("a.title, h2.title a, .title a, [class*='title'] a")
-                company_el = card.select_one("a.subTitle, .subTitle, [class*='companyInfo'] a, [class*='company']")
-                loc_el = card.select_one(".locWdth, [class*='location'], [class*='loc']")
+    def _naukri_row_to_job(self, row: dict, city: str) -> dict:
+        title = (row.get("title") or "").strip()
+        company = (row.get("company") or "Unknown").strip() or "Unknown"
+        location = (row.get("loc") or city).strip() or city
+        if "india" not in location.lower():
+            location = f"{location}, India"
+        url = (row.get("url") or "").strip()
 
-                title = title_el.get_text(strip=True) if title_el else ""
-                company = company_el.get_text(strip=True) if company_el else "Unknown"
-                location = loc_el.get_text(strip=True) if loc_el else city
-                url = title_el.get("href", "") if title_el else ""
-                if url and not url.startswith("http"):
-                    url = "https://www.naukri.com" + url
-
-                if not title or not is_relevant_job(title):
-                    continue
-
-                jobs.append({
-                    "job_id": generate_job_id(url, title, company),
-                    "title": title,
-                    "company": company,
-                    "location": f"{location}, India" if "india" not in location.lower() else location,
-                    "description": "",
-                    "url": url,
-                    "posted_at": datetime.utcnow(),
-                    "scraped_at": datetime.utcnow(),
-                    "source": "naukri",
-                    "region": "india",
-                    "sponsorship_status": "contract",
-                    "contract_type": extract_contract_type(title, ""),
-                    "match_score": None,
-                    "score_breakdown": None,
-                    "gap_analysis": [],
-                    "status": "new",
-                })
-            except Exception:
-                continue
-        return jobs
-
-    def _parse_naukri_item(self, item: dict, city: str) -> dict:
-        title = item.get("title", "").strip()
-        company = item.get("companyName", "Unknown").strip()
-        placeholders = item.get("placeholders", [])
-        location = next((p.get("label", city) for p in placeholders if p.get("type") == "location"), city)
-        exp_text = next((p.get("label", "") for p in placeholders if p.get("type") == "experience"), "")
-
-        url = item.get("jdURL", "") or ""
-        if url and not url.startswith("http"):
-            url = "https://www.naukri.com" + url
-
-        description = clean_description(item.get("jobDescription", "") or "")
+        description = clean_description(row.get("desc") or "")
+        exp_text = (row.get("exp") or "").strip()
         if exp_text:
-            description = f"Experience: {exp_text}. {description}"
+            description = f"Experience: {exp_text}. {description}".strip()
 
         return {
             "job_id": generate_job_id(url, title, company),
             "title": title,
             "company": company,
-            "location": f"{location}, India",
+            "location": location,
             "description": description,
             "url": url,
             "posted_at": datetime.utcnow(),
@@ -443,85 +281,6 @@ class ScraperAgent:
             except Exception:
                 continue
         return jobs
-
-    # ── DICE (US) ────────────────────────────────────────────────────────────
-    # Dice has a public JSON search API — no auth needed, returns structured data.
-
-    async def _scrape_dice(self) -> list:
-        jobs = []
-        headers = {
-            "User-Agent": HEADERS["User-Agent"],
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://www.dice.com/",
-        }
-        async with httpx.AsyncClient(headers=headers, timeout=20, follow_redirects=True) as client:
-            for query in US_QUERIES[:6]:
-                if len(jobs) >= self.max_jobs_per_source:
-                    break
-                try:
-                    params = {
-                        "q": query,
-                        "countryCode2": "US",
-                        "radius": "30",
-                        "radiusUnit": "mi",
-                        "page": "1",
-                        "pageSize": "20",
-                        "filters.postedDate": "THREE_DAYS",
-                        "filters.workFromHomeAvailability": "Remote",
-                        "language": "en",
-                    }
-                    resp = await client.get(
-                        "https://job-search-api.ssg.dice.com/v1/jobs",
-                        params=params,
-                    )
-                    print(f"    Dice '{query}': HTTP {resp.status_code}")
-                    if resp.status_code != 200:
-                        await asyncio.sleep(random.uniform(2, 3))
-                        continue
-                    data = resp.json()
-                    items = data.get("data", [])
-                    print(f"    Dice '{query}': {len(items)} jobs")
-                    for item in items:
-                        try:
-                            job = self._parse_dice_item(item)
-                            if job and is_relevant_job(job["title"]):
-                                jobs.append(job)
-                        except Exception:
-                            continue
-                    await asyncio.sleep(random.uniform(2, 3))
-                except Exception as e:
-                    print(f"    Dice error '{query}': {e}")
-        return jobs[:self.max_jobs_per_source]
-
-    def _parse_dice_item(self, item: dict) -> dict:
-        title = item.get("title", "").strip()
-        company = item.get("companyPageLink", {})
-        company = (company.get("text") if isinstance(company, dict) else None) or item.get("companyDisplay", "Unknown")
-        location = item.get("location", "Remote, US")
-        url = item.get("applyRedirectLink") or item.get("jobDetailUrl") or ""
-        if url and not url.startswith("http"):
-            url = "https://www.dice.com" + url
-        description = clean_description(item.get("jobDescription", "") or "")
-        employment = item.get("employmentType", [""])[0] if item.get("employmentType") else ""
-
-        return {
-            "job_id": generate_job_id(url, title, company),
-            "title": title,
-            "company": company,
-            "location": location,
-            "description": description,
-            "url": url,
-            "posted_at": datetime.utcnow(),
-            "scraped_at": datetime.utcnow(),
-            "source": "dice",
-            "region": "us",
-            "sponsorship_status": "unknown",
-            "contract_type": extract_contract_type(title, employment),
-            "match_score": None,
-            "score_breakdown": None,
-            "gap_analysis": [],
-            "status": "new",
-        }
 
     # ── LINKEDIN Guest API (India + US) ──────────────────────────────────────
     # LinkedIn exposes a public guest jobs endpoint used for AJAX pagination.
