@@ -9,7 +9,6 @@ from db.mongodb import insert_job
 from utils.job_parser import (
     clean_description, generate_job_id, extract_contract_type, is_relevant_job
 )
-from services.h1b_checker import check_h1b_sponsorship
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,11 +17,6 @@ INDIA_QUERIES = [
     "AI Engineer", "Machine Learning Engineer", "Data Engineer",
     "Software Engineer", "Python Developer", "Full Stack Developer",
     "Backend Developer", "MLOps Engineer", "GenAI Engineer",
-]
-US_QUERIES = [
-    "AI Engineer", "Machine Learning Engineer", "Data Engineer",
-    "Software Engineer", "Backend Engineer", "Python Developer",
-    "GenAI Engineer", "MLOps Engineer",
 ]
 INDIA_LOCATIONS = ["Hyderabad", "Bangalore", "Pune"]
 
@@ -51,7 +45,7 @@ class ScraperAgent:
         all_jobs.extend(indeed_india)
         print(f"  Indeed India: {len(indeed_india)} jobs")
 
-        linkedin_india = await self._scrape_linkedin_guest(region="india")
+        linkedin_india = await self._scrape_linkedin_guest()
         all_jobs.extend(linkedin_india)
         print(f"  LinkedIn India: {len(linkedin_india)} jobs")
 
@@ -282,24 +276,21 @@ class ScraperAgent:
                 continue
         return jobs
 
-    # ── LINKEDIN Guest API (India + US) ──────────────────────────────────────
+    # ── LINKEDIN Guest API (India) ───────────────────────────────────────────
     # LinkedIn exposes a public guest jobs endpoint used for AJAX pagination.
     # It returns HTML fragments without requiring login.
 
-    async def _scrape_linkedin_guest(self, region: str) -> list:
+    async def _scrape_linkedin_guest(self) -> list:
         jobs = []
-        queries = INDIA_QUERIES[:6] if region == "india" else US_QUERIES[:5]
-        locations = INDIA_LOCATIONS if region == "india" else ["United States"]
-
         async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as client:
-            for query in queries:
+            for query in INDIA_QUERIES[:6]:
                 if len(jobs) >= self.max_jobs_per_source:
                     break
-                for loc in locations:
+                for loc in INDIA_LOCATIONS:
                     if len(jobs) >= self.max_jobs_per_source:
                         break
                     try:
-                        location_str = f"{loc}, India" if region == "india" else loc
+                        location_str = f"{loc}, India"
                         url = (
                             "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
                             f"?keywords={query.replace(' ', '%20')}"
@@ -308,33 +299,22 @@ class ScraperAgent:
                             f"&f_E=3%2C4"       # mid-senior + associate level
                             f"&start=0"
                         )
-                        if region == "us":
-                            url += "&f_WT=2"    # remote only
-
                         resp = await client.get(url)
-                        print(f"    LinkedIn {region} '{query}' {loc}: HTTP {resp.status_code}")
+                        print(f"    LinkedIn '{query}' {loc}: HTTP {resp.status_code}")
                         if resp.status_code != 200:
                             await asyncio.sleep(random.uniform(2, 4))
                             continue
 
-                        new_jobs = self._parse_linkedin_guest_html(resp.text, region)
-                        print(f"    LinkedIn {region} '{query}' {loc}: {len(new_jobs)} jobs")
+                        new_jobs = self._parse_linkedin_guest_html(resp.text)
+                        print(f"    LinkedIn '{query}' {loc}: {len(new_jobs)} jobs")
                         jobs.extend(new_jobs)
                         await asyncio.sleep(random.uniform(2, 4))
                     except Exception as e:
-                        print(f"    LinkedIn {region} error '{query}' {loc}: {e}")
-
-        # For US jobs, look up H1B sponsorship
-        if region == "us":
-            for job in jobs:
-                try:
-                    job["sponsorship_status"] = await check_h1b_sponsorship(job["company"])
-                except Exception:
-                    job["sponsorship_status"] = "unknown"
+                        print(f"    LinkedIn error '{query}' {loc}: {e}")
 
         return jobs[:self.max_jobs_per_source]
 
-    def _parse_linkedin_guest_html(self, html: str, region: str) -> list:
+    def _parse_linkedin_guest_html(self, html: str) -> list:
         soup = BeautifulSoup(html, "html.parser")
         jobs = []
 
@@ -359,9 +339,7 @@ class ScraperAgent:
 
                 title = title_el.get_text(strip=True) if title_el else ""
                 company = company_el.get_text(strip=True) if company_el else "Unknown"
-                location = location_el.get_text(strip=True) if location_el else (
-                    "India" if region == "india" else "Remote, US"
-                )
+                location = location_el.get_text(strip=True) if location_el else "India"
                 url = link_el.get("href", "").split("?")[0] if link_el else ""
 
                 if not title or not is_relevant_job(title):
@@ -377,8 +355,8 @@ class ScraperAgent:
                     "posted_at": datetime.utcnow(),
                     "scraped_at": datetime.utcnow(),
                     "source": "linkedin",
-                    "region": region,
-                    "sponsorship_status": "contract" if region == "india" else "unknown",
+                    "region": "india",
+                    "sponsorship_status": "contract",
                     "contract_type": extract_contract_type(title, ""),
                     "match_score": None,
                     "score_breakdown": None,

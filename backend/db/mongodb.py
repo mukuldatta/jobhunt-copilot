@@ -260,23 +260,6 @@ async def get_resume() -> dict:
     return await db.resume.find_one({}, {"_id": 0})
 
 
-# --- H1B Cache ---
-
-async def get_cached_sponsorship(company: str) -> dict:
-    db = get_db()
-    return await db.h1b_cache.find_one({"company": company}, {"_id": 0})
-
-
-async def cache_sponsorship(company: str, status: str):
-    db = get_db()
-    from datetime import datetime
-    await db.h1b_cache.replace_one(
-        {"company": company},
-        {"company": company, "status": status, "cached_at": datetime.utcnow()},
-        upsert=True
-    )
-
-
 # --- Auth session state (manual login persisted in browser profiles) ---
 
 async def save_auth_state(platform: str):
@@ -300,35 +283,6 @@ async def get_auth_states() -> dict:
 async def clear_auth_state(platform: str):
     db = get_db()
     await db.auth_state.delete_one({"platform": platform})
-
-
-# --- Login Failure Tracking ---
-
-async def increment_login_failure(platform: str) -> int:
-    db = get_db()
-    from datetime import datetime
-    result = await db.login_failures.find_one_and_update(
-        {"platform": platform},
-        {"$inc": {"count": 1}, "$set": {"last_failed_at": datetime.utcnow()}},
-        upsert=True,
-        return_document=True,
-    )
-    return result.get("count", 1) if result else 1
-
-
-async def reset_login_failures(platform: str):
-    db = get_db()
-    await db.login_failures.update_one(
-        {"platform": platform},
-        {"$set": {"count": 0}},
-        upsert=True,
-    )
-
-
-async def get_login_failures(platform: str) -> int:
-    db = get_db()
-    doc = await db.login_failures.find_one({"platform": platform})
-    return doc.get("count", 0) if doc else 0
 
 
 # --- Stats ---
