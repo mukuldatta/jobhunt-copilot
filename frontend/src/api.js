@@ -33,3 +33,7 @@ export const autoApply = (jobId) => api.post(`/jobs/${jobId}/auto-apply`)
 export const getStats = () => api.get('/stats')
 export const triggerScrape = (data) => api.post('/scrape/trigger', data)
 export const triggerScoring = () => api.post('/score/trigger')
+
+export const getAuthStatus = () => api.get('/auth/status')
+export const platformLogin = (platform) => api.post(`/auth/${platform}/login`)
+export const runAutoApply = (data) => api.post('/auto-apply/run', data)

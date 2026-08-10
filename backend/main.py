@@ -226,6 +226,32 @@ async def trigger_scrape(background_tasks: BackgroundTasks, body: ScrapeRequest 
     return {"message": "Scrape started in background. Refresh jobs in a few minutes."}
 
 
+@app.get("/auth/status")
+async def auth_status():
+    from db.mongodb import get_auth_states
+    from agents.apply_agent import SUPPORTED_PLATFORMS
+    states = await get_auth_states()
+    return {"platforms": [
+        {"platform": p, "logged_in_at": states.get(p), "logged_in": states.get(p) is not None}
+        for p in SUPPORTED_PLATFORMS
+    ]}
+
+
+@app.post("/auth/{platform}/login")
+async def auth_login(platform: str, background_tasks: BackgroundTasks):
+    from agents.apply_agent import ApplyAgent, SUPPORTED_PLATFORMS
+    if platform not in SUPPORTED_PLATFORMS:
+        raise HTTPException(status_code=400, detail=f"Unsupported platform '{platform}'")
+
+    async def _run():
+        result = await ApplyAgent().login_interactive(platform)
+        print(f"AuthLogin [{platform}]: {result.get('status')} — {result.get('message', '')}")
+
+    background_tasks.add_task(_run)
+    return {"message": f"Opening a browser to sign in to {platform.title()}. "
+                       f"Complete the login in that window — the session will be saved."}
+
+
 @app.post("/auto-apply/run")
 async def auto_apply_run(background_tasks: BackgroundTasks, body: AutoApplyRunRequest = AutoApplyRunRequest()):
     from services.orchestrator import run_auto_apply_cycle

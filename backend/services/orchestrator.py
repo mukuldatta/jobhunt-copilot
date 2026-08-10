@@ -21,7 +21,7 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 
-from db.mongodb import get_apply_candidates, count_applications_today, get_login_failures
+from db.mongodb import get_apply_candidates, count_applications_today
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -74,16 +74,16 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
 
     results = {}
     log = []
-    consecutive_login_fail = 0
+    login_needed = set()   # platforms not signed in — skip their remaining jobs
     delay_min = _int("AUTO_APPLY_DELAY_MIN_SEC", 20)
     delay_max = _int("AUTO_APPLY_DELAY_MAX_SEC", 40)
 
     for job in candidates:
         source = job.get("source", "")
-        if source and await get_login_failures(source) >= 5:
-            results["skipped_platform"] = results.get("skipped_platform", 0) + 1
-            log.append({"job": job.get("title"), "result": "skipped_platform",
-                        "msg": f"{source} login disabled after repeated failures"})
+        if source in login_needed:
+            results["login_required"] = results.get("login_required", 0) + 1
+            log.append({"job": job.get("title"), "result": "login_required",
+                        "msg": f"{source} not signed in — use the Login button"})
             continue
 
         result = await agent.apply(job)
@@ -93,13 +93,10 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
                     "result": st, "msg": result.get("message", "")})
         logger.info(f"AutoApply: [{st}] {job.get('title')} @ {job.get('company')} — {result.get('message','')}")
 
-        if st == "login_failed":
-            consecutive_login_fail += 1
-            if consecutive_login_fail >= 3:
-                log.append({"result": "halted", "msg": "3 consecutive login failures — stopping cycle"})
-                break
-        else:
-            consecutive_login_fail = 0
+        if st == "login_required":
+            # No live session for this platform; stop trying it this cycle.
+            login_needed.add(source)
+            continue
 
         await asyncio.sleep(random.uniform(delay_min, delay_max))
 

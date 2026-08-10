@@ -277,6 +277,26 @@ async def cache_sponsorship(company: str, status: str):
     )
 
 
+# --- Auth session state (manual login persisted in browser profiles) ---
+
+async def save_auth_state(platform: str):
+    from datetime import datetime
+    db = get_db()
+    await db.auth_state.replace_one(
+        {"platform": platform},
+        {"platform": platform, "logged_in_at": datetime.utcnow()},
+        upsert=True,
+    )
+
+
+async def get_auth_states() -> dict:
+    db = get_db()
+    out = {}
+    async for doc in db.auth_state.find({}, {"_id": 0}):
+        out[doc["platform"]] = doc.get("logged_in_at")
+    return out
+
+
 # --- Login Failure Tracking ---
 
 async def increment_login_failure(platform: str) -> int:

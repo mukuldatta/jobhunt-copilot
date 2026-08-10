@@ -8,10 +8,10 @@ from agents.tailor_agent import TailorAgent
 from config.apply_profile import AnswerProfile
 from utils.pdf_generator import generate_resume_pdf
 from utils.resume_validator import validate_tailored_resume
-from services.alert_service import send_login_failure_alert, send_manual_action_alert
+from services.alert_service import send_manual_action_alert
 from db.mongodb import (
-    increment_login_failure, reset_login_failures,
     get_application_by_job_id, claim_job_for_apply, finish_job_apply, record_application,
+    save_auth_state,
 )
 from dotenv import load_dotenv
 
@@ -39,56 +39,42 @@ LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "appl
 # bot signal, and two runs must never submit the same job at once.
 _APPLY_LOCK = asyncio.Lock()
 
-# Per-platform login config. The apply flow is otherwise generic.
+# Per-platform config. We do NOT automate login (platform login pages are
+# obfuscated and gated by 2FA/CAPTCHA). Instead you log in once by hand via the
+# Login button; the persistent browser profile keeps the session, and the apply
+# flow just detects whether that session is still valid.
 LOGIN = {
     "linkedin": {
         "home_url": "https://www.linkedin.com/feed/",
         "login_url": "https://www.linkedin.com/login",
-        "email_sel": "#username",
-        "pass_sel": "#password",
-        "submit_sel": "button[type='submit']",
         "logged_in_sel": "img.global-nav__me-photo, div.global-nav__me, button.global-nav__primary-link-me-menu-trigger",
         "fail_url_tokens": ["/login", "authwall", "checkpoint", "signup"],
     },
     "naukri": {
         "home_url": "https://www.naukri.com/mnjuser/homepage",
         "login_url": "https://www.naukri.com/nlogin/login",
-        "email_sel": "input[placeholder*='Email'], #usernameField",
-        "pass_sel": "input[placeholder*='Password'], #passwordField",
-        "submit_sel": "button[type='submit']",
         "logged_in_sel": "a[href*='mnjuser/profile'], .nI-gNb-drawer__bars, .view-profile-wrapper",
         "fail_url_tokens": ["nlogin", "/login"],
     },
     "indeed": {
         "home_url": "https://in.indeed.com/",
-        "login_url": "https://in.indeed.com/account/login",
-        "email_sel": "input[name='__email'], input[type='email'], #ifl-InputFormField-3",
-        "pass_sel": "input[name='__password'], input[type='password']",
-        "submit_sel": "button[type='submit'], button[data-testid='login-button']",
+        "login_url": "https://secure.indeed.com/auth",
         "logged_in_sel": "[data-gnav-element-name='AccountMenu'], #gnav-main-AccountButton",
-        "fail_url_tokens": ["account/login", "/login", "signin"],
+        "fail_url_tokens": ["account/login", "/auth", "signin"],
     },
     "dice": {
         "home_url": "https://www.dice.com/dashboard/",
         "login_url": "https://www.dice.com/dashboard/login",
-        "email_sel": "input[name='email'], input[type='email']",
-        "pass_sel": "input[name='password'], input[type='password']",
-        "submit_sel": "button[type='submit']",
         "logged_in_sel": "[data-cy='nav-profile'], a[href*='dashboard']",
         "fail_url_tokens": ["/login", "signin"],
     },
 }
 
+SUPPORTED_PLATFORMS = list(LOGIN.keys())
+
 
 class ApplyAgent:
     def __init__(self):
-        self.creds = {
-            "linkedin": (os.environ.get("LINKEDIN_EMAIL", ""), os.environ.get("LINKEDIN_PASSWORD", "")),
-            "naukri": (os.environ.get("NAUKRI_EMAIL", os.environ.get("LINKEDIN_EMAIL", "")),
-                       os.environ.get("NAUKRI_PASSWORD", os.environ.get("LINKEDIN_PASSWORD", ""))),
-            "indeed": (os.environ.get("INDEED_EMAIL", ""), os.environ.get("INDEED_PASSWORD", "")),
-            "dice": (os.environ.get("DICE_EMAIL", ""), os.environ.get("DICE_PASSWORD", "")),
-        }
         first = os.environ.get("USER_FIRST_NAME", "Mukul")
         last = os.environ.get("USER_LAST_NAME", "Mokkapati")
         self.user_name = f"{first} {last}"
@@ -99,6 +85,7 @@ class ApplyAgent:
         # Headed is required for manual CAPTCHA. Only go headless if explicitly asked.
         self.headless = os.environ.get("APPLY_HEADLESS", "").strip().lower() in ("1", "true", "yes")
         self.human_timeout = int(os.environ.get("APPLY_HUMAN_TIMEOUT", "300"))
+        self.login_timeout = int(os.environ.get("LOGIN_TIMEOUT", "420"))
 
     # ── Public entrypoint ────────────────────────────────────────────────────
 
@@ -144,9 +131,12 @@ class ApplyAgent:
             })
         elif status in ("manual_required", "needs_review"):
             await finish_job_apply(job_id, "manual_required")
+        elif status == "login_required":
+            # Not a failure — just release it so it's retried once you log in.
+            await finish_job_apply(job_id, "new")
         elif status == "already_applied":
             pass
-        else:  # login_failed, credentials_missing, error
+        else:  # error
             await finish_job_apply(job_id, "apply_failed")
 
     async def _do_apply(self, job: dict) -> dict:
@@ -218,10 +208,10 @@ class ApplyAgent:
     # ── Browser session (headed + persistent) ────────────────────────────────
 
     @asynccontextmanager
-    async def _session(self, pw, platform: str):
+    async def _session(self, pw, platform: str, headed: bool = None):
         user_dir = os.path.join(PROFILE_ROOT, platform)
         os.makedirs(user_dir, exist_ok=True)
-        ctx = await self._launch_persistent(pw, user_dir)
+        ctx = await self._launch_persistent(pw, user_dir, headed=headed)
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             try:
@@ -235,8 +225,9 @@ class ApplyAgent:
             except Exception:
                 pass
 
-    async def _launch_persistent(self, pw, user_dir: str):
-        opts = dict(headless=self.headless, viewport={"width": 1360, "height": 900},
+    async def _launch_persistent(self, pw, user_dir: str, headed: bool = None):
+        headless = self.headless if headed is None else (not headed)
+        opts = dict(headless=headless, viewport={"width": 1360, "height": 900},
                     locale="en-IN", user_agent=UA)
         try:
             return await pw.chromium.launch_persistent_context(user_dir, channel="chrome", **opts)
@@ -244,13 +235,15 @@ class ApplyAgent:
             print(f"    ApplyAgent: real Chrome unavailable ({e}); using bundled Chromium")
             return await pw.chromium.launch_persistent_context(user_dir, **opts)
 
-    # ── Login with human-in-the-loop fallback ────────────────────────────────
+    # ── Session detection + interactive (manual) login ───────────────────────
 
     async def _ensure_login(self, page, platform: str) -> dict:
+        """
+        Check whether the persistent profile still has a valid session. We never
+        automate login — if the session isn't warm, return login_required so you
+        can sign in via the Login button and the job is retried afterwards.
+        """
         cfg = LOGIN[platform]
-        email, password = self.creds[platform]
-
-        # 1. Warm persistent session? Then we're done.
         try:
             await page.goto(cfg["home_url"], wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
@@ -258,59 +251,51 @@ class ApplyAgent:
             pass
         if await self._is_logged_in(page, cfg):
             return {"ok": True}
-
-        # 2. Best-effort automated credential login.
-        if email and password:
-            try:
-                await page.goto(cfg["login_url"], wait_until="domcontentloaded", timeout=30000)
-                await asyncio.sleep(2)
-                await page.fill(cfg["email_sel"], email)
-                pass_el = await page.query_selector(cfg["pass_sel"])
-                if pass_el:
-                    await page.fill(cfg["pass_sel"], password)
-                await page.click(cfg["submit_sel"])
-                await asyncio.sleep(3)
-                # Email-first flows (Indeed): password appears on the next page.
-                if not pass_el:
-                    pass_el2 = await page.query_selector(cfg["pass_sel"])
-                    if pass_el2:
-                        await pass_el2.fill(password)
-                        await page.click(cfg["submit_sel"])
-                        await asyncio.sleep(3)
-            except Exception as e:
-                print(f"    {platform} auto-login error (will fall back to manual): {e}")
-
-        if await self._is_logged_in(page, cfg):
-            await reset_login_failures(platform)
-            return {"ok": True}
-
-        # 3. Human fallback — only possible with a visible window.
-        if self.headless:
-            count = await increment_login_failure(platform)
-            if count >= 5:
-                send_login_failure_alert(platform, count)
-            return {"ok": False, "result": {
-                "status": "login_failed",
-                "message": (f"{platform} not logged in and running headless. Run with a visible "
-                            f"browser (APPLY_HEADLESS unset) and log in once."),
-            }}
-
-        ok = await self._wait_for_human(
-            page, platform,
-            f"log in to {platform.title()} (solve 2FA / CAPTCHA / manual login) in the browser window",
-            done_check=lambda: self._is_logged_in(page, cfg),
-        )
-        if ok:
-            await reset_login_failures(platform)
-            return {"ok": True}
-
-        count = await increment_login_failure(platform)
-        if count >= 5:
-            send_login_failure_alert(platform, count)
         return {"ok": False, "result": {
-            "status": "login_failed",
-            "message": f"{platform} login not completed within {self.human_timeout}s.",
+            "status": "login_required",
+            "message": (f"Not signed in to {platform.title()}. Use the {platform.title()} "
+                        f"Login button, sign in, then run apply again."),
         }}
+
+    async def login_interactive(self, platform: str, timeout: int = None) -> dict:
+        """
+        Open a visible browser to the platform and wait for YOU to log in by
+        hand (including 2FA/CAPTCHA). On success the session is saved in the
+        persistent profile and reused by the apply flow. Triggered by the Login
+        button / POST /auth/{platform}/login.
+        """
+        if platform not in LOGIN:
+            return {"status": "error", "message": f"Unsupported platform '{platform}'."}
+        timeout = timeout or self.login_timeout
+        cfg = LOGIN[platform]
+
+        async with _APPLY_LOCK:  # never share a profile dir with a running apply
+            async with async_playwright() as pw:
+                async with self._session(pw, platform, headed=True) as (ctx, page):
+                    try:
+                        await page.goto(cfg["home_url"], wait_until="domcontentloaded", timeout=30000)
+                        await asyncio.sleep(2)
+                    except Exception:
+                        pass
+                    if await self._is_logged_in(page, cfg):
+                        await save_auth_state(platform)
+                        return {"status": "already_logged_in", "platform": platform,
+                                "message": f"Already signed in to {platform.title()}."}
+                    try:
+                        await page.goto(cfg["login_url"], wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass
+                    ok = await self._wait_for_human(
+                        page, platform, f"Sign in to {platform.title()} in this window",
+                        done_check=lambda: self._is_logged_in(page, cfg),
+                        timeout=timeout, notify=False,
+                    )
+                    if ok:
+                        await save_auth_state(platform)
+                        return {"status": "logged_in", "platform": platform,
+                                "message": f"Signed in to {platform.title()} — session saved."}
+                    return {"status": "timeout", "platform": platform,
+                            "message": f"No sign-in detected within {timeout}s."}
 
     async def _is_logged_in(self, page, cfg: dict) -> bool:
         url = page.url.lower()
@@ -342,21 +327,24 @@ class ApplyAgent:
         except Exception:
             return False
 
-    async def _wait_for_human(self, page, platform: str, reason: str, done_check=None) -> bool:
+    async def _wait_for_human(self, page, platform: str, reason: str, done_check=None,
+                              timeout: int = None, notify: bool = True) -> bool:
         """
-        Pause a headed apply and wait for you to clear a CAPTCHA / 2FA / manual
-        step in the open browser window. Notifies you, then polls until the
-        challenge is resolved (done_check true, or CAPTCHA gone) or times out.
+        Pause a headed browser and wait for you to clear a CAPTCHA / 2FA / manual
+        step in the open window. Polls until resolved (done_check true, or CAPTCHA
+        gone) or times out. `notify` pings you (skip it for button-initiated login).
         """
+        timeout = timeout or self.human_timeout
         print(f"    [PAUSE] MANUAL ACTION [{platform}]: {reason}")
-        print(f"            Solve it in the open browser window. Waiting up to {self.human_timeout}s...")
-        try:
-            send_manual_action_alert(platform, reason, page.url)
-        except Exception:
-            pass
+        print(f"            Act in the open browser window. Waiting up to {timeout}s...")
+        if notify:
+            try:
+                send_manual_action_alert(platform, reason, page.url)
+            except Exception:
+                pass
 
         waited, interval = 0, 5
-        while waited < self.human_timeout:
+        while waited < timeout:
             await asyncio.sleep(interval)
             waited += interval
             try:
@@ -369,7 +357,7 @@ class ApplyAgent:
                     return True
             except Exception:
                 pass
-        print(f"    [TIMEOUT] [{platform}] no human action within {self.human_timeout}s — giving up.")
+        print(f"    [TIMEOUT] [{platform}] no human action within {timeout}s — giving up.")
         return False
 
     async def _guard_captcha(self, page, platform: str) -> bool:
@@ -514,7 +502,8 @@ class ApplyAgent:
         await asyncio.sleep(2)
 
         easy_apply = await page.query_selector(
-            'button.jobs-apply-button, button[aria-label*="Easy Apply"], .jobs-s-apply button'
+            'button.jobs-apply-button, button[aria-label*="Easy Apply"], '
+            'button:has-text("Easy Apply"), .jobs-s-apply button'
         )
         if not easy_apply:
             return self._external_apply(job)
@@ -591,7 +580,7 @@ class ApplyAgent:
             return {"status": "needs_review", "url": page.url, "message": "CAPTCHA not cleared on Naukri."}
 
         apply_btn = await page.query_selector(
-            'button#apply-button, a#apply-button, button[title*="Apply"]'
+            'button#apply-button, a#apply-button, button.apply-button, button[title*="Apply"]'
         )
         if not apply_btn:
             return self._external_apply(job)
