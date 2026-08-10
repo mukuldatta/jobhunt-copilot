@@ -152,6 +152,52 @@ async def get_applications(skip: int = 0, limit: int = 50) -> list:
     return apps
 
 
+async def get_application_by_job_id(job_id: str) -> dict:
+    db = get_db()
+    return await db.applications.find_one({"job_id": job_id})
+
+
+async def claim_job_for_apply(job_id: str) -> bool:
+    """
+    Atomically transition a job into the 'applying' state. Returns True only if
+    this call won the claim; returns False if the job is already applied or an
+    apply is already in progress. This is the dedup guard that stops an
+    autonomous loop from applying to the same job twice.
+    """
+    from datetime import datetime
+    db = get_db()
+    res = await db.jobs.find_one_and_update(
+        {"job_id": job_id, "status": {"$nin": ["applied", "applying"]}},
+        {"$set": {"status": "applying", "apply_started_at": datetime.utcnow()}},
+    )
+    return res is not None
+
+
+async def finish_job_apply(job_id: str, status: str) -> bool:
+    """Set the terminal job status after an apply attempt."""
+    from datetime import datetime
+    db = get_db()
+    result = await db.jobs.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": status, "apply_finished_at": datetime.utcnow()}},
+    )
+    return result.modified_count > 0
+
+
+async def record_application(job_id: str, doc: dict) -> str:
+    """Idempotent upsert of an application, keyed by job_id."""
+    db = get_db()
+    payload = dict(doc)
+    payload["job_id"] = job_id
+    result = await db.applications.update_one(
+        {"job_id": job_id}, {"$set": payload}, upsert=True
+    )
+    if result.upserted_id:
+        return str(result.upserted_id)
+    existing = await db.applications.find_one({"job_id": job_id}, {"_id": 1})
+    return str(existing["_id"]) if existing else ""
+
+
 async def get_application(application_id: str) -> dict:
     from bson import ObjectId
     db = get_db()

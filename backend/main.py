@@ -146,22 +146,14 @@ async def auto_apply(job_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="Job not found")
 
     async def _run_apply():
+        # ApplyAgent.apply() now owns dedup, job-status transitions, and
+        # recording the application — so we just kick it off and log.
         agent = ApplyAgent()
         result = await agent.apply(job)
-        status = result.get("status")
-        print(f"AutoApply [{job_id}]: {status} — {result.get('message', '')}")
-        if status == "applied":
-            from datetime import datetime
-            await update_job(job_id, {"status": "applied"})
-            await insert_application({
-                "job_id": job_id,
-                "status": "applied",
-                "applied_at": datetime.utcnow(),
-                "notes": "Auto-applied via ApplyAgent",
-            })
+        print(f"AutoApply [{job_id}]: {result.get('status')} — {result.get('message', '')}")
 
     background_tasks.add_task(_run_apply)
-    return {"message": "Auto-apply started in background. Check Railway logs for result."}
+    return {"message": "Auto-apply started in background. A browser window may open — watch the logs for result."}
 
 
 @app.post("/jobs/{job_id}/cover-letter")

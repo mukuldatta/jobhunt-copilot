@@ -87,6 +87,49 @@ def send_sms_alert(job: dict):
         print(f"SMS alert failed: {e}")
 
 
+def send_manual_action_alert(platform: str, reason: str, url: str = ""):
+    """
+    Fired when the headed apply browser hits a CAPTCHA / 2FA / verification step
+    that only a human can clear. The browser window stays open and waits — this
+    just pings you to go solve it.
+    """
+    html = f"""
+    <div style="font-family: Inter, sans-serif; background: #0F1117; color: #E0E0E0; padding: 24px; border-radius: 8px;">
+        <h2 style="color: #FFC107;">🙋 Manual action needed — {platform.title()}</h2>
+        <p><strong style="color: #4FC3F7;">{reason}</strong></p>
+        <p style="color: #9E9E9E;">The auto-apply browser window is open and paused, waiting for you to
+        solve it. Once you do, it continues on its own. If you don't act in time, this apply is skipped.</p>
+        {f'<p style="color:#9E9E9E;">Page: <a href="{url}" style="color:#4FC3F7;">{url}</a></p>' if url else ''}
+    </div>
+    """
+    message = Mail(
+        from_email=os.environ.get("SENDGRID_FROM_EMAIL"),
+        to_emails=os.environ.get("MY_EMAIL"),
+        subject=f"🙋 JobHunt Copilot: solve {platform.title()} verification to continue applying",
+        html_content=html,
+    )
+    try:
+        sg = SendGridAPIClient(os.environ.get("SENDGRID_API_KEY"))
+        sg.send(message)
+        print(f"Manual-action email sent for {platform}: {reason}")
+    except Exception as e:
+        print(f"Manual-action email failed: {e}")
+
+    body = f"JobHunt: solve {platform.title()} verification in the open browser to keep applying."
+    try:
+        client = TwilioClient(
+            os.environ.get("TWILIO_ACCOUNT_SID"),
+            os.environ.get("TWILIO_AUTH_TOKEN"),
+        )
+        client.messages.create(
+            body=body[:160],
+            from_=os.environ.get("TWILIO_PHONE_NUMBER"),
+            to=os.environ.get("MY_PHONE"),
+        )
+    except Exception as e:
+        print(f"Manual-action SMS failed: {e}")
+
+
 def send_login_failure_alert(platform: str, count: int):
     html = f"""
     <div style="font-family: Inter, sans-serif; background: #0F1117; color: #E0E0E0; padding: 24px; border-radius: 8px;">

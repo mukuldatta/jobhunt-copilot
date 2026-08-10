@@ -29,5 +29,9 @@ Thumbs.db
 
 # Playwright browsers (downloaded at build time by Docker)
 /ms-playwright/
+
+# Persistent browser login profiles + apply debug screenshots (local only)
+backend/.browser_profiles/
+backend/logs/
 .claude/
 CLAUDE.md
