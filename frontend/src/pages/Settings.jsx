@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { uploadResume, getAuthStatus, platformLogin, runAutoApply } from '../api'
+import { uploadResume, getAuthStatus, platformLogin, platformCheck, runAutoApply } from '../api'
 
 const PLATFORM_LABELS = { naukri: 'Naukri', linkedin: 'LinkedIn', indeed: 'Indeed', dice: 'Dice' }
 
@@ -12,6 +12,7 @@ export default function Settings() {
   // --- Session login ---
   const [platforms, setPlatforms] = useState([])
   const [loginMsg, setLoginMsg] = useState(null)
+  const [checking, setChecking] = useState(null)
 
   // --- Auto-apply ---
   const [applyBusy, setApplyBusy] = useState(false)
@@ -38,6 +39,20 @@ export default function Settings() {
       setError(e.response?.data?.detail || 'Upload failed')
     } finally {
       setUploading(false)
+    }
+  }
+
+  async function handleCheck(platform) {
+    setChecking(platform); setLoginMsg(null)
+    try {
+      const res = await platformCheck(platform)
+      setPlatforms(prev => prev.map(p =>
+        p.platform === platform ? { ...p, logged_in: res.data.logged_in } : p))
+      setLoginMsg(`${PLATFORM_LABELS[platform] || platform}: ${res.data.logged_in ? 'signed in' : 'not signed in'}`)
+    } catch (e) {
+      setLoginMsg(e.response?.data?.detail || `Could not check ${platform}`)
+    } finally {
+      setChecking(null)
     }
   }
 
@@ -107,10 +122,16 @@ export default function Settings() {
                 <span className="text-textPrimary text-sm">{PLATFORM_LABELS[p.platform] || p.platform}</span>
                 <span className="text-textSecondary text-xs">{p.logged_in ? 'signed in' : 'not signed in'}</span>
               </div>
-              <button onClick={() => handleLogin(p.platform)}
-                className="px-3 py-1 text-xs font-medium rounded border border-accent text-accent hover:bg-accent hover:text-bg transition-colors">
-                {p.logged_in ? 'Re-login' : 'Login'}
-              </button>
+              <div className="flex items-center gap-2">
+                <button onClick={() => handleCheck(p.platform)} disabled={checking === p.platform}
+                  className="px-3 py-1 text-xs font-medium rounded border border-border text-textSecondary hover:text-textPrimary hover:border-textSecondary disabled:opacity-50 transition-colors">
+                  {checking === p.platform ? 'Checking...' : 'Check'}
+                </button>
+                <button onClick={() => handleLogin(p.platform)}
+                  className="px-3 py-1 text-xs font-medium rounded border border-accent text-accent hover:bg-accent hover:text-bg transition-colors">
+                  {p.logged_in ? 'Re-login' : 'Login'}
+                </button>
+              </div>
             </div>
           ))}
         </div>

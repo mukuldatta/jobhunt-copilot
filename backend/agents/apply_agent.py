@@ -11,7 +11,7 @@ from utils.resume_validator import validate_tailored_resume
 from services.alert_service import send_manual_action_alert
 from db.mongodb import (
     get_application_by_job_id, claim_job_for_apply, finish_job_apply, record_application,
-    save_auth_state,
+    save_auth_state, clear_auth_state,
 )
 from dotenv import load_dotenv
 
@@ -296,6 +296,32 @@ class ApplyAgent:
                                 "message": f"Signed in to {platform.title()} — session saved."}
                     return {"status": "timeout", "platform": platform,
                             "message": f"No sign-in detected within {timeout}s."}
+
+    async def check_login(self, platform: str) -> dict:
+        """
+        Live probe: open the persistent session and verify against the actual
+        page whether it's still signed in, then reconcile the stored auth state.
+        Runs headed because headless loads are unreliable on these sites (Naukri
+        Akamai / LinkedIn auth walls), which would give false negatives.
+        """
+        if platform not in LOGIN:
+            return {"platform": platform, "logged_in": False, "error": "unsupported"}
+        cfg = LOGIN[platform]
+        logged_in = False
+        async with _APPLY_LOCK:  # never share a profile dir with an apply/login
+            async with async_playwright() as pw:
+                async with self._session(pw, platform, headed=True) as (ctx, page):
+                    try:
+                        await page.goto(cfg["home_url"], wait_until="domcontentloaded", timeout=30000)
+                        await asyncio.sleep(2)
+                    except Exception:
+                        pass
+                    logged_in = await self._is_logged_in(page, cfg)
+        if logged_in:
+            await save_auth_state(platform)
+        else:
+            await clear_auth_state(platform)
+        return {"platform": platform, "logged_in": logged_in}
 
     async def _is_logged_in(self, page, cfg: dict) -> bool:
         url = page.url.lower()

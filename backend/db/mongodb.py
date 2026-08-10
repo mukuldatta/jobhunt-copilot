@@ -297,6 +297,11 @@ async def get_auth_states() -> dict:
     return out
 
 
+async def clear_auth_state(platform: str):
+    db = get_db()
+    await db.auth_state.delete_one({"platform": platform})
+
+
 # --- Login Failure Tracking ---
 
 async def increment_login_failure(platform: str) -> int:

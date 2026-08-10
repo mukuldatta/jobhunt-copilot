@@ -36,4 +36,5 @@ export const triggerScoring = () => api.post('/score/trigger')
 
 export const getAuthStatus = () => api.get('/auth/status')
 export const platformLogin = (platform) => api.post(`/auth/${platform}/login`)
+export const platformCheck = (platform) => api.post(`/auth/${platform}/check`, null, { timeout: 90000 })
 export const runAutoApply = (data) => api.post('/auto-apply/run', data)

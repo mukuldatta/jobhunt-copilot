@@ -237,6 +237,15 @@ async def auth_status():
     ]}
 
 
+@app.post("/auth/{platform}/check")
+async def auth_check(platform: str):
+    from agents.apply_agent import ApplyAgent, SUPPORTED_PLATFORMS
+    if platform not in SUPPORTED_PLATFORMS:
+        raise HTTPException(status_code=400, detail=f"Unsupported platform '{platform}'")
+    # Live probe — runs inline (opens a browser briefly) and returns the truth.
+    return await ApplyAgent().check_login(platform)
+
+
 @app.post("/auth/{platform}/login")
 async def auth_login(platform: str, background_tasks: BackgroundTasks):
     from agents.apply_agent import ApplyAgent, SUPPORTED_PLATFORMS
