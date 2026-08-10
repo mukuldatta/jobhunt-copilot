@@ -7,6 +7,7 @@ from playwright.async_api import async_playwright
 from agents.tailor_agent import TailorAgent
 from config.apply_profile import AnswerProfile
 from utils.pdf_generator import generate_resume_pdf
+from utils.resume_validator import validate_tailored_resume
 from services.alert_service import send_login_failure_alert, send_manual_action_alert
 from db.mongodb import (
     increment_login_failure, reset_login_failures,
@@ -168,15 +169,51 @@ class ApplyAgent:
     # ── Resume ───────────────────────────────────────────────────────────────
 
     async def _make_resume(self, job: dict):
+        """
+        Tailor + validate the resume. If validation fails (fabricated skills,
+        truncation, dropped education), fall back to the ORIGINAL resume so an
+        honest document is submitted rather than a corrupted one. Returns
+        (pdf_path, text_that_was_used).
+        """
+        try:
+            from db.mongodb import get_resume
+            resume = await get_resume()
+        except Exception:
+            resume = None
+
         try:
             tailored_text = await TailorAgent().tailor(job)
+        except Exception as e:
+            print(f"ApplyAgent: tailoring failed: {e}")
+            tailored_text = None
+
+        final_text = None
+        if tailored_text and resume:
+            v = validate_tailored_resume(tailored_text, resume,
+                                         user_name=self.user_name, user_email=self.user_email)
+            if v["ok"]:
+                final_text = v["text"]
+                if v["issues"]:
+                    print(f"    Resume validation warnings: {v['issues']}")
+            else:
+                print(f"    Resume validation FAILED {v['issues']} — using original resume instead.")
+                final_text = resume.get("parsed_text")
+        elif tailored_text:
+            final_text = tailored_text  # no stored resume to validate against
+        elif resume:
+            final_text = resume.get("parsed_text")
+
+        if not final_text:
+            return None, None
+
+        try:
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
             tmp.close()
-            generate_resume_pdf(tailored_text, tmp.name)
-            return tmp.name, tailored_text
+            generate_resume_pdf(final_text, tmp.name)
+            return tmp.name, final_text
         except Exception as e:
-            print(f"ApplyAgent: resume tailoring failed: {e}")
-            return None, None
+            print(f"ApplyAgent: PDF generation failed: {e}")
+            return None, final_text
 
     # ── Browser session (headed + persistent) ────────────────────────────────
 
