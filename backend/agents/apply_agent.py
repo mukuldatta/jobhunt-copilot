@@ -5,6 +5,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright
 from agents.tailor_agent import TailorAgent
+from config.apply_profile import AnswerProfile
 from utils.pdf_generator import generate_resume_pdf
 from services.alert_service import send_login_failure_alert, send_manual_action_alert
 from db.mongodb import (
@@ -92,6 +93,7 @@ class ApplyAgent:
         self.user_name = f"{first} {last}"
         self.user_email = os.environ.get("MY_EMAIL", "mukulmokkapati@gmail.com")
         self.user_phone = os.environ.get("MY_PHONE", "")
+        self.answers = AnswerProfile()
 
         # Headed is required for manual CAPTCHA. Only go headless if explicitly asked.
         self.headless = os.environ.get("APPLY_HEADLESS", "").strip().lower() in ("1", "true", "yes")
@@ -371,6 +373,103 @@ class ApplyAgent:
         except Exception:
             pass
 
+    # ── Screening-question answering (structured profile, no guessing) ────────
+
+    async def _answer_form_fields(self, page) -> int:
+        """
+        Fill screening questions using the answer profile. Returns the number of
+        required questions the profile could NOT answer — the caller pauses for a
+        human on those instead of guessing.
+        """
+        # Convenience fills that are always safe.
+        if self.user_phone:
+            for sel in ['input[id*="phoneNumber"]', 'input[name*="phone"]', 'input[type="tel"]']:
+                el = await page.query_selector(sel)
+                if el:
+                    if not await el.input_value():
+                        await el.fill(self.user_phone)
+                    break
+        for sel in ['input[id*="email"]', 'input[type="email"]']:
+            el = await page.query_selector(sel)
+            if el:
+                if not await el.input_value():
+                    await el.fill(self.user_email)
+                break
+
+        unknown = 0
+        containers = await page.query_selector_all(
+            'div.fb-dash-form-element, div[data-test-form-element], '
+            'div[data-test-text-entity-list-form-component]'
+        )
+        for c in containers:
+            try:
+                label_el = await c.query_selector(
+                    'label, legend, span[data-test-form-element-label]'
+                )
+                label = (await label_el.inner_text()).strip() if label_el else ""
+                if not label:
+                    continue
+
+                select_el = await c.query_selector('select')
+                radios = await c.query_selector_all('input[type="radio"]')
+                text_el = await c.query_selector(
+                    'input[type="text"], input[type="number"], input:not([type]), textarea'
+                )
+                if not (select_el or radios or text_el):
+                    continue
+
+                ans = self.answers.answer(label)
+                if ans is None:
+                    unknown += 1
+                    continue
+
+                if select_el:
+                    await self._select_option(select_el, str(ans))
+                elif radios:
+                    await self._check_radio(c, radios, str(ans))
+                elif text_el:
+                    if not await text_el.input_value():
+                        await text_el.fill(str(ans))
+            except Exception:
+                continue
+        return unknown
+
+    async def _select_option(self, select_el, value: str):
+        try:
+            await select_el.select_option(label=value)
+            return
+        except Exception:
+            pass
+        try:
+            for opt in await select_el.query_selector_all('option'):
+                text = (await opt.inner_text()).strip().lower()
+                if text == value.lower() or value.lower() in text:
+                    await select_el.select_option(value=await opt.get_attribute('value'))
+                    return
+        except Exception:
+            pass
+
+    async def _check_radio(self, container, radios, value: str):
+        v = value.strip().lower()
+        for r in radios:
+            label = (await r.get_attribute('aria-label') or "").lower()
+            rvalue = (await r.get_attribute('value') or "").lower()
+            text = ""
+            rid = await r.get_attribute('id')
+            if rid:
+                lab = await container.query_selector(f'label[for="{rid}"]')
+                if lab:
+                    text = (await lab.inner_text()).strip().lower()
+            if v == rvalue or v in label or (text and v in text):
+                try:
+                    await r.check()
+                except Exception:
+                    try:
+                        await r.click()
+                    except Exception:
+                        pass
+                return
+
     # ── LinkedIn Easy Apply ──────────────────────────────────────────────────
 
     async def _apply_linkedin(self, page, job: dict, pdf_path: str = None) -> dict:
@@ -411,32 +510,21 @@ class ApplyAgent:
                     except Exception:
                         pass
 
-            # TODO(P1): replace these blind defaults with a structured answer profile
-            # (work-auth, notice period, CTC, relocation) + pause-for-human on unknowns.
-            if self.user_phone:
-                for sel in ['input[id*="phoneNumber"]', 'input[name*="phone"]', 'input[type="tel"]']:
-                    el = await page.query_selector(sel)
-                    if el:
-                        if not await el.input_value():
-                            await el.fill(self.user_phone)
-                        break
-
-            for sel in ['input[id*="email"]', 'input[type="email"]']:
-                el = await page.query_selector(sel)
-                if el:
-                    if not await el.input_value():
-                        await el.fill(self.user_email)
-                    break
-
-            for radio in await page.query_selector_all('input[type="radio"]'):
-                label = (await radio.get_attribute("aria-label") or "").lower()
-                value = (await radio.get_attribute("value") or "").lower()
-                if "yes" in label or value == "yes":
-                    await radio.check()
-
-            for inp in await page.query_selector_all('input[type="number"], input[class*="numeric"]'):
-                if not await inp.input_value():
-                    await inp.fill("3")
+            # Answer screening questions from the profile. Anything the profile
+            # can't answer safely is handed to you — the bot never guesses.
+            unknown = await self._answer_form_fields(page)
+            if unknown:
+                await self._wait_for_human(
+                    page, "linkedin",
+                    f"{unknown} screening question(s) I can't answer safely — please finish "
+                    f"and submit this application in the window",
+                    done_check=lambda: self._linkedin_modal_closed(page),
+                )
+                confirmed = await self._verify_submission(page)
+                if confirmed:
+                    return confirmed
+                return {"status": "needs_review", "url": page.url,
+                        "message": "Handed to you for screening questions — verify it submitted."}
 
             review_btn = await page.query_selector('button[aria-label="Review your application"]')
             next_btn = await page.query_selector('button[aria-label="Continue to next step"]')
@@ -449,6 +537,13 @@ class ApplyAgent:
 
         return {"status": "needs_review", "url": page.url,
                 "message": "Partially filled — could not reach final submit. Some questions need manual answers."}
+
+    async def _linkedin_modal_closed(self, page) -> bool:
+        try:
+            modal = await page.query_selector('div.jobs-easy-apply-modal, div[role="dialog"]')
+            return modal is None
+        except Exception:
+            return True
 
     # ── Naukri Apply ─────────────────────────────────────────────────────────
 
