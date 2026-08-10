@@ -126,6 +126,37 @@ async def get_high_match_jobs(threshold: int = 70) -> list:
     return jobs
 
 
+async def get_apply_candidates(min_score: int = 70, region: str = "india", limit: int = 5) -> list:
+    """
+    Jobs eligible for auto-apply: still 'new', scored at/above the threshold, in
+    the target region. Excludes anything already applied/applying/manual/failed
+    (those are no longer status 'new'). Highest score first.
+    """
+    db = get_db()
+    query = {"status": "new", "match_score": {"$gte": min_score}}
+    if region == "india":
+        query["$or"] = [
+            {"region": "india"},
+            {"location": {"$regex": _INDIA_CITIES, "$options": "i"}},
+        ]
+    cursor = db.jobs.find(query).sort("match_score", -1).limit(limit)
+    jobs = []
+    async for job in cursor:
+        job["id"] = str(job.pop("_id"))
+        jobs.append(job)
+    return jobs
+
+
+async def count_applications_today() -> int:
+    from datetime import datetime
+    db = get_db()
+    start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    return await db.applications.count_documents({
+        "applied_at": {"$gte": start},
+        "status": {"$ne": "saved"},
+    })
+
+
 async def delete_old_jobs(days: int = 7) -> int:
     db = get_db()
     from datetime import datetime, timedelta

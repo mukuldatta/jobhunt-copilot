@@ -123,6 +123,12 @@ class ScrapeRequest(BaseModel):
     max_jobs: int = 50
 
 
+class AutoApplyRunRequest(BaseModel):
+    max_apply: Optional[int] = None
+    dry_run: bool = False
+    force: bool = False
+
+
 class TailorRequest(BaseModel):
     job_id: str
 

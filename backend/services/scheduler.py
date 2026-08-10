@@ -1,5 +1,6 @@
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+import os
 import logging
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,15 @@ def setup_scheduler():
     scheduler.add_job(score_new_jobs, IntervalTrigger(minutes=30), id="score_jobs", replace_existing=True)
     scheduler.add_job(send_alerts, IntervalTrigger(minutes=30), id="send_alerts", replace_existing=True)
     scheduler.add_job(cleanup_old_jobs, IntervalTrigger(hours=24), id="cleanup_jobs", replace_existing=True)
+
+    # Autonomous apply is opt-in: it opens a real browser window and submits
+    # applications, so it only runs on a schedule when AUTO_APPLY_ENABLED is set.
+    if os.environ.get("AUTO_APPLY_ENABLED", "").strip().lower() in ("1", "true", "yes"):
+        from services.orchestrator import run_auto_apply_cycle
+        interval = int(os.environ.get("AUTO_APPLY_INTERVAL_MIN", "60"))
+        scheduler.add_job(run_auto_apply_cycle, IntervalTrigger(minutes=interval),
+                          id="auto_apply", replace_existing=True)
+        logger.info(f"Auto-apply scheduled every {interval} minutes")
 
     scheduler.start()
     logger.info("Scheduler started — running every 30 minutes")

@@ -16,7 +16,7 @@ from db.mongodb import (
     get_resume, save_resume, get_stats,
 )
 from models.schemas import (
-    ApplicationStatusUpdate, ScrapeRequest,
+    ApplicationStatusUpdate, ScrapeRequest, AutoApplyRunRequest,
 )
 from utils.resume_parser import parse_resume_pdf
 from utils.pdf_generator import generate_resume_pdf
@@ -224,6 +224,22 @@ async def trigger_scrape(background_tasks: BackgroundTasks, body: ScrapeRequest 
     agent.max_jobs_per_source = min(body.max_jobs, 100)
     background_tasks.add_task(agent.scrape_all)
     return {"message": "Scrape started in background. Refresh jobs in a few minutes."}
+
+
+@app.post("/auto-apply/run")
+async def auto_apply_run(background_tasks: BackgroundTasks, body: AutoApplyRunRequest = AutoApplyRunRequest()):
+    from services.orchestrator import run_auto_apply_cycle
+
+    # dry_run is fast and read-only — run inline so the preview comes right back.
+    if body.dry_run:
+        return await run_auto_apply_cycle(max_apply=body.max_apply, dry_run=True)
+
+    async def _run():
+        result = await run_auto_apply_cycle(max_apply=body.max_apply, force=body.force)
+        print(f"AutoApplyCycle: {result.get('status')} — results={result.get('results', result.get('message',''))}")
+
+    background_tasks.add_task(_run)
+    return {"message": "Auto-apply cycle started in background. A browser window may open; watch the logs."}
 
 
 @app.post("/score/trigger")
