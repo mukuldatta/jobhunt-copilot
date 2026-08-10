@@ -5,9 +5,10 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright
 from agents.tailor_agent import TailorAgent
+from agents.cover_letter_agent import CoverLetterAgent
 from config.apply_profile import AnswerProfile
 from utils.pdf_generator import generate_resume_pdf
-from utils.resume_validator import validate_tailored_resume
+from utils.resume_validator import validate_tailored_resume, clean_resume_text
 from services.alert_service import send_manual_action_alert
 from db.mongodb import (
     get_application_by_job_id, claim_job_for_apply, finish_job_apply, record_application,
@@ -127,6 +128,7 @@ class ApplyAgent:
                 "status": "applied",
                 "applied_at": datetime.utcnow(),
                 "tailored_resume_text": result.pop("_tailored_text", None),
+                "cover_letter": result.pop("_cover_letter", None),
                 "notes": "Auto-applied via ApplyAgent",
             })
         elif status in ("manual_required", "needs_review"):
@@ -141,7 +143,6 @@ class ApplyAgent:
 
     async def _do_apply(self, job: dict) -> dict:
         source = job["source"]
-        pdf_path, tailored_text = await self._make_resume(job)
 
         async with async_playwright() as pw:
             async with self._session(pw, source) as (ctx, page):
@@ -149,11 +150,19 @@ class ApplyAgent:
                 if not login["ok"]:
                     return login["result"]
 
-                handler = getattr(self, f"_apply_{source}")
-                result = await handler(page, job, pdf_path)
+                # Generate documents only after login is confirmed, so a
+                # login_required job never burns LLM calls.
+                pdf_path, tailored_text = await self._make_resume(job)
+                cover_letter = await self._make_cover_letter(job)
 
-        if tailored_text and result.get("status") == "applied":
-            result["_tailored_text"] = tailored_text
+                handler = getattr(self, f"_apply_{source}")
+                result = await handler(page, job, pdf_path, cover_letter)
+
+        if result.get("status") == "applied":
+            if tailored_text:
+                result["_tailored_text"] = tailored_text
+            if cover_letter:
+                result["_cover_letter"] = cover_letter
         return result
 
     # ── Resume ───────────────────────────────────────────────────────────────
@@ -204,6 +213,29 @@ class ApplyAgent:
         except Exception as e:
             print(f"ApplyAgent: PDF generation failed: {e}")
             return None, final_text
+
+    async def _make_cover_letter(self, job: dict) -> str:
+        """Best-effort cover letter — never blocks an apply if it fails."""
+        try:
+            return clean_resume_text(await CoverLetterAgent().generate(job))
+        except Exception as e:
+            print(f"ApplyAgent: cover letter generation failed: {e}")
+            return ""
+
+    async def _fill_cover_letter(self, page, text: str):
+        """Paste the cover letter into a message / cover-letter field if present."""
+        if not text:
+            return
+        for sel in ['textarea[name*="coverLetter" i]', 'textarea[id*="coverLetter" i]',
+                    'textarea[aria-label*="cover letter" i]', 'textarea[placeholder*="cover letter" i]',
+                    'textarea[aria-label*="message" i]', 'textarea[placeholder*="message" i]']:
+            try:
+                el = await page.query_selector(sel)
+                if el and not (await el.input_value()):
+                    await el.fill(text[:1900])
+                    return
+            except Exception:
+                continue
 
     # ── Browser session (headed + persistent) ────────────────────────────────
 
@@ -523,7 +555,7 @@ class ApplyAgent:
 
     # ── LinkedIn Easy Apply ──────────────────────────────────────────────────
 
-    async def _apply_linkedin(self, page, job: dict, pdf_path: str = None) -> dict:
+    async def _apply_linkedin(self, page, job: dict, pdf_path: str = None, cover_letter: str = None) -> dict:
         await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(2)
 
@@ -536,9 +568,9 @@ class ApplyAgent:
 
         await easy_apply.click()
         await asyncio.sleep(2)
-        return await self._fill_linkedin_modal(page, pdf_path)
+        return await self._fill_linkedin_modal(page, pdf_path, cover_letter)
 
-    async def _fill_linkedin_modal(self, page, pdf_path: str = None) -> dict:
+    async def _fill_linkedin_modal(self, page, pdf_path: str = None, cover_letter: str = None) -> dict:
         for _ in range(12):
             await asyncio.sleep(1.5)
             if not await self._guard_captcha(page, "linkedin"):
@@ -561,6 +593,9 @@ class ApplyAgent:
                         await asyncio.sleep(1)
                     except Exception:
                         pass
+
+            # Paste the cover letter if this step has a message field.
+            await self._fill_cover_letter(page, cover_letter)
 
             # Answer screening questions from the profile. Anything the profile
             # can't answer safely is handed to you — the bot never guesses.
@@ -599,7 +634,7 @@ class ApplyAgent:
 
     # ── Naukri Apply ─────────────────────────────────────────────────────────
 
-    async def _apply_naukri(self, page, job: dict, pdf_path: str = None) -> dict:
+    async def _apply_naukri(self, page, job: dict, pdf_path: str = None, cover_letter: str = None) -> dict:
         await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(2)
         if not await self._guard_captcha(page, "naukri"):
@@ -630,7 +665,7 @@ class ApplyAgent:
 
     # ── Indeed Apply ─────────────────────────────────────────────────────────
 
-    async def _apply_indeed(self, page, job: dict, pdf_path: str = None) -> dict:
+    async def _apply_indeed(self, page, job: dict, pdf_path: str = None, cover_letter: str = None) -> dict:
         await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(2)
 
@@ -662,6 +697,8 @@ class ApplyAgent:
                     await el.fill(self.user_phone)
                     break
 
+        await self._fill_cover_letter(page, cover_letter)
+
         submit = await page.query_selector(
             'button[data-testid*="submit"], button[aria-label*="Submit"], button[type="submit"]'
         )
@@ -677,7 +714,7 @@ class ApplyAgent:
 
     # ── Dice Apply ───────────────────────────────────────────────────────────
 
-    async def _apply_dice(self, page, job: dict, pdf_path: str = None) -> dict:
+    async def _apply_dice(self, page, job: dict, pdf_path: str = None, cover_letter: str = None) -> dict:
         await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(2)
 
@@ -708,6 +745,8 @@ class ApplyAgent:
                 if el and not await el.input_value():
                     await el.fill(self.user_phone)
                     break
+
+        await self._fill_cover_letter(page, cover_letter)
 
         submit = await page.query_selector('button[data-cy="submit-application"], button[type="submit"]')
         if submit:
