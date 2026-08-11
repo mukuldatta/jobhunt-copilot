@@ -717,17 +717,29 @@ class ApplyAgent:
                 continue
 
             sel = f'[data-jh-radio="{target["mark"]}"]'
+            loc = page.locator(sel)
+            # The modal scrolls: options below the fold are "outside of the
+            # viewport" and clicks fail until they're scrolled into view.
             try:
-                await page.locator(sel).check()
-                print(f"    [ok] {g['q'][:55]} -> {target['label'] or target['value']}")
+                await loc.scroll_into_view_if_needed(timeout=3000)
             except Exception:
-                # React radios often ignore .check(); a real click on the input
-                # (or its label) fires the events the app actually listens for.
+                pass
+            label = target["label"] or target["value"]
+            try:
+                await loc.check()
+                print(f"    [ok] {g['q'][:55]} -> {label}")
+            except Exception:
+                # React radios often ignore .check(); dispatch a real click,
+                # falling back to the DOM so an overlay can't intercept it.
                 try:
-                    await page.locator(sel).click(force=True)
-                    print(f"    [ok] {g['q'][:55]} -> {target['label'] or target['value']} (click)")
-                except Exception as e:
-                    print(f"    [!] could not select for '{g['q'][:40]}': {str(e)[:50]}")
+                    await loc.click(force=True, timeout=5000)
+                    print(f"    [ok] {g['q'][:55]} -> {label} (click)")
+                except Exception:
+                    try:
+                        await page.eval_on_selector(sel, "e => e.click()")
+                        print(f"    [ok] {g['q'][:55]} -> {label} (dom)")
+                    except Exception as e:
+                        print(f"    [!] could not select for '{g['q'][:40]}': {str(e)[:60]}")
         return unknown
 
     @staticmethod
