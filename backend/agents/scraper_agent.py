@@ -20,6 +20,12 @@ INDIA_QUERIES = [
 ]
 INDIA_LOCATIONS = ["Hyderabad", "Bangalore", "Pune"]
 
+# Persistent browser profiles keep Cloudflare/Akamai clearance cookies between
+# runs, so a bot check solved once isn't re-challenged on every scrape.
+PROFILE_ROOT = os.environ.get("BROWSER_PROFILE_DIR") or os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), ".browser_profiles"
+)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -73,14 +79,10 @@ class ScraperAgent:
         jobs = []
         seen = set()
         async with async_playwright() as pw:
-            browser = await self._launch_headed(pw)
-            if browser is None:
+            context = await self._headed_context(pw, "naukri_scrape")
+            if context is None:
                 return []
-            context = await browser.new_context(
-                locale="en-IN",
-                viewport={"width": 1360, "height": 900},
-            )
-            page = await context.new_page()
+            page = context.pages[0] if context.pages else await context.new_page()
             try:
                 for query in INDIA_QUERIES:
                     if len(jobs) >= self.max_jobs_per_source:
@@ -107,20 +109,63 @@ class ScraperAgent:
                             print(f"    Naukri error '{query}' {city}: {e}")
             finally:
                 await context.close()
-                await browser.close()
         return jobs[:self.max_jobs_per_source]
 
-    async def _launch_headed(self, pw):
-        """Headed real Chrome beats Akamai; fall back to headed Chromium."""
+    async def _headed_context(self, pw, name: str):
+        """
+        Headed browser with a *persistent* profile. Without this the scraper
+        started from an empty profile every run, so Cloudflare's clearance cookie
+        was never kept and every page load was challenged again. One profile per
+        site keeps cookies isolated.
+        """
+        user_dir = os.path.join(PROFILE_ROOT, name)
+        os.makedirs(user_dir, exist_ok=True)
+        opts = dict(headless=False, viewport={"width": 1360, "height": 900}, locale="en-IN",
+                    args=["--disable-blink-features=AutomationControlled"],
+                    ignore_default_args=["--enable-automation"])
         try:
-            return await pw.chromium.launch(headless=False, channel="chrome")
+            return await pw.chromium.launch_persistent_context(user_dir, channel="chrome", **opts)
         except Exception as e:
-            print(f"    Naukri: real Chrome unavailable ({e}); trying headed Chromium")
+            print(f"    {name}: real Chrome unavailable ({e}); using bundled Chromium")
         try:
-            return await pw.chromium.launch(headless=False)
+            return await pw.chromium.launch_persistent_context(user_dir, **opts)
         except Exception as e:
-            print(f"    Naukri: headed browser unavailable ({e}); skipping Naukri")
+            print(f"    {name}: headed browser unavailable ({e}); skipping")
             return None
+
+    async def _is_challenged(self, page) -> bool:
+        """Cloudflare / bot-check interstitial rather than a real results page."""
+        try:
+            title = (await page.title() or "").lower()
+            if any(s in title for s in ("just a moment", "attention required", "verify", "access denied")):
+                return True
+            body = (await page.inner_text("body"))[:1500].lower()
+            return any(s in body for s in (
+                "verify you are human", "verify you're human", "checking your browser",
+                "needs to review the security", "additional verification required",
+                "complete the security check",
+            ))
+        except Exception:
+            return False
+
+    async def _solve_challenge(self, page, label: str) -> bool:
+        """
+        Pause and let you clear the bot check in the visible window. Because the
+        profile is persistent, solving it once keeps the clearance cookie for
+        subsequent runs instead of re-challenging forever.
+        """
+        timeout = int(os.getenv("SCRAPE_CHALLENGE_TIMEOUT", "180"))
+        print(f"    [PAUSE] {label}: bot check detected — solve it in the open browser window.")
+        print(f"            Waiting up to {timeout}s (set SCRAPE_CHALLENGE_TIMEOUT to change)...")
+        waited = 0
+        while waited < timeout:
+            await asyncio.sleep(5)
+            waited += 5
+            if not await self._is_challenged(page):
+                print(f"    [RESUME] {label}: cleared after {waited}s — continuing.")
+                return True
+        print(f"    [TIMEOUT] {label}: not cleared within {timeout}s.")
+        return False
 
     async def _load_naukri_page(self, page, query: str, city: str) -> list:
         slug = query.lower().replace(" ", "-")
@@ -197,21 +242,25 @@ class ScraperAgent:
     async def _scrape_indeed_india(self) -> list:
         jobs = []
         seen = set()
+        blocked_streak = 0
         async with async_playwright() as pw:
-            browser = await self._launch_headed(pw)
-            if browser is None:
+            context = await self._headed_context(pw, "indeed")
+            if context is None:
                 return []
-            context = await browser.new_context(locale="en-IN", viewport={"width": 1360, "height": 900})
-            page = await context.new_page()
+            page = context.pages[0] if context.pages else await context.new_page()
             try:
                 for query in INDIA_QUERIES[:6]:
-                    if len(jobs) >= self.max_jobs_per_source:
+                    if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2:
                         break
                     for city in INDIA_LOCATIONS:
-                        if len(jobs) >= self.max_jobs_per_source:
+                        if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2:
                             break
                         try:
                             rows = await self._load_indeed_page(page, query, city)
+                            if rows is None:          # bot check we couldn't clear
+                                blocked_streak += 1
+                                continue
+                            blocked_streak = 0
                             added = 0
                             for row in rows:
                                 title = (row.get("title") or "").strip()
@@ -224,25 +273,36 @@ class ScraperAgent:
                                 jobs.append(self._indeed_row_to_job(row, city))
                                 added += 1
                             print(f"    Indeed '{query}' {city}: {added} jobs")
-                            await asyncio.sleep(random.uniform(2, 4))
+                            # Indeed rate-limits bursts; pace requests generously.
+                            await asyncio.sleep(random.uniform(5, 9))
                         except Exception as e:
                             print(f"    Indeed error '{query}' {city}: {e}")
+                if blocked_streak >= 2:
+                    print("    Indeed: stopping early — bot check not cleared "
+                          "(solve it once in the window and the session is remembered)")
             finally:
                 await context.close()
-                await browser.close()
         return jobs[:self.max_jobs_per_source]
 
-    async def _load_indeed_page(self, page, query: str, city: str) -> list:
+    async def _load_indeed_page(self, page, query: str, city: str):
+        """Returns a list of rows, or None if a bot check blocked this load."""
         from urllib.parse import quote
         url = f"https://in.indeed.com/jobs?q={quote(query)}&l={quote(city)}&fromage=3&sort=date"
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         try:
             await page.wait_for_selector("div.job_seen_beacon", timeout=12000)
         except Exception:
-            title = (await page.title()).lower()
-            if "just a moment" in title or "verify" in title:
-                print(f"    Indeed BLOCKED on '{query}' {city} (Cloudflare challenge)")
-            return []
+            if await self._is_challenged(page):
+                # Let the user clear it once; the persistent profile keeps the
+                # clearance cookie so later loads sail through.
+                if not await self._solve_challenge(page, f"Indeed '{query}' {city}"):
+                    return None
+                try:
+                    await page.wait_for_selector("div.job_seen_beacon", timeout=15000)
+                except Exception:
+                    return None
+            else:
+                return []
         await asyncio.sleep(random.uniform(1.5, 3))
         rows = await page.evaluate("""() => {
             const out = [];
