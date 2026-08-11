@@ -259,8 +259,16 @@ class ApplyAgent:
 
     async def _launch_persistent(self, pw, user_dir: str, headed: bool = None):
         headless = self.headless if headed is None else (not headed)
-        opts = dict(headless=headless, viewport={"width": 1360, "height": 900},
-                    locale="en-IN", user_agent=UA)
+        # Strip the automation signals (webdriver flag, --enable-automation infobar)
+        # so sites' bot detection — and third-party OAuth like Google — are less
+        # likely to refuse the session. Native email/password login is still the
+        # most reliable path (Google OAuth blocks controlled browsers regardless).
+        opts = dict(
+            headless=headless, viewport={"width": 1360, "height": 900},
+            locale="en-IN", user_agent=UA,
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation"],
+        )
         try:
             return await pw.chromium.launch_persistent_context(user_dir, channel="chrome", **opts)
         except Exception as e:
