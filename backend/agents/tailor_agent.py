@@ -1,4 +1,5 @@
 import os
+import asyncio
 from llm_provider import LLMProvider
 from db.mongodb import get_resume
 from utils.job_parser import truncate_description
@@ -45,4 +46,4 @@ Rewrite the resume to better match this job. Follow these steps:
 
 Return the full tailored resume text only. No explanations."""
 
-        return clean_resume_text(self.llm.complete(prompt))
+        return clean_resume_text(await asyncio.to_thread(self.llm.complete, prompt))

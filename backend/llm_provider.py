@@ -6,6 +6,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# gemini-1.5-flash was retired (404 on generateContent). Overridable via env.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+
+
 class LLMProvider:
     def __init__(self, provider = "groq"):
         self.provider = provider
@@ -15,7 +19,7 @@ class LLMProvider:
             self.model = "llama-3.3-70b-versatile"
         elif provider == "gemini":
             genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-            self.model = "gemini-1.5-flash"
+            self.model = GEMINI_MODEL
             self.client = genai.GenerativeModel(self.model)
         elif provider == "anthropic":
             self.model = "claude-haiku-4-5-20251001"
@@ -45,8 +49,8 @@ class LLMProvider:
             if self.provider == "groq":
                 print("Falling back to Gemini...")
                 self.provider = "gemini"
-                self.model = "gemini-1.5-flash"
+                self.model = GEMINI_MODEL
                 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-                self.client = genai.GenerativeModel("gemini-1.5-flash")
+                self.client = genai.GenerativeModel(GEMINI_MODEL)
                 return self.complete(prompt)
             raise Exception(f"All providers failed, Please check you API keys and Rate Limits. {e}")

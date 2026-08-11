@@ -1,4 +1,5 @@
 import os
+import asyncio
 from llm_provider import LLMProvider
 from db.mongodb import get_resume
 from utils.job_parser import truncate_description
@@ -46,4 +47,4 @@ Keep it under 400 words. Be specific, not generic. Do not use clichés like "I a
 Write in first person. Start directly with "Dear Hiring Manager," or the team name if known.
 Only output the cover letter text."""
 
-        return self.llm.complete(prompt)
+        return await asyncio.to_thread(self.llm.complete, prompt)

@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import asyncio
 from llm_provider import LLMProvider
 from db.mongodb import get_resume
 from utils.job_parser import truncate_description
@@ -24,7 +25,9 @@ class ScorerAgent:
 
     async def score(self, job: dict) -> dict:
         resume_text = await self._get_resume_text()
-        job_description = truncate_description(job.get("description", ""), max_chars=3000)
+        # Keep the prompt lean — the free Groq tier has a daily token budget and
+        # a long resume+JD per job exhausts it after ~100 jobs.
+        job_description = truncate_description(job.get("description", ""), max_chars=1500)
         title = job.get("title", "")
         company = job.get("company", "")
 
@@ -33,7 +36,7 @@ class ScorerAgent:
         prompt = f"""You are a resume-job matcher. Score how well this resume matches the job posting.
 
 RESUME:
-{resume_text[:2000]}
+{resume_text[:1200]}
 
 JOB TITLE: {title}
 COMPANY: {company}
@@ -66,7 +69,9 @@ Respond in this exact JSON format:
 Only return the JSON, no explanation."""
 
         try:
-            response = self.llm.complete(prompt)
+            # llm.complete() is synchronous; run it off the event loop so the API
+            # stays responsive while a long scoring batch runs in the background.
+            response = await asyncio.to_thread(self.llm.complete, prompt)
             data = self._parse_json(response)
             skills = min(data.get("skills_score", 0), 40)
             experience = min(data.get("experience_score", 0), 30)
@@ -85,12 +90,11 @@ Only return the JSON, no explanation."""
                 "gap_analysis": data.get("gap_analysis", [])[:5],
             }
         except Exception as e:
+            # Do NOT return a 0 score here: a saved 0 is indistinguishable from a
+            # genuine poor match, so the job would look scored and never be
+            # retried. Signal failure and let the caller leave it unscored.
             print(f"Scorer error for {job.get('job_id')}: {e}")
-            return {
-                "match_score": 0,
-                "score_breakdown": {"skills_score": 0, "experience_score": 0, "domain_score": 0, "location_score": 0},
-                "gap_analysis": [],
-            }
+            return None
 
     def _parse_json(self, text: str) -> dict:
         text = text.strip()

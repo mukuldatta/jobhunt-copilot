@@ -24,17 +24,29 @@ def setup_scheduler():
         logger.info("Scheduler: scoring unscored jobs...")
         agent = ScorerAgent()
         unscored = await get_unscored_jobs()
+        scored = failures = 0
         for job in unscored:
             try:
                 result = await agent.score(job)
+                if result is None:
+                    # Failed (usually an LLM rate limit) — leave it unscored so
+                    # the next cycle retries it, and stop hammering the API.
+                    failures += 1
+                    if failures >= 3:
+                        logger.warning(f"Scoring paused after {failures} consecutive "
+                                       f"failures; {scored} scored, retrying next cycle")
+                        break
+                    continue
+                failures = 0
                 await update_job(job["job_id"], {
                     "match_score": result["match_score"],
                     "score_breakdown": result["score_breakdown"],
                     "gap_analysis": result["gap_analysis"],
                 })
+                scored += 1
             except Exception as e:
                 logger.error(f"Scoring failed for {job.get('job_id')}: {e}")
-        logger.info(f"Scheduler: scored {len(unscored)} jobs")
+        logger.info(f"Scheduler: scored {scored} of {len(unscored)} unscored jobs")
 
     async def send_alerts():
         logger.info("Scheduler: checking for high-match jobs to alert...")

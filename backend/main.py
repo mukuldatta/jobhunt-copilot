@@ -328,10 +328,20 @@ async def trigger_scoring(background_tasks: BackgroundTasks):
     async def _run_scoring():
         agent = ScorerAgent()
         unscored = await get_unscored_jobs()
-        scored = 0
+        scored = failures = 0
         for job in unscored:
             try:
                 result = await agent.score(job)
+                if result is None:
+                    # Leave unscored so it is retried later.
+                    failures += 1
+                    if failures >= 3:
+                        print(f"Scoring stopped after {failures} consecutive failures "
+                              f"(likely LLM rate limit). {scored} scored, "
+                              f"{len(unscored) - scored} left for the next run.")
+                        return
+                    continue
+                failures = 0
                 await _update_job(job["job_id"], {
                     "match_score": result["match_score"],
                     "score_breakdown": result["score_breakdown"],

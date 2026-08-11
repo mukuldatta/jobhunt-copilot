@@ -255,6 +255,9 @@ class ScraperAgent:
                     company: g('[data-testid="company-name"]') || g('span.companyName'),
                     loc: g('[data-testid="text-location"]') || g('div.companyLocation'),
                     href: a ? a.getAttribute('href') : "",
+                    // snippet gives the scorer something to work with
+                    desc: g('[data-testid="belowJobSnippet"]') || g('div.job-snippet') || g('ul'),
+                    meta: g('[data-testid="attribute_snippet_testid"]') || "",
                 });
             });
             return out;
@@ -271,12 +274,15 @@ class ScraperAgent:
         if "india" not in location.lower():
             location = f"{location}, India"
         url = (row.get("url") or "").strip()
+        description = clean_description(
+            " ".join(x for x in [row.get("meta") or "", row.get("desc") or ""] if x)
+        )
         return {
             "job_id": generate_job_id(url, title, company),
             "title": title,
             "company": company,
             "location": location,
-            "description": "",
+            "description": description,
             "url": url,
             "posted_at": datetime.utcnow(),
             "scraped_at": datetime.utcnow(),
@@ -326,7 +332,40 @@ class ScraperAgent:
                     except Exception as e:
                         print(f"    LinkedIn error '{query}' {loc}: {e}")
 
-        return jobs[:self.max_jobs_per_source]
+        jobs = jobs[:self.max_jobs_per_source]
+        await self._fetch_linkedin_descriptions(jobs)
+        return jobs
+
+    async def _fetch_linkedin_descriptions(self, jobs: list):
+        """
+        The guest search endpoint returns cards without descriptions, which makes
+        scoring meaningless (every job lands ~10%). LinkedIn's guest jobPosting
+        endpoint returns the full JD without login, so fetch it per job.
+        """
+        import re as _re
+        async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as client:
+            for job in jobs:
+                if job.get("description"):
+                    continue
+                m = _re.search(r"/jobs/view/(?:.*-)?(\d+)", job.get("url", ""))
+                if not m:
+                    continue
+                try:
+                    resp = await client.get(
+                        f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{m.group(1)}"
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    el = (soup.select_one("div.show-more-less-html__markup")
+                          or soup.select_one("div.description__text"))
+                    if el:
+                        job["description"] = clean_description(el.get_text(" ", strip=True))
+                    await asyncio.sleep(random.uniform(1.5, 3))
+                except Exception:
+                    continue
+        filled = sum(1 for j in jobs if j.get("description"))
+        print(f"    LinkedIn descriptions: {filled}/{len(jobs)} fetched")
 
     def _parse_linkedin_guest_html(self, html: str) -> list:
         soup = BeautifulSoup(html, "html.parser")
