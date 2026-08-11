@@ -648,6 +648,7 @@ class ApplyAgent:
             });
 
             const out = [];
+            let n = 0;
             for (const [, radios] of byName) {
                 const first = radios[0];
                 const opts = radios.map(r => {
@@ -655,7 +656,23 @@ class ApplyAgent:
                     if (r.id) {
                         try { const l = root.querySelector('label[for="' + CSS.escape(r.id) + '"]'); if (l) lab = (l.innerText || '').trim(); } catch (_) {}
                     }
-                    return {id: r.id, value: r.value, label: lab};
+                    if (!lab) lab = (r.getAttribute('aria-label') || '').trim();
+                    if (!lab) lab = (r.closest('label')?.innerText || '').trim();
+                    // These radios often have no label[for], no aria-label and
+                    // value="on" — the option text sits in a sibling/ancestor.
+                    if (!lab) lab = (r.nextElementSibling?.innerText || '').trim();
+                    if (!lab) {
+                        let p = r.parentElement;
+                        for (let i = 0; i < 3 && p && !lab; i++, p = p.parentElement) {
+                            const t = (p.innerText || '').trim();
+                            // only accept if it looks like a single option, not the whole group
+                            if (t && t.length < 40 && !t.includes('\\n')) lab = t;
+                        }
+                    }
+                    // Tag it: these radios often have no usable id to select by.
+                    const mark = 'jhr' + (n++);
+                    r.setAttribute('data-jh-radio', mark);
+                    return {id: r.id, value: r.value, label: lab, mark};
                 });
                 const optText = new Set(opts.map(o => (o.label || '').toLowerCase()));
 
@@ -688,15 +705,29 @@ class ApplyAgent:
                 continue
             av = str(ans).lower()
             target = next((r for r in g["radios"]
-                           if av == r["value"].lower() or (r["label"] and av in r["label"].lower())), None)
-            if target and target["id"]:
+                           if av == (r["value"] or "").lower()
+                           or (r["label"] and av == r["label"].lower())), None)
+            if target is None:
+                target = next((r for r in g["radios"]
+                               if r["label"] and av in r["label"].lower()), None)
+            if target is None:
+                print(f"    [?] no option matching {ans!r} for: {g['q'][:50]} "
+                      f"| options={[(r['label'], r['value']) for r in g['radios']]}")
+                unknown += 1
+                continue
+
+            sel = f'[data-jh-radio="{target["mark"]}"]'
+            try:
+                await page.locator(sel).check()
+                print(f"    [ok] {g['q'][:55]} -> {target['label'] or target['value']}")
+            except Exception:
+                # React radios often ignore .check(); a real click on the input
+                # (or its label) fires the events the app actually listens for.
                 try:
-                    await page.locator(f'[id="{target["id"]}"]').check()
-                except Exception:
-                    try:
-                        await page.locator(f'label[for="{target["id"]}"]').click()
-                    except Exception:
-                        pass
+                    await page.locator(sel).click(force=True)
+                    print(f"    [ok] {g['q'][:55]} -> {target['label'] or target['value']} (click)")
+                except Exception as e:
+                    print(f"    [!] could not select for '{g['q'][:40]}': {str(e)[:50]}")
         return unknown
 
     @staticmethod
