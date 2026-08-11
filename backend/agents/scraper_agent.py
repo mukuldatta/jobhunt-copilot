@@ -78,6 +78,8 @@ class ScraperAgent:
 
         jobs = []
         seen = set()
+        blocked_streak = 0
+        self._challenge_gave_up = False
         async with async_playwright() as pw:
             context = await self._headed_context(pw, "naukri_scrape")
             if context is None:
@@ -85,13 +87,17 @@ class ScraperAgent:
             page = context.pages[0] if context.pages else await context.new_page()
             try:
                 for query in INDIA_QUERIES:
-                    if len(jobs) >= self.max_jobs_per_source:
+                    if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2:
                         break
                     for city in INDIA_LOCATIONS:
-                        if len(jobs) >= self.max_jobs_per_source:
+                        if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2:
                             break
                         try:
                             rows = await self._load_naukri_page(page, query, city)
+                            if rows is None:          # blocked — don't grind on
+                                blocked_streak += 1
+                                continue
+                            blocked_streak = 0
                             added = 0
                             for row in rows:
                                 title = (row.get("title") or "").strip()
@@ -107,6 +113,9 @@ class ScraperAgent:
                             await asyncio.sleep(random.uniform(2, 4))
                         except Exception as e:
                             print(f"    Naukri error '{query}' {city}: {e}")
+                if blocked_streak >= 2:
+                    print("    Naukri: stopping early — blocked by Akamai "
+                          "(needs a headed browser on a residential IP)")
             finally:
                 await context.close()
         return jobs[:self.max_jobs_per_source]
@@ -154,6 +163,11 @@ class ScraperAgent:
         profile is persistent, solving it once keeps the clearance cookie for
         subsequent runs instead of re-challenging forever.
         """
+        # If nobody cleared the last challenge, nobody is watching — don't burn
+        # another full timeout on every subsequent blocked page.
+        if getattr(self, "_challenge_gave_up", False):
+            return False
+
         timeout = int(os.getenv("SCRAPE_CHALLENGE_TIMEOUT", "180"))
         print(f"    [PAUSE] {label}: bot check detected — solve it in the open browser window.")
         print(f"            Waiting up to {timeout}s (set SCRAPE_CHALLENGE_TIMEOUT to change)...")
@@ -165,9 +179,11 @@ class ScraperAgent:
                 print(f"    [RESUME] {label}: cleared after {waited}s — continuing.")
                 return True
         print(f"    [TIMEOUT] {label}: not cleared within {timeout}s.")
+        self._challenge_gave_up = True
         return False
 
-    async def _load_naukri_page(self, page, query: str, city: str) -> list:
+    async def _load_naukri_page(self, page, query: str, city: str):
+        """Returns a list of rows, or None if Akamai blocked this load."""
         slug = query.lower().replace(" ", "-")
         url = f"https://www.naukri.com/{slug}-jobs-in-{city.lower()}"
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
@@ -179,11 +195,20 @@ class ScraperAgent:
         try:
             await page.wait_for_selector("div.srp-jobtuple-wrapper", timeout=12000)
         except Exception:
-            title = await page.title()
-            if "access denied" in title.lower():
+            title = (await page.title() or "").lower()
+            if "access denied" in title:
                 print(f"    Naukri BLOCKED on '{query}' {city} (Access Denied) "
                       f"— need a residential IP + headed browser")
-            return []
+                return None
+            if await self._is_challenged(page):
+                if not await self._solve_challenge(page, f"Naukri '{query}' {city}"):
+                    return None
+                try:
+                    await page.wait_for_selector("div.srp-jobtuple-wrapper", timeout=15000)
+                except Exception:
+                    return None
+            else:
+                return []
         await asyncio.sleep(random.uniform(1.5, 3))
         return await page.evaluate("""() => {
             const out = [];
@@ -243,6 +268,7 @@ class ScraperAgent:
         jobs = []
         seen = set()
         blocked_streak = 0
+        self._challenge_gave_up = False
         async with async_playwright() as pw:
             context = await self._headed_context(pw, "indeed")
             if context is None:
@@ -403,8 +429,14 @@ class ScraperAgent:
         endpoint returns the full JD without login, so fetch it per job.
         """
         import re as _re
+        fail_streak = 0
         async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True) as client:
             for job in jobs:
+                if fail_streak >= 3:
+                    # Rate limited or blocked — stop rather than walking every
+                    # remaining job at ~2s each for nothing.
+                    print("    LinkedIn descriptions: stopping early (3 consecutive failures)")
+                    break
                 if job.get("description"):
                     continue
                 m = _re.search(r"/jobs/view/(?:.*-)?(\d+)", job.get("url", ""))
@@ -415,7 +447,9 @@ class ScraperAgent:
                         f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{m.group(1)}"
                     )
                     if resp.status_code != 200:
+                        fail_streak += 1
                         continue
+                    fail_streak = 0
                     soup = BeautifulSoup(resp.text, "html.parser")
                     el = (soup.select_one("div.show-more-less-html__markup")
                           or soup.select_one("div.description__text"))
@@ -423,7 +457,7 @@ class ScraperAgent:
                         job["description"] = clean_description(el.get_text(" ", strip=True))
                     await asyncio.sleep(random.uniform(1.5, 3))
                 except Exception:
-                    continue
+                    fail_streak += 1
         filled = sum(1 for j in jobs if j.get("description"))
         print(f"    LinkedIn descriptions: {filled}/{len(jobs)} fetched")
 
