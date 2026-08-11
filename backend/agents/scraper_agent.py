@@ -189,92 +189,106 @@ class ScraperAgent:
             "status": "new",
         }
 
-    # ── INDEED INDIA (httpx) ────────────────────────────────────────────────
-    # in.indeed.com is far less aggressive than Naukri about blocking servers.
+    # ── INDEED INDIA (headed) ────────────────────────────────────────────────
+    # in.indeed.com is Cloudflare-protected: httpx gets 403, but a headed
+    # real-Chrome browser on a residential IP loads results fine (like Naukri),
+    # so this must run locally. Jobs are read from the rendered DOM.
 
     async def _scrape_indeed_india(self) -> list:
         jobs = []
-        headers = {
-            "User-Agent": HEADERS["User-Agent"],
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-IN,en;q=0.9",
-            "Referer": "https://in.indeed.com/",
-        }
-        async with httpx.AsyncClient(headers=headers, timeout=20, follow_redirects=True) as client:
-            for query in INDIA_QUERIES[:6]:
-                if len(jobs) >= self.max_jobs_per_source:
-                    break
-                for city in INDIA_LOCATIONS:
+        seen = set()
+        async with async_playwright() as pw:
+            browser = await self._launch_headed(pw)
+            if browser is None:
+                return []
+            context = await browser.new_context(locale="en-IN", viewport={"width": 1360, "height": 900})
+            page = await context.new_page()
+            try:
+                for query in INDIA_QUERIES[:6]:
                     if len(jobs) >= self.max_jobs_per_source:
                         break
-                    try:
-                        resp = await client.get(
-                            "https://in.indeed.com/jobs",
-                            params={"q": query, "l": city, "fromage": "3", "sort": "date"},
-                        )
-                        print(f"    Indeed India '{query}' {city}: HTTP {resp.status_code}")
-                        if resp.status_code != 200:
-                            await asyncio.sleep(random.uniform(2, 3))
-                            continue
-                        new_jobs = self._parse_indeed_india_html(resp.text, city)
-                        print(f"    Indeed India '{query}' {city}: {len(new_jobs)} jobs")
-                        jobs.extend(new_jobs)
-                        await asyncio.sleep(random.uniform(2, 3))
-                    except Exception as e:
-                        print(f"    Indeed India error '{query}' {city}: {e}")
+                    for city in INDIA_LOCATIONS:
+                        if len(jobs) >= self.max_jobs_per_source:
+                            break
+                        try:
+                            rows = await self._load_indeed_page(page, query, city)
+                            added = 0
+                            for row in rows:
+                                title = (row.get("title") or "").strip()
+                                url = (row.get("url") or "").strip()
+                                if not title or not url or url in seen:
+                                    continue
+                                if not is_relevant_job(title):
+                                    continue
+                                seen.add(url)
+                                jobs.append(self._indeed_row_to_job(row, city))
+                                added += 1
+                            print(f"    Indeed '{query}' {city}: {added} jobs")
+                            await asyncio.sleep(random.uniform(2, 4))
+                        except Exception as e:
+                            print(f"    Indeed error '{query}' {city}: {e}")
+            finally:
+                await context.close()
+                await browser.close()
         return jobs[:self.max_jobs_per_source]
 
-    def _parse_indeed_india_html(self, html: str, city: str) -> list:
-        soup = BeautifulSoup(html, "lxml")
-        jobs = []
-        # Indeed job cards — try multiple selector strategies
-        cards = (soup.select("div.job_seen_beacon")
-                 or soup.select("div[data-jk]")
-                 or soup.select("li.css-1ac2h1w")
-                 or soup.select("div.tapItem"))
-        for card in cards[:20]:
-            try:
-                title_el = (card.select_one("h2.jobTitle a span[title]")
-                            or card.select_one("h2.jobTitle a")
-                            or card.select_one("a[data-jk] span"))
-                company_el = (card.select_one("span.companyName")
-                              or card.select_one("[data-testid='company-name']")
-                              or card.select_one(".companyName"))
-                loc_el = (card.select_one("div.companyLocation")
-                          or card.select_one("[data-testid='text-location']")
-                          or card.select_one(".companyLocation"))
-                link_el = card.select_one("h2.jobTitle a, a[data-jk]")
+    async def _load_indeed_page(self, page, query: str, city: str) -> list:
+        from urllib.parse import quote
+        url = f"https://in.indeed.com/jobs?q={quote(query)}&l={quote(city)}&fromage=3&sort=date"
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        try:
+            await page.wait_for_selector("div.job_seen_beacon", timeout=12000)
+        except Exception:
+            title = (await page.title()).lower()
+            if "just a moment" in title or "verify" in title:
+                print(f"    Indeed BLOCKED on '{query}' {city} (Cloudflare challenge)")
+            return []
+        await asyncio.sleep(random.uniform(1.5, 3))
+        rows = await page.evaluate("""() => {
+            const out = [];
+            document.querySelectorAll('div.job_seen_beacon').forEach(c => {
+                const g = (s) => { const e = c.querySelector(s); return e ? e.textContent.trim() : ""; };
+                const a = c.querySelector('a[data-jk]');
+                const t = c.querySelector('a[data-jk] span[title]');
+                out.push({
+                    title: (t && t.getAttribute('title')) || (a ? a.textContent.trim() : ""),
+                    company: g('[data-testid="company-name"]') || g('span.companyName'),
+                    loc: g('[data-testid="text-location"]') || g('div.companyLocation'),
+                    href: a ? a.getAttribute('href') : "",
+                });
+            });
+            return out;
+        }""")
+        for r in rows:
+            href = r.get("href") or ""
+            r["url"] = f"https://in.indeed.com{href}" if href.startswith("/") else href
+        return rows
 
-                title = (title_el.get("title") or title_el.get_text(strip=True)) if title_el else ""
-                company = company_el.get_text(strip=True) if company_el else "Unknown"
-                location = loc_el.get_text(strip=True) if loc_el else f"{city}, India"
-                href = link_el.get("href", "") if link_el else ""
-                url = f"https://in.indeed.com{href}" if href.startswith("/") else href
-
-                if not title or not is_relevant_job(title):
-                    continue
-
-                jobs.append({
-                    "job_id": generate_job_id(url, title, company),
-                    "title": title,
-                    "company": company,
-                    "location": location if location else f"{city}, India",
-                    "description": "",
-                    "url": url,
-                    "posted_at": datetime.utcnow(),
-                    "scraped_at": datetime.utcnow(),
-                    "source": "indeed",
-                    "region": "india",
-                    "sponsorship_status": "contract",
-                    "contract_type": extract_contract_type(title, ""),
-                    "match_score": None,
-                    "score_breakdown": None,
-                    "gap_analysis": [],
-                    "status": "new",
-                })
-            except Exception:
-                continue
-        return jobs
+    def _indeed_row_to_job(self, row: dict, city: str) -> dict:
+        title = (row.get("title") or "").strip()
+        company = (row.get("company") or "Unknown").strip() or "Unknown"
+        location = (row.get("loc") or f"{city}, India").strip() or f"{city}, India"
+        if "india" not in location.lower():
+            location = f"{location}, India"
+        url = (row.get("url") or "").strip()
+        return {
+            "job_id": generate_job_id(url, title, company),
+            "title": title,
+            "company": company,
+            "location": location,
+            "description": "",
+            "url": url,
+            "posted_at": datetime.utcnow(),
+            "scraped_at": datetime.utcnow(),
+            "source": "indeed",
+            "region": "india",
+            "sponsorship_status": "contract",
+            "contract_type": extract_contract_type(title, ""),
+            "match_score": None,
+            "score_breakdown": None,
+            "gap_analysis": [],
+            "status": "new",
+        }
 
     # ── LINKEDIN Guest API (India) ───────────────────────────────────────────
     # LinkedIn exposes a public guest jobs endpoint used for AJAX pagination.
