@@ -607,12 +607,23 @@ class ApplyAgent:
                 continue  # handled as fieldset groups below
             if f["hasValue"]:
                 continue  # already filled (by LinkedIn or a previous pass)
-            kind = "number" if f["type"] == "number" else ("select" if f["tag"] == "select" else "text")
+            numeric = f["type"] == "number" or any(
+                k in ql for k in ("in lakhs", "in days", "in years", "in months",
+                                  "how many years", "number of years", "(in ")
+            )
+            kind = "number" if numeric else ("select" if f["tag"] == "select" else "text")
             ans = await self.answers.answer(q, options=f.get("options") or None, kind=kind)
             if ans is None:
                 print(f"    [?] no answer for: {q[:70]}")
                 unknown += 1
                 continue
+            if numeric:
+                # "38 LPA" fails a field that asks for lakhs as a number.
+                ans = self._numeric_only(ans)
+                if ans is None:
+                    print(f"    [?] no numeric value for: {q[:60]}")
+                    unknown += 1
+                    continue
             loc = (page.locator(f'[id="{f["id"]}"]') if f["id"]
                    else page.locator(f'[data-jh-id="{f["jh"]}"]'))
             try:
@@ -624,23 +635,47 @@ class ApplyAgent:
             except Exception as e:
                 print(f"    [!] could not fill '{q[:40]}': {str(e)[:60]}")
 
-        # 2) Radio groups (yes/no): a <fieldset> with a <legend> question and
-        # radios whose <label for> gives the option text.
+        # 2) Radio groups (yes/no). LinkedIn doesn't always wrap these in a
+        # <fieldset><legend>, so group by the radios' shared name and derive the
+        # question from the nearest ancestor text that isn't just the options.
         groups = await page.evaluate("""() => {
-            const out = [];
             const root = document.querySelector('dialog[open]') || document;
-            root.querySelectorAll('fieldset').forEach(fs => {
-                const legend = fs.querySelector('legend');
-                const q = legend ? (legend.innerText || '').trim() : '';
-                if (!q) return;
-                const radios = [...fs.querySelectorAll('input[type=radio]')].map(r => {
+            const byName = new Map();
+            root.querySelectorAll('input[type=radio]').forEach(r => {
+                const key = r.name || ('__' + (r.id || Math.random()));
+                if (!byName.has(key)) byName.set(key, []);
+                byName.get(key).push(r);
+            });
+
+            const out = [];
+            for (const [, radios] of byName) {
+                const first = radios[0];
+                const opts = radios.map(r => {
                     let lab = '';
-                    if (r.id) { const l = fs.querySelector('label[for="' + CSS.escape(r.id) + '"]'); if (l) lab = (l.innerText || '').trim(); }
+                    if (r.id) {
+                        try { const l = root.querySelector('label[for="' + CSS.escape(r.id) + '"]'); if (l) lab = (l.innerText || '').trim(); } catch (_) {}
+                    }
                     return {id: r.id, value: r.value, label: lab};
                 });
-                const anyChecked = [...fs.querySelectorAll('input[type=radio]')].some(r => r.checked);
-                if (radios.length) out.push({q, radios, anyChecked});
-            });
+                const optText = new Set(opts.map(o => (o.label || '').toLowerCase()));
+
+                // Question: nearest ancestor whose first line isn't an option label
+                let q = '';
+                const fs = first.closest('fieldset');
+                const legend = fs && fs.querySelector('legend');
+                if (legend) q = (legend.innerText || '').trim();
+                if (!q) {
+                    let p = first.parentElement;
+                    for (let i = 0; i < 6 && p && !q; i++, p = p.parentElement) {
+                        const lines = (p.innerText || '').split('\\n')
+                            .map(s => s.trim())
+                            .filter(s => s.length > 4 && !optText.has(s.toLowerCase()));
+                        if (lines.length) q = lines[0];
+                    }
+                }
+                const anyChecked = radios.some(r => r.checked);
+                if (q && opts.length) out.push({q, radios: opts, anyChecked});
+            }
             return out;
         }""")
         for g in groups:
@@ -663,6 +698,13 @@ class ApplyAgent:
                     except Exception:
                         pass
         return unknown
+
+    @staticmethod
+    def _numeric_only(value: str):
+        """'38 LPA' -> '38', '3.5 years' -> '3.5'. None if there's no number."""
+        import re as _re
+        m = _re.search(r"\d+(?:\.\d+)?", str(value))
+        return m.group() if m else None
 
     async def _select_option(self, select_el, value: str):
         if select_el is None:
@@ -734,10 +776,30 @@ class ApplyAgent:
         return max(last, 0)
 
     async def _fill_linkedin_modal(self, page, pdf_path: str = None, cover_letter: str = None) -> dict:
+        last_sig, stalled = None, 0
         for step in range(12):
             await asyncio.sleep(1.5)
             await self._wait_for_modal_content(page)
             print(f"    -- modal step {step + 1}")
+
+            # If the same step renders twice running, Next/Review isn't advancing
+            # (usually a validation error we can't satisfy) — stop rather than
+            # spinning through all 12 iterations.
+            sig = await page.evaluate("""() => {
+                const d = document.querySelector('dialog[open]');
+                if (!d) return 'closed';
+                return [...d.querySelectorAll('label')].map(l => (l.innerText || '').trim()).join('|').slice(0, 400);
+            }""")
+            if sig == last_sig:
+                stalled += 1
+                if stalled >= 2:
+                    await self._screenshot(page, "linkedin_stalled")
+                    return {"status": "needs_review", "url": page.url,
+                            "message": ("Form stopped advancing — a field was rejected "
+                                        "(check the screenshot in backend/logs/apply).")}
+            else:
+                stalled = 0
+            last_sig = sig
             if not await self._guard_captcha(page, "linkedin"):
                 return {"status": "needs_review", "url": page.url,
                         "message": "CAPTCHA not cleared during LinkedIn apply."}

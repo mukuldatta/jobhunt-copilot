@@ -126,9 +126,13 @@ class AnswerResolver:
         if any_("expected", "desired", "expecting") and any_("ctc", "salary", "compensation", "pay"):
             return str(p.get("expected_ctc") or "") or None
 
+        # Match on stems: "commute" never matches "commuting".
         if "relocat" in q:
             return _yn(bool(p.get("willing_to_relocate", True)))
-        if any_("commute", "work from office", "on-site", "onsite", "hybrid", "in office", "willing to travel"):
+        if any_("commut", "work from office", "on-site", "onsite", "on site",
+                "hybrid", "in office", "in-office", "willing to travel", "travel to"):
+            return _yn(bool(p.get("willing_onsite_hybrid", True)))
+        if any_("night shift", "rotational shift", "work from home", "remote"):
             return _yn(bool(p.get("willing_onsite_hybrid", True)))
 
         if any_("current location", "current city", "which city", "where are you located", "your location"):
