@@ -22,12 +22,12 @@ An AI-powered job hunting assistant that scrapes job postings, scores them again
 |---|---|
 | Frontend | React + Vite + Tailwind CSS |
 | Backend | FastAPI + Python |
-| Database | MongoDB Atlas (Motor async driver) |
-| Scraping | Playwright (Chromium) |
+| Database | MongoDB (Motor async driver) — local via Docker, or Atlas |
+| Scraping | Playwright driving real Chrome (headed, local) |
 | LLM | Groq LLaMA 3.3 70B (primary) · Gemini Flash (fallback) |
 | Alerts | SendGrid (email) · Twilio (SMS) |
 | Scheduler | APScheduler (every 30 min) |
-| Deploy | Railway (backend) · Vercel (frontend) |
+| Runs | Locally (headed browser required) · Vercel for the frontend |
 
 ---
 
@@ -46,16 +46,17 @@ jobhunt-copilot/
 │   │   ├── outreach_agent.py     # LinkedIn outreach message
 │   │   └── apply_agent.py        # Auto-apply via Playwright
 │   ├── services/
-│   │   ├── alert_service.py      # Email + SMS alerts
+│   │   ├── answer_service.py     # Resolves form questions from your profile
+│   │   ├── scoring_service.py    # Paced/backoff scoring runner
 │   │   ├── orchestrator.py       # Autonomous apply cycle (score-gated + caps)
+│   │   ├── alert_service.py      # Email + SMS alerts
 │   │   └── scheduler.py          # APScheduler tasks
-│   ├── config/
-│   │   └── apply_profile.py      # Structured answers to screening questions
 │   ├── db/
 │   │   └── mongodb.py            # MongoDB CRUD
 │   └── utils/
 │       ├── resume_parser.py      # PDF resume parser
-│       ├── job_parser.py         # Job description cleaner
+│       ├── resume_validator.py   # Anti-fabrication check on tailored resumes
+│       ├── job_parser.py         # Cleaning, relevance, role dedup key
 │       └── pdf_generator.py      # Tailored resume → PDF (fpdf2)
 ├── frontend/
 │   └── src/
@@ -63,7 +64,8 @@ jobhunt-copilot/
 │       │   ├── Dashboard.jsx     # Stats + trigger scrape/score
 │       │   ├── Jobs.jsx          # Scraped jobs with filters
 │       │   ├── Applications.jsx  # Application tracker
-│       │   └── Settings.jsx      # Resume upload + preferences
+│       │   ├── Profile.jsx       # Application questionnaire + pending questions
+│       │   └── Settings.jsx      # Resume, platform logins, run auto-apply
 │       └── components/
 │           ├── JobCard.jsx       # Job card with auto-apply
 │           ├── ResumeModal.jsx   # Tailored resume + PDF download
@@ -121,7 +123,13 @@ cp .env.example .env
 | `AUTO_APPLY_DAILY_CAP` | `20` | Max applications per day |
 | `AUTO_APPLY_PER_RUN` | `5` | Max applications per cycle |
 | `APPLY_HUMAN_TIMEOUT` | `300` | Seconds to wait for you to clear a CAPTCHA |
-| `APPLY_REQUIRES_SPONSORSHIP` | `no` | Answer to sponsorship screening questions |
+| `LOGIN_TIMEOUT` | `420` | Seconds to wait for you to finish signing in |
+| `APPLY_DRY_RUN` | unset | Fill forms and screenshot, but never submit |
+| `SCORE_DELAY_SEC` | `4` | Pace between scoring calls (free tiers ≈15/min) |
+| `SCORE_PER_RUN` | `60` | Max jobs scored per run |
+| `NAUKRI_DISABLED` | unset | Skip Naukri (needs a headed browser + local IP) |
+
+Screening-question answers come from the **Profile** page, not env vars.
 
 ### 3. Run locally
 
@@ -157,21 +165,41 @@ pauses and waits for you to solve it in that window.
 
 ---
 
+## First run
+
+1. **Settings → Upload resume** (PDF). It is parsed for skills and used for
+   scoring and tailoring.
+2. **Profile →** fill in notice period, CTC, years per skill, languages. This is
+   what answers screening questions.
+3. **Settings → Login** for Naukri / LinkedIn. A browser window opens — sign in
+   by hand (2FA and CAPTCHA included). **Click Login, not "Sign in with
+   Google"**: Google blocks automated browsers. The session is then saved and
+   reused. **Check** re-probes it live.
+4. **Dashboard → Trigger scrape**, then **Trigger scoring**. Chrome windows open
+   for Naukri and Indeed — that is expected.
+5. **Settings → Dry run** to preview what would be applied to, then **Submit
+   applications**.
+
+---
+
 ## Deployment
 
-### Backend → Railway
+This is designed to **run locally**. Naukri and Indeed block headless browsers
+and datacenter IPs, and manual CAPTCHA/login needs a visible window — so
+scraping and auto-apply only work on your own machine.
 
-1. Create a new Railway project and connect this repo
-2. Railway auto-detects the `Dockerfile` and `railway.toml`
-3. Add all environment variables in Railway → Variables
-4. Set MongoDB Atlas Network Access to allow `0.0.0.0/0`
+The included `Dockerfile` / `railway.toml` still build the API, but a container
+deploy can only do the LLM/API parts. Set `NAUKRI_DISABLED=1` and expect
+`login_required` from auto-apply there.
 
-### Frontend → Vercel
+The `mongo` service in `docker-compose.yml` is genuinely useful either way:
 
-1. Import this repo in Vercel
-2. Set **Root Directory** to `frontend`
-3. Add environment variable: `VITE_API_URL=https://your-app.up.railway.app`
-4. Deploy
+```bash
+docker compose up -d mongo     # persistent local database
+```
+
+Frontend deploys to Vercel normally (root directory `frontend`, set
+`VITE_API_URL`), but it needs a reachable backend.
 
 ---
 
@@ -201,12 +229,40 @@ pauses and waits for you to solve it in that window.
 2. AI tailors your resume + generates a cover letter for the specific job, and
    the resume is validated (no fabricated skills) before submission
 3. Playwright opens the job in your signed-in session and fills the form —
-   screening questions are answered from a structured profile, and anything it
-   can't answer safely (or a CAPTCHA) pauses for you to handle in the window
+   screening questions are answered from your profile, and anything it can't
+   answer safely (or a CAPTCHA) pauses for you to handle in the window
 4. Submits and records the application
 
 Run it for a batch from **Settings → Check & Submit Applications** (dry-run
 preview, then submit), gated by a daily cap and min-score.
+
+Set `APPLY_DRY_RUN=1` to fill forms and screenshot the final step **without
+ever submitting** — useful when verifying a new form.
+
+### Answering screening questions
+
+Application forms ask things like *"How many years with Python?"*, *"Notice
+period?"*, *"Do you require sponsorship?"*. You fill in the **Profile** page
+once, and each question is resolved in order:
+
+1. **Learned answers** — you answered this question before
+2. **Profile rules** — sponsorship, notice period, CTC, relocation, city,
+   languages, per-skill years, straight from your stored fields
+3. **LLM mapping** — reworded or novel questions mapped onto your profile and
+   resume, instructed to return `UNKNOWN` rather than invent anything
+4. **Unanswered** → the apply **pauses for you**, and the question is saved to
+   the Profile page. Answer it once and it is reused forever
+
+The bot never guesses. Anything it can't ground in your profile is handed back
+to you.
+
+### Not fabricating your resume
+
+`resume_validator.py` gates every tailored resume before it is submitted: it
+strips LLM preamble, then rejects the rewrite if it introduces skills absent
+from your original (alias-aware, so "ML" → "Machine Learning" is fine),
+truncates it, or drops your identity/education. On failure the **original**
+resume is submitted instead.
 
 ---
 
@@ -233,7 +289,26 @@ GET  /auth/status                 # per-platform sign-in state
 POST /auth/{platform}/login       # open browser to sign in (session saved)
 POST /auth/{platform}/check       # live-probe whether a session is still valid
 POST /auto-apply/run              # {dry_run|force, max_apply} — batch apply cycle
+GET  /profile                     # application questionnaire
+PUT  /profile
+GET  /profile/questions           # questions awaiting your answer
+POST /profile/questions           # {question, answer} — saved and reused
+DELETE /profile/questions?question=...
 ```
+
+---
+
+## Notes and limits
+
+- **Free LLM tiers run out.** Groq's daily token cap and Gemini's quota will
+  stop scoring mid-run. That is handled: jobs are left unscored (never saved as
+  a fake `0`) and retried next cycle, paced by `SCORE_DELAY_SEC` with backoff.
+- **Many postings are external.** LinkedIn "Apply" (as opposed to "Easy Apply")
+  redirects to the company's site; those return `manual_required` rather than a
+  fake submission.
+- **Jobs are deduped by role**, not URL — the same job is re-listed under
+  different URLs, which otherwise wastes scoring quota and risks duplicate
+  applications.
 
 ---
 
