@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright
 from agents.tailor_agent import TailorAgent
 from agents.cover_letter_agent import CoverLetterAgent
-from config.apply_profile import AnswerProfile
+from services.answer_service import AnswerResolver
 from utils.pdf_generator import generate_resume_pdf
 from utils.resume_validator import validate_tailored_resume, clean_resume_text
 from services.alert_service import send_manual_action_alert
@@ -83,7 +83,7 @@ class ApplyAgent:
         self.user_name = f"{first} {last}"
         self.user_email = os.environ.get("MY_EMAIL", "mukulmokkapati@gmail.com")
         self.user_phone = os.environ.get("MY_PHONE", "")
-        self.answers = AnswerProfile()
+        self.answers = None   # AnswerResolver, loaded per apply (needs DB)
 
         # Headed is required for manual CAPTCHA. Only go headless if explicitly asked.
         self.headless = os.environ.get("APPLY_HEADLESS", "").strip().lower() in ("1", "true", "yes")
@@ -159,6 +159,7 @@ class ApplyAgent:
                 # login_required job never burns LLM calls.
                 pdf_path, tailored_text = await self._make_resume(job)
                 cover_letter = await self._make_cover_letter(job)
+                await self._load_answers()
 
                 handler = getattr(self, f"_apply_{source}")
                 result = await handler(page, job, pdf_path, cover_letter)
@@ -218,6 +219,20 @@ class ApplyAgent:
         except Exception as e:
             print(f"ApplyAgent: PDF generation failed: {e}")
             return None, final_text
+
+    async def _load_answers(self):
+        """Load the questionnaire profile used to answer screening questions."""
+        try:
+            from db.mongodb import get_resume
+            resume = await get_resume() or {}
+            self.answers = await AnswerResolver.load(resume.get("parsed_text", ""))
+            p = self.answers.profile or {}
+            # Prefer questionnaire contact details over env defaults.
+            self.user_phone = p.get("phone") or self.user_phone
+            self.user_email = p.get("email") or self.user_email
+        except Exception as e:
+            print(f"    ApplyAgent: could not load apply profile ({e}); using defaults")
+            self.answers = AnswerResolver({})
 
     async def _make_cover_letter(self, job: dict) -> str:
         """Best-effort cover letter — never blocks an apply if it fails."""
@@ -388,18 +403,29 @@ class ApplyAgent:
     # ── Shared helpers ───────────────────────────────────────────────────────
 
     async def _has_captcha(self, page) -> bool:
+        """
+        Detect a real challenge. Deliberately strict: page HTML often contains
+        the word "captcha" inside bundled scripts, and matching that produced
+        false positives that stalled every apply. Require either a visible
+        challenge widget or challenge wording in the *visible* text.
+        """
         try:
-            content = (await page.content()).lower()
-            signals = ["captcha", "verify you're human", "prove you're not a robot",
-                       "security challenge", "bot detection", "are you a robot",
-                       "unusual activity", "verify your identity"]
-            if any(s in content for s in signals):
-                return True
-            frame = await page.query_selector(
-                'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
-                'div[class*="captcha"], #captcha'
+            widget = await page.query_selector(
+                'iframe[src*="recaptcha"]:not([src*="anchor"]), iframe[src*="hcaptcha"], '
+                'iframe[title*="challenge" i], div.g-recaptcha, #captcha'
             )
-            return frame is not None
+            if widget:
+                try:
+                    if await widget.is_visible():
+                        return True
+                except Exception:
+                    return True
+
+            body = (await page.inner_text("body")).lower()
+            phrases = ["verify you're human", "verify you are human", "prove you're not a robot",
+                       "security challenge", "are you a robot", "complete this security check",
+                       "unusual activity from your"]
+            return any(p in body for p in phrases)
         except Exception:
             return False
 
@@ -504,44 +530,120 @@ class ApplyAgent:
                 break
 
         unknown = 0
-        containers = await page.query_selector_all(
-            'div.fb-dash-form-element, div[data-test-form-element], '
-            'div[data-test-text-entity-list-form-component]'
-        )
-        for c in containers:
-            try:
-                label_el = await c.query_selector(
-                    'label, legend, span[data-test-form-element-label]'
-                )
-                label = (await label_el.inner_text()).strip() if label_el else ""
-                if not label:
-                    continue
 
-                select_el = await c.query_selector('select')
-                radios = await c.query_selector_all('input[type="radio"]')
-                text_el = await c.query_selector(
-                    'input[type="text"], input[type="number"], input:not([type]), textarea'
-                )
-                if not (select_el or radios or text_el):
-                    continue
+        # 1) Labelled text/number/select fields. LinkedIn's containers are
+        # obfuscated, but each question's <label for> points at its field id, so
+        # we map via that. (ids can contain odd chars, so target by [id="..."].)
+        # Walk every field in the dialog and derive its question text. LinkedIn
+        # doesn't consistently use label[for], so fall back to aria-label and
+        # then the nearest preceding text in the field's ancestry.
+        fields = await page.evaluate("""() => {
+            const root = document.querySelector('dialog[open]') || document;
+            const out = [];
+            let n = 0;
+            root.querySelectorAll('input, select, textarea').forEach(e => {
+                const type = (e.type || '').toLowerCase();
+                if (['hidden', 'file', 'submit', 'button'].includes(type)) return;
+                if (!e.offsetParent && type !== 'radio') return;   // not visible
 
-                ans = self.answers.answer(label)
-                if ans is None:
-                    unknown += 1
-                    continue
+                let q = '';
+                if (e.id) {
+                    let l = null;
+                    try { l = root.querySelector('label[for="' + CSS.escape(e.id) + '"]'); } catch (_) {}
+                    if (l) q = (l.innerText || '').trim();
+                }
+                if (!q) q = (e.getAttribute('aria-label') || '').trim();
+                if (!q) {
+                    // nearest ancestor whose text is mostly the question
+                    let p = e.parentElement;
+                    for (let i = 0; i < 5 && p && !q; i++, p = p.parentElement) {
+                        const t = (p.innerText || '').trim();
+                        if (t && t.length > 5 && t.length < 300) q = t.split('\\n')[0].trim();
+                    }
+                }
+                if (!q || q.length < 4) return;
 
-                if select_el:
-                    await self._select_option(select_el, str(ans))
-                elif radios:
-                    await self._check_radio(c, radios, str(ans))
-                elif text_el:
-                    if not await text_el.input_value():
-                        await text_el.fill(str(ans))
-            except Exception:
+                if (!e.id) { e.setAttribute('data-jh-id', 'jh' + (n++)); }
+                const opts = e.tagName.toLowerCase() === 'select'
+                    ? [...e.querySelectorAll('option')].map(o => (o.innerText || '').trim())
+                          .filter(t => t && !/^select/i.test(t))
+                    : [];
+                out.push({q, id: e.id || null, jh: e.getAttribute('data-jh-id'),
+                          tag: e.tagName.toLowerCase(), type,
+                          hasValue: !!(e.value && e.value.trim()), options: opts});
+            });
+            return out;
+        }""")
+        print(f"    fields found in modal: {[f['q'][:40] for f in fields]}")
+        for f in fields:
+            q = f["q"]
+            ql = q.lower()
+            if any(k in ql for k in ("email", "phone", "country code")):
+                continue  # handled by the convenience fills above
+            if f["type"] in ("radio", "checkbox"):
+                continue  # handled as fieldset groups below
+            if f["hasValue"]:
+                continue  # already filled (by LinkedIn or a previous pass)
+            kind = "number" if f["type"] == "number" else ("select" if f["tag"] == "select" else "text")
+            ans = await self.answers.answer(q, options=f.get("options") or None, kind=kind)
+            if ans is None:
+                print(f"    [?] no answer for: {q[:70]}")
+                unknown += 1
                 continue
+            loc = (page.locator(f'[id="{f["id"]}"]') if f["id"]
+                   else page.locator(f'[data-jh-id="{f["jh"]}"]'))
+            try:
+                if f["tag"] == "select":
+                    await self._select_option(await loc.element_handle(), str(ans))
+                else:
+                    await loc.fill(str(ans))
+                print(f"    [ok] {q[:55]} -> {ans}")
+            except Exception as e:
+                print(f"    [!] could not fill '{q[:40]}': {str(e)[:60]}")
+
+        # 2) Radio groups (yes/no): a <fieldset> with a <legend> question and
+        # radios whose <label for> gives the option text.
+        groups = await page.evaluate("""() => {
+            const out = [];
+            const root = document.querySelector('dialog[open]') || document;
+            root.querySelectorAll('fieldset').forEach(fs => {
+                const legend = fs.querySelector('legend');
+                const q = legend ? (legend.innerText || '').trim() : '';
+                if (!q) return;
+                const radios = [...fs.querySelectorAll('input[type=radio]')].map(r => {
+                    let lab = '';
+                    if (r.id) { const l = fs.querySelector('label[for="' + CSS.escape(r.id) + '"]'); if (l) lab = (l.innerText || '').trim(); }
+                    return {id: r.id, value: r.value, label: lab};
+                });
+                const anyChecked = [...fs.querySelectorAll('input[type=radio]')].some(r => r.checked);
+                if (radios.length) out.push({q, radios, anyChecked});
+            });
+            return out;
+        }""")
+        for g in groups:
+            opts = [r["label"] or r["value"] for r in g["radios"] if (r["label"] or r["value"])]
+            ans = await self.answers.answer(g["q"], options=opts or None, kind="radio")
+            if ans is None:
+                if not g["anyChecked"]:
+                    print(f"    [?] no answer for: {g['q'][:70]}")
+                    unknown += 1
+                continue
+            av = str(ans).lower()
+            target = next((r for r in g["radios"]
+                           if av == r["value"].lower() or (r["label"] and av in r["label"].lower())), None)
+            if target and target["id"]:
+                try:
+                    await page.locator(f'[id="{target["id"]}"]').check()
+                except Exception:
+                    try:
+                        await page.locator(f'label[for="{target["id"]}"]').click()
+                    except Exception:
+                        pass
         return unknown
 
     async def _select_option(self, select_el, value: str):
+        if select_el is None:
+            return
         try:
             await select_el.select_option(label=value)
             return
@@ -556,67 +658,87 @@ class ApplyAgent:
         except Exception:
             pass
 
-    async def _check_radio(self, container, radios, value: str):
-        v = value.strip().lower()
-        for r in radios:
-            label = (await r.get_attribute('aria-label') or "").lower()
-            rvalue = (await r.get_attribute('value') or "").lower()
-            text = ""
-            rid = await r.get_attribute('id')
-            if rid:
-                lab = await container.query_selector(f'label[for="{rid}"]')
-                if lab:
-                    text = (await lab.inner_text()).strip().lower()
-            if v == rvalue or v in label or (text and v in text):
-                try:
-                    await r.check()
-                except Exception:
-                    try:
-                        await r.click()
-                    except Exception:
-                        pass
-                return
-
     # ── LinkedIn Easy Apply ──────────────────────────────────────────────────
 
     async def _apply_linkedin(self, page, job: dict, pdf_path: str = None, cover_letter: str = None) -> dict:
         await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(2)
 
-        easy_apply = await page.query_selector(
-            'button.jobs-apply-button, button[aria-label*="Easy Apply"], '
-            'button:has-text("Easy Apply"), .jobs-s-apply button'
-        )
+        # Wait for the job page to finish rendering — clicking while it still
+        # shows placeholders silently fails to open the modal.
+        sel = ('button.jobs-apply-button, button[aria-label*="Easy Apply"], '
+               'button:has-text("Easy Apply"), .jobs-s-apply button')
+        try:
+            await page.wait_for_selector(sel, timeout=15000)
+        except Exception:
+            return self._external_apply(job)
+
+        easy_apply = await page.query_selector(sel)
         if not easy_apply:
             return self._external_apply(job)
 
         await easy_apply.click()
-        await asyncio.sleep(2)
+
+        # The dialog element appears within a few seconds of the click.
+        try:
+            await page.wait_for_selector("dialog[open]", timeout=20000)
+        except Exception:
+            await self._screenshot(page, "linkedin_modal_never_opened")
+            return {"status": "needs_review", "url": page.url,
+                    "message": "Easy Apply clicked but the application modal did not open."}
+
+        await self._wait_for_modal_content(page)
         return await self._fill_linkedin_modal(page, pdf_path, cover_letter)
 
+    async def _wait_for_modal_content(self, page, timeout: float = 10.0) -> int:
+        """
+        Each modal step renders its fields asynchronously (~5s). Reading too early
+        sees an empty form and blindly clicks Next, so wait until the field count
+        inside the dialog stops changing.
+        """
+        waited, step, last = 0.0, 0.5, -1
+        while waited < timeout:
+            count = await page.evaluate("""() => {
+                const d = document.querySelector('dialog[open]');
+                if (!d) return 0;
+                return d.querySelectorAll('label[for], fieldset legend, input[type=file]').length;
+            }""")
+            if count and count == last:
+                return count           # stable => rendered
+            last = count
+            await asyncio.sleep(step)
+            waited += step
+        return max(last, 0)
+
     async def _fill_linkedin_modal(self, page, pdf_path: str = None, cover_letter: str = None) -> dict:
-        for _ in range(12):
+        for step in range(12):
             await asyncio.sleep(1.5)
+            await self._wait_for_modal_content(page)
+            print(f"    -- modal step {step + 1}")
             if not await self._guard_captcha(page, "linkedin"):
                 return {"status": "needs_review", "url": page.url,
                         "message": "CAPTCHA not cleared during LinkedIn apply."}
 
-            submit_btn = await page.query_selector('button[aria-label="Submit application"]')
-            if submit_btn:
+            # Footer buttons carry only text, so match by accessible name — scoped
+            # to the dialog so the page's carousel "Next" can't be picked up.
+            modal = self._modal(page)
+            submit_btn = modal.get_by_role("button", name="Submit application")
+            if await submit_btn.count() > 0:
                 if self.dry_run:
                     return await self._dry_stop(page, "linkedin", "Submit application")
-                await submit_btn.click()
+                await submit_btn.first.click()
                 confirmed = await self._verify_submission(page)
                 if confirmed:
                     return confirmed
                 return {"status": "applied", "message": "Application submitted via LinkedIn Easy Apply."}
 
             if pdf_path:
-                upload = await page.query_selector('input[type="file"][accept*="pdf"]')
+                upload = await page.query_selector('dialog[open] input[type="file"]')
                 if upload:
                     try:
                         await upload.set_input_files(pdf_path)
                         await asyncio.sleep(1)
+                        print("    [ok] uploaded tailored resume")
                     except Exception:
                         pass
 
@@ -639,24 +761,33 @@ class ApplyAgent:
                 return {"status": "needs_review", "url": page.url,
                         "message": "Handed to you for screening questions — verify it submitted."}
 
-            review_btn = await page.query_selector('button[aria-label="Review your application"]')
-            next_btn = await page.query_selector('button[aria-label="Continue to next step"]')
-            if review_btn:
-                await review_btn.click()
-            elif next_btn:
-                await next_btn.click()
+            # Review (final step) before Next. "Review" matches both "Review" and
+            # "Review your application"; Next is exact to avoid "Next steps".
+            review_btn = modal.get_by_role("button", name="Review")
+            next_btn = modal.get_by_role("button", name="Next", exact=True)
+            if await review_btn.count() > 0:
+                await review_btn.first.click()
+            elif await next_btn.count() > 0:
+                await next_btn.first.click()
             else:
                 break
 
+        await self._screenshot(page, "linkedin_stuck")
         return {"status": "needs_review", "url": page.url,
                 "message": "Partially filled — could not reach final submit. Some questions need manual answers."}
 
     async def _linkedin_modal_closed(self, page) -> bool:
+        # LinkedIn's Easy Apply modal is a native <dialog open> element — the one
+        # reliable signal. (Matching footer button text page-wide false-positives
+        # on the "Next" button of the recommended-jobs carousel.)
         try:
-            modal = await page.query_selector('div.jobs-easy-apply-modal, div[role="dialog"]')
-            return modal is None
+            return await page.locator("dialog[open]").count() == 0
         except Exception:
             return True
+
+    def _modal(self, page):
+        """Locator scoped to the Easy Apply dialog."""
+        return page.locator("dialog[open]")
 
     # ── Naukri Apply ─────────────────────────────────────────────────────────
 

@@ -260,6 +260,68 @@ async def get_resume() -> dict:
     return await db.resume.find_one({}, {"_id": 0})
 
 
+# --- Apply profile (questionnaire) + learned answers ---
+
+async def get_apply_profile() -> dict:
+    db = get_db()
+    return await db.apply_profile.find_one({}, {"_id": 0}) or {}
+
+
+async def save_apply_profile(profile: dict):
+    from datetime import datetime
+    payload = dict(profile)
+    payload["updated_at"] = datetime.utcnow()
+    db = get_db()
+    await db.apply_profile.replace_one({}, payload, upsert=True)
+
+
+async def upsert_learned_answer(question: str, answer: str):
+    """Store an answer for a specific form question, so it's reused next time."""
+    from datetime import datetime
+    db = get_db()
+    profile = await db.apply_profile.find_one({}) or {}
+    qa = profile.get("qa", [])
+    q_norm = " ".join(question.lower().split())
+    for entry in qa:
+        if " ".join(entry.get("question", "").lower().split()) == q_norm:
+            entry["answer"] = answer
+            break
+    else:
+        qa.append({"question": question, "answer": answer})
+    await db.apply_profile.update_one(
+        {}, {"$set": {"qa": qa, "updated_at": datetime.utcnow()}}, upsert=True
+    )
+    # Answering it clears it from the pending list.
+    await db.pending_questions.delete_one({"question_norm": q_norm})
+
+
+async def record_pending_question(question: str, source: str = "", job_title: str = ""):
+    """Log a question the system could not answer, for you to fill in later."""
+    from datetime import datetime
+    db = get_db()
+    q_norm = " ".join(question.lower().split())
+    await db.pending_questions.update_one(
+        {"question_norm": q_norm},
+        {"$set": {"question": question, "question_norm": q_norm, "last_seen_at": datetime.utcnow(),
+                  "source": source, "job_title": job_title},
+         "$inc": {"times_seen": 1}},
+        upsert=True,
+    )
+
+
+async def get_pending_questions() -> list:
+    db = get_db()
+    out = []
+    async for doc in db.pending_questions.find({}, {"_id": 0}).sort("times_seen", -1):
+        out.append(doc)
+    return out
+
+
+async def delete_pending_question(question: str):
+    db = get_db()
+    await db.pending_questions.delete_one({"question_norm": " ".join(question.lower().split())})
+
+
 # --- Auth session state (manual login persisted in browser profiles) ---
 
 async def save_auth_state(platform: str):

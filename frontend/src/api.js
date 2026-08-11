@@ -34,6 +34,12 @@ export const getStats = () => api.get('/stats')
 export const triggerScrape = (data) => api.post('/scrape/trigger', data)
 export const triggerScoring = () => api.post('/score/trigger')
 
+export const getProfile = () => api.get('/profile')
+export const saveProfile = (data) => api.put('/profile', data)
+export const getPendingQuestions = () => api.get('/profile/questions')
+export const answerQuestion = (question, answer) => api.post('/profile/questions', { question, answer })
+export const dismissQuestion = (question) => api.delete('/profile/questions', { params: { question } })
+
 export const getAuthStatus = () => api.get('/auth/status')
 export const platformLogin = (platform) => api.post(`/auth/${platform}/login`)
 export const platformCheck = (platform) => api.post(`/auth/${platform}/check`, null, { timeout: 90000 })

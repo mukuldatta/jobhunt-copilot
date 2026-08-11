@@ -17,6 +17,7 @@ from db.mongodb import (
 )
 from models.schemas import (
     ApplicationStatusUpdate, ScrapeRequest, AutoApplyRunRequest,
+    ApplyProfile, AnswerUpsert,
 )
 from utils.resume_parser import parse_resume_pdf
 from utils.pdf_generator import generate_resume_pdf
@@ -224,6 +225,49 @@ async def trigger_scrape(background_tasks: BackgroundTasks, body: ScrapeRequest 
     agent.max_jobs_per_source = min(body.max_jobs, 100)
     background_tasks.add_task(agent.scrape_all)
     return {"message": "Scrape started in background. Refresh jobs in a few minutes."}
+
+
+# --- Apply profile (questionnaire) ---
+
+@app.get("/profile")
+async def get_profile():
+    from db.mongodb import get_apply_profile
+    profile = await get_apply_profile()
+    if not profile:
+        # Seed sensible defaults from env so the form starts pre-filled.
+        profile = ApplyProfile(
+            full_name=f"{os.environ.get('USER_FIRST_NAME', '')} {os.environ.get('USER_LAST_NAME', '')}".strip() or None,
+            email=os.environ.get("MY_EMAIL"),
+            phone=os.environ.get("MY_PHONE"),
+        ).model_dump()
+    return profile
+
+
+@app.put("/profile")
+async def update_profile(body: ApplyProfile):
+    from db.mongodb import save_apply_profile
+    await save_apply_profile(body.model_dump())
+    return {"message": "Profile saved"}
+
+
+@app.get("/profile/questions")
+async def list_pending_questions():
+    from db.mongodb import get_pending_questions
+    return {"questions": await get_pending_questions()}
+
+
+@app.post("/profile/questions")
+async def answer_pending_question(body: AnswerUpsert):
+    from db.mongodb import upsert_learned_answer
+    await upsert_learned_answer(body.question, body.answer)
+    return {"message": "Answer saved and will be reused"}
+
+
+@app.delete("/profile/questions")
+async def dismiss_pending_question(question: str = Query(...)):
+    from db.mongodb import delete_pending_question
+    await delete_pending_question(question)
+    return {"message": "Question dismissed"}
 
 
 @app.get("/auth/status")

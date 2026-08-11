@@ -123,6 +123,46 @@ class ScrapeRequest(BaseModel):
     max_jobs: int = 50
 
 
+class QAEntry(BaseModel):
+    question: str
+    answer: str
+
+
+class ApplyProfile(BaseModel):
+    """Answers used to fill job-application forms. Filled once via the UI."""
+    # Identity / contact
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    current_city: Optional[str] = "Hyderabad"
+    # Work eligibility
+    authorized_to_work: bool = True
+    requires_sponsorship: bool = False
+    # Experience / availability
+    total_years_experience: Optional[str] = "3"
+    notice_period_days: Optional[str] = "30"
+    earliest_start: Optional[str] = "Immediately"
+    willing_to_relocate: bool = True
+    willing_onsite_hybrid: bool = True
+    # Compensation (blank => ask a human rather than guess)
+    current_ctc: Optional[str] = None
+    expected_ctc: Optional[str] = None
+    # Education / background
+    highest_degree: Optional[str] = None
+    has_bachelors: bool = True
+    # Free-form: skill -> years, e.g. {"Python": "3", "LangChain": "2"}
+    skill_years: dict = {}
+    # Learned answers to specific questions seen on real forms
+    qa: List[QAEntry] = []
+    # Anything else the LLM should know when answering
+    notes: Optional[str] = None
+
+
+class AnswerUpsert(BaseModel):
+    question: str
+    answer: str
+
+
 class AutoApplyRunRequest(BaseModel):
     max_apply: Optional[int] = None
     dry_run: bool = False

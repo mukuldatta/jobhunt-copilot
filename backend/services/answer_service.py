@@ -1,0 +1,215 @@
+"""
+Resolve job-application form questions into answers from your stored profile.
+
+Resolution order (cheapest and most certain first):
+  1. Learned Q&A — you already answered this exact question before.
+  2. Deterministic profile rules — unambiguous questions (sponsorship, notice
+     period, CTC, relocation, ...) answered straight from structured fields.
+  3. LLM semantic mapping — reworded/novel questions mapped onto your profile.
+     The prompt is instructed to return UNKNOWN rather than invent anything.
+  4. UNKNOWN — recorded as a pending question so you answer it once in the
+     Profile page and it is reused forever after.
+
+Never guesses: an unresolved question makes the apply flow pause for a human.
+"""
+
+import os
+import re
+import json
+from llm_provider import LLMProvider
+from db.mongodb import get_apply_profile, record_pending_question
+
+
+def _norm(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _yn(flag: bool) -> str:
+    return "Yes" if flag else "No"
+
+
+class AnswerResolver:
+    def __init__(self, profile: dict = None, resume_text: str = ""):
+        self.profile = profile or {}
+        self.resume_text = resume_text or ""
+        self._llm = None
+        self._llm_cache = {}
+
+    @classmethod
+    async def load(cls, resume_text: str = ""):
+        return cls(await get_apply_profile(), resume_text)
+
+    @property
+    def llm(self):
+        if self._llm is None:
+            self._llm = LLMProvider(provider=os.getenv("LLM_PROVIDER", "groq"))
+        return self._llm
+
+    # ── public ───────────────────────────────────────────────────────────────
+
+    async def answer(self, question: str, options: list = None, kind: str = "text"):
+        """
+        Return an answer string, or None if it can't be answered safely.
+        `options` are the choices for a radio/select; `kind` is text|number|radio|select.
+        """
+        if not question or not question.strip():
+            return None
+
+        ans = self._from_learned(question)
+        if ans is None:
+            ans = self._from_rules(question)
+        if ans is None:
+            ans = self._from_llm(question, options, kind)
+
+        if ans is None:
+            try:
+                await record_pending_question(question)
+            except Exception:
+                pass
+            return None
+
+        # If the field has fixed options, snap the answer to the closest one.
+        if options:
+            ans = self._snap_to_option(ans, options) or ans
+        return ans
+
+    # ── 1. learned answers ───────────────────────────────────────────────────
+
+    def _from_learned(self, question: str):
+        q = _norm(question)
+        for entry in self.profile.get("qa", []) or []:
+            eq = _norm(entry.get("question", ""))
+            if not eq:
+                continue
+            if eq == q or (len(eq) > 15 and (eq in q or q in eq)):
+                val = (entry.get("answer") or "").strip()
+                if val:
+                    return val
+        return None
+
+    # ── 2. deterministic rules ───────────────────────────────────────────────
+
+    def _from_rules(self, question: str):
+        p = self.profile
+        q = _norm(question)
+
+        def any_(*w):
+            return any(x in q for x in w)
+
+        # Sponsorship — check before generic work-authorization wording.
+        if any_("sponsor", "sponsorship", "visa"):
+            requires = bool(p.get("requires_sponsorship", False))
+            if any_("without", "not require", "no sponsorship"):
+                return _yn(not requires)
+            if any_("require", "need", "will you", "would you", "future"):
+                return _yn(requires)
+
+        if any_("authorized", "authorised", "eligible", "legal right", "legally") and any_("work", "employ"):
+            return _yn(bool(p.get("authorized_to_work", True)))
+
+        if any_("felony", "convicted", "criminal record", "criminal history"):
+            return "No"
+
+        if any_("immediate") and any_("join", "joiner", "available", "start"):
+            return "Yes"
+        if "notice" in q and any_("period", "days", "how many", "how long", "serving"):
+            return str(p.get("notice_period_days") or "") or None
+
+        if any_("current") and any_("ctc", "salary", "compensation", "pay"):
+            return str(p.get("current_ctc") or "") or None
+        if any_("expected", "desired", "expecting") and any_("ctc", "salary", "compensation", "pay"):
+            return str(p.get("expected_ctc") or "") or None
+
+        if "relocat" in q:
+            return _yn(bool(p.get("willing_to_relocate", True)))
+        if any_("commute", "work from office", "on-site", "onsite", "hybrid", "in office", "willing to travel"):
+            return _yn(bool(p.get("willing_onsite_hybrid", True)))
+
+        if any_("current location", "current city", "which city", "where are you located", "your location"):
+            return str(p.get("current_city") or "") or None
+
+        if any_("start date", "when can you start", "available to start", "earliest start"):
+            return str(p.get("earliest_start") or "") or None
+
+        if any_("bachelor", "degree", "graduate", "graduated", "qualification"):
+            return _yn(bool(p.get("has_bachelors", True)))
+
+        if any_("background check", "background verification", "drug test", "willing to undergo"):
+            return "Yes"
+
+        # Years of experience — per-skill first, else total.
+        if any_("how many years", "years of experience", "years experience", "total experience",
+                "yrs of experience") or ("years" in q and any_("experience", "exp")):
+            for skill, years in (p.get("skill_years") or {}).items():
+                if skill and _norm(skill) in q:
+                    return str(years)
+            return str(p.get("total_years_experience") or "") or None
+
+        return None
+
+    # ── 3. LLM semantic mapping ──────────────────────────────────────────────
+
+    def _from_llm(self, question: str, options: list = None, kind: str = "text"):
+        cache_key = (_norm(question), tuple(options or []))
+        if cache_key in self._llm_cache:
+            return self._llm_cache[cache_key]
+
+        profile_json = json.dumps(
+            {k: v for k, v in self.profile.items() if k not in ("qa", "_id", "updated_at")},
+            default=str, indent=2,
+        )
+        learned = "\n".join(
+            f"- {e.get('question')} => {e.get('answer')}"
+            for e in (self.profile.get("qa") or [])[:25]
+        ) or "(none)"
+        opts = f"\nALLOWED ANSWERS (choose exactly one): {options}" if options else ""
+
+        prompt = f"""You are filling a job application form on behalf of a candidate.
+Answer the question using ONLY the candidate profile below.
+
+CANDIDATE PROFILE (JSON):
+{profile_json}
+
+PREVIOUSLY ANSWERED QUESTIONS:
+{learned}
+
+RESUME EXCERPT:
+{self.resume_text[:1200]}
+
+FORM QUESTION ({kind}): {question}{opts}
+
+RULES:
+- If the profile does not contain the information, reply exactly: UNKNOWN
+- Never invent salary, years of experience, dates, or qualifications.
+- For yes/no questions reply exactly Yes or No.
+- For numeric questions reply with digits only (e.g. 3).
+- Reply with the answer value ONLY — no explanation, no quotes, no punctuation."""
+
+        try:
+            raw = (self.llm.complete(prompt) or "").strip()
+        except Exception as e:
+            print(f"    AnswerResolver LLM error: {e}")
+            return None
+
+        answer = raw.splitlines()[0].strip().strip('"').strip("'") if raw else ""
+        if not answer or answer.upper().startswith("UNKNOWN") or len(answer) > 120:
+            self._llm_cache[cache_key] = None
+            return None
+        if kind == "number":
+            m = re.search(r"\d+", answer)
+            answer = m.group() if m else answer
+        self._llm_cache[cache_key] = answer
+        return answer
+
+    # ── option snapping ──────────────────────────────────────────────────────
+
+    def _snap_to_option(self, answer: str, options: list):
+        a = _norm(answer)
+        for o in options:
+            if _norm(o) == a:
+                return o
+        for o in options:
+            no = _norm(o)
+            if no and (a in no or no in a):
+                return o
+        return None
