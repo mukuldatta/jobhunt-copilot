@@ -29,12 +29,14 @@ export default function Profile() {
   const [pending, setPending] = useState([])
   const [drafts, setDrafts] = useState({})
   const [skillRows, setSkillRows] = useState([])
+  const [langRows, setLangRows] = useState([])
 
   async function load() {
     try {
       const [pr, pq] = await Promise.all([getProfile(), getPendingQuestions()])
       setP(pr.data)
       setSkillRows(Object.entries(pr.data.skill_years || {}).map(([k, v]) => ({ k, v })))
+      setLangRows(Object.entries(pr.data.languages || {}).map(([k, v]) => ({ k, v })))
       setPending(pq.data.questions || [])
     } catch {
       setMsg('Could not load profile — is the backend running?')
@@ -49,7 +51,9 @@ export default function Profile() {
     try {
       const skill_years = {}
       skillRows.forEach(({ k, v }) => { if (k.trim()) skill_years[k.trim()] = v })
-      await saveProfile({ ...p, skill_years })
+      const languages = {}
+      langRows.forEach(({ k, v }) => { if (k.trim()) languages[k.trim()] = v })
+      await saveProfile({ ...p, skill_years, languages })
       setMsg('Profile saved.')
     } catch (e) {
       setMsg(e.response?.data?.detail || 'Save failed')
@@ -150,6 +154,28 @@ export default function Profile() {
         ))}
         <button onClick={() => setSkillRows(rs => [...rs, { k: '', v: '' }])}
           className="text-accent text-sm hover:underline">+ Add skill</button>
+      </div>
+
+      <div className="bg-card border border-border rounded-lg p-6 mb-6">
+        <h2 className="text-textPrimary font-semibold mb-1">Languages</h2>
+        <p className="text-textSecondary text-sm mb-4">
+          Used for "proficiency in X?" questions. Use <code className="text-accent">*</code> as the
+          language to set a default for any language not listed.
+        </p>
+        {langRows.map((row, i) => (
+          <div key={i} className="flex gap-2 mb-2">
+            <input value={row.k} placeholder="Language (e.g. Hindi)"
+              onChange={e => setLangRows(rs => rs.map((r, j) => j === i ? { ...r, k: e.target.value } : r))}
+              className="flex-1 bg-bg border border-border rounded px-3 py-1.5 text-sm text-textPrimary focus:border-accent outline-none" />
+            <input value={row.v} placeholder="Proficiency"
+              onChange={e => setLangRows(rs => rs.map((r, j) => j === i ? { ...r, v: e.target.value } : r))}
+              className="w-64 bg-bg border border-border rounded px-3 py-1.5 text-sm text-textPrimary focus:border-accent outline-none" />
+            <button onClick={() => setLangRows(rs => rs.filter((_, j) => j !== i))}
+              className="px-2 text-textSecondary hover:text-danger">×</button>
+          </div>
+        ))}
+        <button onClick={() => setLangRows(rs => [...rs, { k: '', v: '' }])}
+          className="text-accent text-sm hover:underline">+ Add language</button>
       </div>
 
       <div className="bg-card border border-border rounded-lg p-6 mb-6">

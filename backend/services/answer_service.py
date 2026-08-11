@@ -143,6 +143,16 @@ class AnswerResolver:
         if any_("background check", "background verification", "drug test", "willing to undergo"):
             return "Yes"
 
+        # Language proficiency — match the language named in the question.
+        if any_("proficiency", "fluency", "do you speak", "language"):
+            langs = p.get("languages") or {}
+            for lang, level in langs.items():
+                if lang and _norm(lang) in q:
+                    return str(level)
+            default = langs.get("*") or langs.get("default")
+            if default:
+                return str(default)
+
         # Years of experience — per-skill first, else total.
         if any_("how many years", "years of experience", "years experience", "total experience",
                 "yrs of experience") or ("years" in q and any_("experience", "exp")):

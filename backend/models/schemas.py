@@ -152,6 +152,8 @@ class ApplyProfile(BaseModel):
     has_bachelors: bool = True
     # Free-form: skill -> years, e.g. {"Python": "3", "LangChain": "2"}
     skill_years: dict = {}
+    # Language -> proficiency, e.g. {"English": "Native or bilingual proficiency"}
+    languages: dict = {}
     # Learned answers to specific questions seen on real forms
     qa: List[QAEntry] = []
     # Anything else the LLM should know when answering
