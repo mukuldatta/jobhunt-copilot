@@ -147,23 +147,27 @@ class AnswerResolver:
         if any_("background check", "background verification", "drug test", "willing to undergo"):
             return "Yes"
 
-        # Language proficiency — match the language named in the question.
-        if any_("proficiency", "fluency", "do you speak", "language"):
+        # Years of experience — checked before the language rule, because forms
+        # phrase skills as "Python (Programming Language)" and that word would
+        # otherwise be treated as a spoken-language question.
+        years_q = (any_("how many years", "years of experience", "years experience",
+                        "total experience", "yrs of experience")
+                   or ("years" in q and any_("experience", "exp")))
+        if years_q:
+            for skill, yrs in (p.get("skill_years") or {}).items():
+                if skill and _norm(skill) in q and str(yrs).strip():
+                    return str(yrs)
+            return str(p.get("total_years_experience") or "") or None
+
+        # Spoken-language proficiency. "programming language" is not one.
+        if any_("proficiency", "fluency", "do you speak", "language") and "programming" not in q:
             langs = p.get("languages") or {}
             for lang, level in langs.items():
-                if lang and _norm(lang) in q:
+                if lang and lang != "*" and _norm(lang) in q:
                     return str(level)
             default = langs.get("*") or langs.get("default")
             if default:
                 return str(default)
-
-        # Years of experience — per-skill first, else total.
-        if any_("how many years", "years of experience", "years experience", "total experience",
-                "yrs of experience") or ("years" in q and any_("experience", "exp")):
-            for skill, years in (p.get("skill_years") or {}).items():
-                if skill and _norm(skill) in q:
-                    return str(years)
-            return str(p.get("total_years_experience") or "") or None
 
         return None
 
