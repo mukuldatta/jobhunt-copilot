@@ -16,7 +16,7 @@ Never guesses: an unresolved question makes the apply flow pause for a human.
 import os
 import re
 import json
-from llm_provider import LLMProvider
+from llm_provider import LLMProvider, RateLimited
 from db.mongodb import get_apply_profile, record_pending_question
 
 
@@ -34,6 +34,7 @@ class AnswerResolver:
         self.resume_text = resume_text or ""
         self._llm = None
         self._llm_cache = {}
+        self._rate_limited = False
 
     @classmethod
     async def load(cls, resume_text: str = ""):
@@ -55,6 +56,7 @@ class AnswerResolver:
         if not question or not question.strip():
             return None
 
+        self._rate_limited = False
         ans = self._from_learned(question)
         if ans is None:
             ans = self._from_rules(question)
@@ -62,10 +64,14 @@ class AnswerResolver:
             ans = self._from_llm(question, options, kind)
 
         if ans is None:
-            try:
-                await record_pending_question(question)
-            except Exception:
-                pass
+            # Only record a question we genuinely couldn't answer. A rate-limited
+            # call never got to try, so recording it would pollute your pending
+            # list with questions the profile may well cover.
+            if not self._rate_limited:
+                try:
+                    await record_pending_question(question)
+                except Exception:
+                    pass
             return None
 
         # If the field has fixed options, snap the answer to the closest one.
@@ -187,6 +193,10 @@ RULES:
 
         try:
             raw = (self.llm.complete(prompt) or "").strip()
+        except RateLimited as e:
+            self._rate_limited = True
+            print(f"    AnswerResolver rate limited: {e}")
+            return None
         except Exception as e:
             print(f"    AnswerResolver LLM error: {e}")
             return None
