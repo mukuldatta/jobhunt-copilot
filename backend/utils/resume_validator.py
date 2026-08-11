@@ -14,6 +14,35 @@ misbehaves.
 import re
 from utils.resume_parser import _extract_skills
 
+# A tailored resume legitimately expands abbreviations and uses synonyms — a
+# resume saying "ML", "vector search" and "RESTful" is not fabricating when the
+# rewrite says "Machine Learning", "Vector Database" and "REST API". Without
+# these, honest rewrites were rejected and the original was submitted instead.
+_SKILL_ALIASES = {
+    "machine learning": ["machine learning", "ml", "mlops", "ml engineer"],
+    "deep learning": ["deep learning", "dl", "neural network", "pytorch", "tensorflow"],
+    "vector database": ["vector database", "vector db", "vector store", "vector index",
+                        "vector search", "pinecone", "faiss", "chroma", "weaviate", "qdrant", "milvus"],
+    "embeddings": ["embedding", "embeddings", "vector embedding"],
+    "rest api": ["rest api", "rest apis", "restful", "rest", "api", "apis"],
+    "nlp": ["nlp", "natural language processing"],
+    "data engineering": ["data engineering", "data pipeline", "etl", "elt", "airflow", "spark"],
+    "ci/cd": ["ci/cd", "cicd", "continuous integration", "github actions", "jenkins"],
+    "microservices": ["microservice", "microservices"],
+    "graphql": ["graphql"],
+    "kubernetes": ["kubernetes", "k8s", "eks", "gke"],
+    "docker": ["docker", "container"],
+    "fine-tuning": ["fine-tuning", "fine tuning", "finetune", "lora", "peft"],
+    "sql": ["sql", "postgres", "postgresql", "mysql"],
+    "nosql": ["nosql", "mongodb", "dynamodb", "cassandra"],
+}
+
+
+def _mentions_skill(text_norm: str, skill: str) -> bool:
+    """True if the original resume refers to this skill in any recognised form."""
+    aliases = _SKILL_ALIASES.get(skill.lower(), [skill.lower()])
+    return any(re.search(r"(?<!\w)" + re.escape(a) + r"(?!\w)", text_norm) for a in aliases)
+
 _PREAMBLE = [
     r"here('?s| is)\b", r"sure[,!]", r"certainly[,!]", r"absolutely[,!]",
     r"(below|the following) is\b", r"tailored resume\s*:?\s*$",
@@ -89,8 +118,12 @@ def validate_tailored_resume(tailored: str, resume: dict, *, user_name: str = No
         return {"ok": False, "text": cleaned, "severity": "fail",
                 "issues": ["Tailored resume is empty or far too short."]}
 
-    # 1) Fabricated skills — the core integrity check.
-    added = [s for s in _extract_skills(cleaned) if s.lower() not in orig_skills]
+    # 1) Fabricated skills — the core integrity check. A skill counts as present
+    # if the original lists it OR mentions it in any recognised form, so honest
+    # expansions ("ML" -> "Machine Learning") aren't treated as fabrication.
+    original_norm = " ".join(original.lower().split())
+    added = [s for s in _extract_skills(cleaned)
+             if s.lower() not in orig_skills and not _mentions_skill(original_norm, s)]
     if added and orig_skills:
         issues.append(f"Introduces skills not in the original resume: {', '.join(added)}")
         escalate("fail")
