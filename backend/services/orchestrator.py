@@ -75,6 +75,7 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
     results = {}
     log = []
     login_needed = set()   # platforms not signed in — skip their remaining jobs
+    stuck = 0              # consecutive needs_review (unattended CAPTCHA, etc.)
     delay_min = _int("AUTO_APPLY_DELAY_MIN_SEC", 20)
     delay_max = _int("AUTO_APPLY_DELAY_MAX_SEC", 40)
 
@@ -97,6 +98,20 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
             # No live session for this platform; stop trying it this cycle.
             login_needed.add(source)
             continue
+
+        # Repeated needs_review usually means an unattended bot check: each one
+        # burns a full APPLY_HUMAN_TIMEOUT wait and fires an alert, so stop the
+        # cycle rather than pausing on every remaining job.
+        if st == "needs_review":
+            stuck += 1
+            if stuck >= 2:
+                log.append({"result": "halted",
+                            "msg": "2 consecutive applications needed manual review "
+                                   "(likely an unattended CAPTCHA) — stopping cycle"})
+                logger.warning("AutoApply halted: 2 consecutive needs_review")
+                break
+        else:
+            stuck = 0
 
         await asyncio.sleep(random.uniform(delay_min, delay_max))
 

@@ -40,6 +40,9 @@ LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "appl
 # bot signal, and two runs must never submit the same job at once.
 _APPLY_LOCK = asyncio.Lock()
 
+# Last manual-action alert per platform (epoch seconds), for throttling.
+_LAST_ALERT: dict = {}
+
 # Per-platform config. We do NOT automate login (platform login pages are
 # obfuscated and gated by 2FA/CAPTCHA). Instead you log in once by hand via the
 # Login button; the persistent browser profile keeps the session, and the apply
@@ -148,6 +151,7 @@ class ApplyAgent:
 
     async def _do_apply(self, job: dict) -> dict:
         source = job["source"]
+        self._captcha_gave_up = False   # per-job: don't carry a giveup forward
 
         async with async_playwright() as pw:
             async with self._session(pw, source) as (ctx, page):
@@ -439,11 +443,18 @@ class ApplyAgent:
         timeout = timeout or self.human_timeout
         print(f"    [PAUSE] MANUAL ACTION [{platform}]: {reason}")
         print(f"            Act in the open browser window. Waiting up to {timeout}s...")
+        # Throttle: a batch run can pause on many jobs, and one email+SMS per
+        # pause is just noise. Alert at most once every ALERT_COOLDOWN_SEC.
         if notify:
-            try:
-                send_manual_action_alert(platform, reason, page.url)
-            except Exception:
-                pass
+            now = datetime.utcnow().timestamp()
+            cooldown = int(os.environ.get("ALERT_COOLDOWN_SEC", "900"))
+            last = _LAST_ALERT.get(platform, 0)
+            if now - last >= cooldown:
+                _LAST_ALERT[platform] = now
+                try:
+                    send_manual_action_alert(platform, reason, page.url)
+                except Exception:
+                    pass
 
         waited, interval = 0, 5
         while waited < timeout:
@@ -463,9 +474,21 @@ class ApplyAgent:
         return False
 
     async def _guard_captcha(self, page, platform: str) -> bool:
-        """If a CAPTCHA shows up mid-flow, pause for a human. Returns True if clear to continue."""
+        """
+        If a CAPTCHA shows up mid-flow, pause for a human once. Returns True if
+        clear to continue.
+
+        This is called on every step of the modal loop, so without the
+        _captcha_gave_up latch an unattended challenge would burn a full
+        APPLY_HUMAN_TIMEOUT per step (12 steps x 300s = an hour on one job).
+        """
+        if getattr(self, "_captcha_gave_up", False):
+            return False
         if await self._has_captcha(page):
-            return await self._wait_for_human(page, platform, "CAPTCHA appeared during application")
+            ok = await self._wait_for_human(page, platform, "CAPTCHA appeared during application")
+            if not ok:
+                self._captcha_gave_up = True
+            return ok
         return True
 
     async def _verify_submission(self, page) -> dict | None:
