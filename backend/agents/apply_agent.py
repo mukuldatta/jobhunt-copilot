@@ -89,6 +89,9 @@ class ApplyAgent:
         self.headless = os.environ.get("APPLY_HEADLESS", "").strip().lower() in ("1", "true", "yes")
         self.human_timeout = int(os.environ.get("APPLY_HUMAN_TIMEOUT", "300"))
         self.login_timeout = int(os.environ.get("LOGIN_TIMEOUT", "420"))
+        # APPLY_DRY_RUN: navigate + fill the form but stop before the final submit
+        # (screenshot it) — for safely tuning selectors without applying for real.
+        self.dry_run = os.environ.get("APPLY_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
     # ── Public entrypoint ────────────────────────────────────────────────────
 
@@ -135,8 +138,8 @@ class ApplyAgent:
             })
         elif status in ("manual_required", "needs_review"):
             await finish_job_apply(job_id, "manual_required")
-        elif status == "login_required":
-            # Not a failure — just release it so it's retried once you log in.
+        elif status in ("login_required", "dry_run"):
+            # Not a real apply — release it so it can be retried later.
             await finish_job_apply(job_id, "new")
         elif status == "already_applied":
             pass
@@ -462,6 +465,12 @@ class ApplyAgent:
         return {"status": "manual_required", "url": job.get("url", ""),
                 "message": "This posting applies on the company site — open the link and finish manually."}
 
+    async def _dry_stop(self, page, platform: str, what: str) -> dict:
+        await self._screenshot(page, f"dryrun_{platform}")
+        print(f"    [DRY RUN] {platform}: reached '{what}', not submitting.")
+        return {"status": "dry_run", "url": page.url,
+                "message": f"DRY RUN — filled the form and reached '{what}' without submitting. Screenshot saved to backend/logs/apply."}
+
     async def _screenshot(self, page, label: str):
         try:
             os.makedirs(LOG_DIR, exist_ok=True)
@@ -594,6 +603,8 @@ class ApplyAgent:
 
             submit_btn = await page.query_selector('button[aria-label="Submit application"]')
             if submit_btn:
+                if self.dry_run:
+                    return await self._dry_stop(page, "linkedin", "Submit application")
                 await submit_btn.click()
                 confirmed = await self._verify_submission(page)
                 if confirmed:
@@ -661,6 +672,9 @@ class ApplyAgent:
         if not apply_btn:
             return self._external_apply(job)
 
+        if self.dry_run:
+            return await self._dry_stop(page, "naukri", "Apply button")
+
         await apply_btn.click()
         await asyncio.sleep(3)
 
@@ -718,6 +732,8 @@ class ApplyAgent:
             'button[data-testid*="submit"], button[aria-label*="Submit"], button[type="submit"]'
         )
         if submit:
+            if self.dry_run:
+                return await self._dry_stop(page, "indeed", "Submit")
             await submit.click()
             confirmed = await self._verify_submission(page)
             if confirmed:
@@ -765,6 +781,8 @@ class ApplyAgent:
 
         submit = await page.query_selector('button[data-cy="submit-application"], button[type="submit"]')
         if submit:
+            if self.dry_run:
+                return await self._dry_stop(page, "dice", "Submit")
             await submit.click()
             confirmed = await self._verify_submission(page)
             if confirmed:
