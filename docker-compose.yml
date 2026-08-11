@@ -1,14 +1,30 @@
 version: '3.9'
 
 services:
+  mongo:
+    image: mongo:7
+    container_name: jobhunt-mongo
+    ports:
+      - "27017:27017"          # published so a locally-run backend can reach it
+    volumes:
+      - mongo-data:/data/db    # named volume => data persists across restarts
+    restart: unless-stopped
+
   backend:
     build: .
     ports:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # Inside compose the backend reaches Mongo by service name, overriding .env.
+      # NOTE: headed scraping/apply needs a display + Chrome, so in practice you
+      # run the backend locally (uvicorn) and only use the mongo service here.
+      - MONGODB_URI=mongodb://mongo:27017/jobhunt
     volumes:
       - ./resume:/app/resume:ro
+    depends_on:
+      - mongo
     restart: unless-stopped
 
   frontend:
@@ -22,3 +38,6 @@ services:
     environment:
       - VITE_API_URL=http://localhost:8000
     restart: unless-stopped
+
+volumes:
+  mongo-data:
