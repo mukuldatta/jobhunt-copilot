@@ -49,13 +49,15 @@ LOGIN = {
         "home_url": "https://www.linkedin.com/feed/",
         "login_url": "https://www.linkedin.com/login",
         "logged_in_sel": "img.global-nav__me-photo, div.global-nav__me, button.global-nav__primary-link-me-menu-trigger",
-        "fail_url_tokens": ["/login", "authwall", "checkpoint", "signup"],
+        "fail_url_tokens": ["/login", "authwall", "checkpoint", "signup", "uas/login"],
+        "home_is_private": True,   # feed redirects to /login when signed out
     },
     "naukri": {
         "home_url": "https://www.naukri.com/mnjuser/homepage",
         "login_url": "https://www.naukri.com/nlogin/login",
         "logged_in_sel": "a[href*='mnjuser/profile'], .nI-gNb-drawer__bars, .view-profile-wrapper",
         "fail_url_tokens": ["nlogin", "/login"],
+        "home_is_private": True,   # homepage redirects to login when signed out
     },
     "indeed": {
         "home_url": "https://in.indeed.com/",
@@ -368,12 +370,17 @@ class ApplyAgent:
         if any(tok in url for tok in cfg["fail_url_tokens"]):
             return False
         sel = cfg.get("logged_in_sel")
-        if not sel:
-            return True
-        try:
-            return await page.query_selector(sel) is not None
-        except Exception:
-            return False
+        if sel:
+            try:
+                if await page.query_selector(sel) is not None:
+                    return True
+            except Exception:
+                pass
+        # Auth-gated home pages (LinkedIn feed, Naukri homepage) redirect to login
+        # when signed out, so reaching one without a fail-token in the URL is proof
+        # of a live session even if the nav DOM hasn't rendered yet. Public home
+        # pages (Indeed/Dice) load for everyone, so there we require the selector.
+        return bool(cfg.get("home_is_private"))
 
     # ── Shared helpers ───────────────────────────────────────────────────────
 
