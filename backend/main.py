@@ -323,34 +323,6 @@ async def auto_apply_run(background_tasks: BackgroundTasks, body: AutoApplyRunRe
 
 @app.post("/score/trigger")
 async def trigger_scoring(background_tasks: BackgroundTasks):
-    from db.mongodb import get_unscored_jobs, update_job as _update_job
-
-    async def _run_scoring():
-        agent = ScorerAgent()
-        unscored = await get_unscored_jobs()
-        scored = failures = 0
-        for job in unscored:
-            try:
-                result = await agent.score(job)
-                if result is None:
-                    # Leave unscored so it is retried later.
-                    failures += 1
-                    if failures >= 3:
-                        print(f"Scoring stopped after {failures} consecutive failures "
-                              f"(likely LLM rate limit). {scored} scored, "
-                              f"{len(unscored) - scored} left for the next run.")
-                        return
-                    continue
-                failures = 0
-                await _update_job(job["job_id"], {
-                    "match_score": result["match_score"],
-                    "score_breakdown": result["score_breakdown"],
-                    "gap_analysis": result["gap_analysis"],
-                })
-                scored += 1
-            except Exception as e:
-                print(f"Score error: {e}")
-        print(f"Background scoring complete: {scored} jobs scored")
-
-    background_tasks.add_task(_run_scoring)
+    from services.scoring_service import run_scoring
+    background_tasks.add_task(run_scoring)
     return {"message": "Scoring started in background. Refresh jobs in a few minutes."}

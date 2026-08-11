@@ -24,10 +24,25 @@ def get_db():
 # --- Jobs ---
 
 async def insert_job(job: dict) -> bool:
+    from utils.job_parser import dedup_key
     db = get_db()
-    existing = await db.jobs.find_one({"job_id": job["job_id"]})
-    if existing:
+    if await db.jobs.find_one({"job_id": job["job_id"]}):
         return False
+
+    # Same role re-listed under a different URL — skip it, but let a listing
+    # with a real description replace one scraped without it (better scoring).
+    key = dedup_key(job.get("title", ""), job.get("company", ""))
+    job["dedup_key"] = key
+    twin = await db.jobs.find_one({"dedup_key": key})
+    if twin:
+        if job.get("description") and not (twin.get("description") or "").strip():
+            await db.jobs.update_one(
+                {"_id": twin["_id"]},
+                {"$set": {"description": job["description"], "url": job.get("url", twin.get("url")),
+                          "match_score": None, "score_breakdown": None, "gap_analysis": []}},
+            )
+        return False
+
     await db.jobs.insert_one(job)
     return True
 

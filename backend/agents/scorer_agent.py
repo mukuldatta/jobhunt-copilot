@@ -2,7 +2,7 @@ import os
 import json
 import re
 import asyncio
-from llm_provider import LLMProvider
+from llm_provider import LLMProvider, RateLimited
 from db.mongodb import get_resume
 from utils.job_parser import truncate_description
 from dotenv import load_dotenv
@@ -14,6 +14,7 @@ class ScorerAgent:
     def __init__(self):
         self.llm = LLMProvider(provider=os.getenv("LLM_PROVIDER", "groq"))
         self._resume_cache = None
+        self.last_retry_after = None   # seconds hinted by the provider, if any
 
     async def _get_resume_text(self) -> str:
         if self._resume_cache:
@@ -89,10 +90,18 @@ Only return the JSON, no explanation."""
                 },
                 "gap_analysis": data.get("gap_analysis", [])[:5],
             }
+        except RateLimited as e:
+            # Providers are throttled — surface the hint so the caller can back
+            # off for the right amount of time.
+            m = re.search(r"retry_after=(\d+)", str(e))
+            self.last_retry_after = float(m.group(1)) if m else None
+            print(f"Scorer rate limited for {job.get('job_id')}: {e}")
+            return None
         except Exception as e:
             # Do NOT return a 0 score here: a saved 0 is indistinguishable from a
             # genuine poor match, so the job would look scored and never be
             # retried. Signal failure and let the caller leave it unscored.
+            self.last_retry_after = None
             print(f"Scorer error for {job.get('job_id')}: {e}")
             return None
 

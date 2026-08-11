@@ -19,6 +19,21 @@ def generate_job_id(url: str, title: str, company: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()
 
 
+def dedup_key(title: str, company: str) -> str:
+    """
+    Identity of a *role*, independent of the listing URL. The same job is
+    re-posted under different URLs (Naukri re-lists, Indeed varies its `jk`
+    tracking key), which slipped past URL-based job_ids and wasted scoring
+    quota on duplicates — and would have applied to the same role repeatedly.
+    """
+    def norm(s: str) -> str:
+        s = (s or "").lower()
+        s = re.sub(r"[^a-z0-9 ]+", " ", s)      # drop punctuation
+        s = re.sub(r"\b(pvt|private|ltd|limited|inc|llp|technologies|solutions)\b", " ", s)
+        return " ".join(s.split())
+    return hashlib.md5(f"{norm(title)}|{norm(company)}".encode()).hexdigest()
+
+
 def extract_contract_type(title: str, description: str) -> str:
     text = f"{title} {description}".lower()
     if any(w in text for w in ["c2c", "corp to corp", "corp-to-corp"]):
