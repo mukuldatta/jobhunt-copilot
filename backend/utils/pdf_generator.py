@@ -1,6 +1,24 @@
 from fpdf import FPDF
 import re
 
+# FPDF core fonts are latin-1 only, so characters outside it (the smart
+# punctuation LLMs love) would render as "?". Transliterate the common ones to
+# ASCII first; latin-1 then covers the rest (including accented letters).
+_UNICODE_TO_ASCII = {
+    "–": "-", "—": "-", "−": "-",           # en/em dash, minus
+    "‘": "'", "’": "'", "‚": ",", "′": "'",  # single quotes
+    "“": '"', "”": '"', "„": '"', "″": '"',  # double quotes
+    "•": "-", "●": "-", "▪": "-", "‣": "-",   # bullets
+    "…": "...", " ": " ", "​": "",           # ellipsis, nbsp, zwsp
+    "™": "(TM)", "®": "(R)", "©": "(C)",
+    "→": "->", "←": "<-", "≤": "<=", "≥": ">=",
+}
+_UNICODE_TABLE = {ord(k): v for k, v in _UNICODE_TO_ASCII.items()}
+
+
+def _to_latin1(text: str) -> str:
+    return text.translate(_UNICODE_TABLE).encode("latin-1", "replace").decode("latin-1")
+
 
 def generate_resume_pdf(text: str, output_path: str):
     pdf = FPDF()
@@ -15,8 +33,8 @@ def generate_resume_pdf(text: str, output_path: str):
             pdf.ln(3)
             continue
 
-        # Sanitize to latin-1 (FPDF default encoding)
-        line = line.encode("latin-1", "replace").decode("latin-1")
+        # Transliterate smart punctuation, then sanitize to latin-1
+        line = _to_latin1(line)
 
         # Section headers: ALL CAPS short lines
         if re.match(r"^[A-Z\s\-|]{4,40}$", line) and len(line) < 45:
