@@ -23,7 +23,8 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 
-from db.mongodb import get_apply_candidates, count_applications_today
+from db.mongodb import get_apply_candidates, count_applications_today, record_run
+from platforms import APPLY_DISABLED
 from services import agent_state
 from services.settings_service import get_agent_rules
 
@@ -58,10 +59,12 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
                 "message": f"Daily cap of {daily_cap} already reached."}
 
     take = per_run if dry_run else min(per_run, budget)
-    candidates = await get_apply_candidates(min_score=min_score, region=region, limit=take)
+    candidates = await get_apply_candidates(min_score=min_score, region=region, limit=take,
+                                            exclude_sources=list(APPLY_DISABLED))
     if not candidates:
         return {"status": "no_candidates",
-                "message": f"No 'new' jobs with score >= {min_score} in region '{region}'."}
+                "message": f"No 'new' jobs with score >= {min_score} in region '{region}' "
+                           f"on an apply-capable board."}
 
     if dry_run:
         preview = [{"title": j.get("title"), "company": j.get("company"),
@@ -76,9 +79,17 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
 
     agent_state.start("applying")
     try:
-        return await _apply_all(agent, candidates, daily_cap)
+        summary = await _apply_all(agent, candidates, daily_cap)
     finally:
         agent_state.finish()
+
+    # A background cycle has no caller to return to, so the outcome has to
+    # outlive the process's stdout or nobody ever sees it.
+    try:
+        await record_run(summary)
+    except Exception as e:
+        logger.warning(f"Could not record run summary: {e}")
+    return summary
 
 
 async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:

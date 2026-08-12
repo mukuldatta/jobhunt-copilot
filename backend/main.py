@@ -39,6 +39,11 @@ load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        from db.mongodb import ensure_indexes
+        await ensure_indexes()
+    except Exception as e:
+        print(f"Index setup skipped ({e}) — the app still runs, queries are just slower.")
     await setup_scheduler()
     yield
     scheduler.shutdown()
@@ -122,13 +127,32 @@ async def get_job_route(job_id: str):
 
 
 @app.post("/jobs/{job_id}/tailor")
-async def tailor_resume(job_id: str):
+async def tailor_resume(job_id: str, force: bool = Query(False)):
+    """
+    The tailored resume for this job — the same one the PDF download and the
+    apply run use. Previously each of the three tailored independently, so the
+    document you previewed was not the one that got submitted. Pass force=true
+    to deliberately re-roll.
+    """
     job = await get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    agent = TailorAgent()
-    tailored = await agent.tailor(job)
-    return {"tailored_resume": tailored}
+
+    from services.resume_service import build_tailored_resume
+    built = await build_tailored_resume(
+        job, force=force,
+        user_name=f"{os.environ.get('USER_FIRST_NAME', '')} "
+                  f"{os.environ.get('USER_LAST_NAME', '')}".strip() or None,
+        user_email=os.environ.get("MY_EMAIL"))
+
+    if built["rate_limited"]:
+        raise HTTPException(status_code=429,
+                            detail="LLM quota exhausted — try again shortly.")
+    if not built["ok"]:
+        raise HTTPException(status_code=422,
+                            detail=f"Tailored resume rejected: {'; '.join(built['issues'])}")
+    return {"tailored_resume": built["text"], "cached": built["cached"],
+            "warnings": built["issues"]}
 
 
 @app.get("/jobs/{job_id}/tailor-pdf")
@@ -136,8 +160,17 @@ async def download_tailored_pdf(job_id: str):
     job = await get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    agent = TailorAgent()
-    tailored_text = await agent.tailor(job)
+    # Same artefact as the preview and the apply run — see /jobs/{id}/tailor.
+    from services.resume_service import build_tailored_resume
+    built = await build_tailored_resume(
+        job,
+        user_name=f"{os.environ.get('USER_FIRST_NAME', '')} "
+                  f"{os.environ.get('USER_LAST_NAME', '')}".strip() or None,
+        user_email=os.environ.get("MY_EMAIL"))
+    if not built["ok"]:
+        raise HTTPException(status_code=422,
+                            detail=f"Tailored resume unavailable: {'; '.join(built['issues'])}")
+    tailored_text = built["text"]
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.close()
     generate_resume_pdf(tailored_text, tmp.name)
@@ -248,6 +281,18 @@ async def agent_state_route():
     """
     from services.agent_state import snapshot
     return await snapshot()
+
+
+@app.get("/platforms")
+async def platforms_route():
+    """
+    Which boards the agent will submit to, and why the others are excluded. The
+    UI needs this to offer the right action per job — duplicating the policy
+    client-side is how the two drift apart.
+    """
+    from platforms import APPLY_DISABLED
+    from agents.apply_agent import SUPPORTED_PLATFORMS
+    return {"apply_capable": SUPPORTED_PLATFORMS, "apply_disabled": APPLY_DISABLED}
 
 
 @app.get("/settings")

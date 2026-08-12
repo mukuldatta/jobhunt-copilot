@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useState } from 'react'
-import { getAgentState, getStats } from '../api'
+import { getAgentState, getStats, getPlatforms } from '../api'
 
 const AgentContext = createContext(null)
 
@@ -19,6 +19,9 @@ export function AgentProvider({ children }) {
   })
   const [stats, setStats] = useState(null)
   const [offline, setOffline] = useState(false)
+  // Which boards the agent will submit to. Policy lives on the server; the UI
+  // reads it so the two cannot drift.
+  const [applyDisabled, setApplyDisabled] = useState({})
 
   const refreshAgent = useCallback(async () => {
     try {
@@ -40,6 +43,13 @@ export function AgentProvider({ children }) {
   }, [])
 
   useEffect(() => {
+    // Fetched once — this changes only when the code does.
+    getPlatforms()
+      .then((r) => setApplyDisabled(r.data.apply_disabled || {}))
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
     refreshAgent()
     refreshStats()
     const a = setInterval(refreshAgent, STATE_POLL_MS)
@@ -54,7 +64,7 @@ export function AgentProvider({ children }) {
 
   return (
     <AgentContext.Provider
-      value={{ agent, stats, running, offline, refreshAgent, refreshStats }}
+      value={{ agent, stats, running, offline, applyDisabled, refreshAgent, refreshStats }}
     >
       {children}
     </AgentContext.Provider>

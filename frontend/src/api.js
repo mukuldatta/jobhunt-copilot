@@ -47,5 +47,6 @@ export const platformCheck = (platform) => api.post(`/auth/${platform}/check`, n
 export const runAutoApply = (data) => api.post('/auto-apply/run', data)
 
 export const getAgentState = () => api.get('/agent/state')
+export const getPlatforms = () => api.get('/platforms')
 export const getSettings = () => api.get('/settings')
 export const saveSettings = (data) => api.put('/settings', data)

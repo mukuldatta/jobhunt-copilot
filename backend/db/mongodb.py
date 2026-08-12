@@ -126,13 +126,22 @@ async def get_unscored_jobs() -> list:
 
 
 async def get_high_match_jobs(threshold: int = 70) -> list:
+    """
+    High matches you have not been alerted about yet.
+
+    Alerting used to key off status: it selected status "new" and then wrote
+    "reviewed", which quietly deleted the job from the auto-apply pool, because
+    get_apply_candidates requires "new". Two unrelated facts — "has the user
+    been told?" and "is this eligible to apply?" — were sharing one field, and
+    alerting won. alerted_at now carries the first, and status is left alone.
+    """
     db = get_db()
     from datetime import datetime, timedelta
     two_hours_ago = datetime.utcnow() - timedelta(hours=2)
     cursor = db.jobs.find({
         "match_score": {"$gte": threshold},
         "scraped_at": {"$gte": two_hours_ago},
-        "status": "new"
+        "alerted_at": {"$exists": False},
     })
     jobs = []
     async for job in cursor:
@@ -141,25 +150,51 @@ async def get_high_match_jobs(threshold: int = 70) -> list:
     return jobs
 
 
-async def get_apply_candidates(min_score: int = 70, region: str = "india", limit: int = 5) -> list:
+async def get_apply_candidates(min_score: int = 70, region: str = "india", limit: int = 5,
+                               exclude_sources: list = None) -> list:
     """
     Jobs eligible for auto-apply: still 'new', scored at/above the threshold, in
     the target region. Excludes anything already applied/applying/manual/failed
     (those are no longer status 'new'). Highest score first.
+
+    exclude_sources drops boards we never submit to, so they cannot take a slot
+    in a run that is capped at a handful of applications. Known-external
+    postings are dropped for the same reason once apply_type has been recorded.
     """
     db = get_db()
-    query = {"status": "new", "match_score": {"$gte": min_score}}
+    # Never offer a posting a previous run proved we cannot submit. $nin also
+    # matches documents with no apply_type at all, which is what we want: an
+    # unclassified job is a candidate, and the preflight settles it cheaply.
+    query = {"status": "new", "match_score": {"$gte": min_score},
+             "apply_type": {"$nin": ["external", "expired"]}}
+    if exclude_sources:
+        query["source"] = {"$nin": list(exclude_sources)}
     if region == "india":
         query["$or"] = [
             {"region": "india"},
             {"location": {"$regex": _INDIA_CITIES, "$options": "i"}},
         ]
-    cursor = db.jobs.find(query).sort("match_score", -1).limit(limit)
-    jobs = []
+    # Take a wider slice than needed, then order it. apply_type_hint is a scrape
+    # -time guess (~4/5 accurate), so it may reorder the queue but must never
+    # exclude: a wrong "external" hint would otherwise bury a good job forever,
+    # and nothing would ever correct it. Confirmed apply_type, set by an actual
+    # run, is what the query above filters on.
+    cursor = db.jobs.find(query).sort("match_score", -1).limit(max(limit * 4, 20))
+    rows = []
     async for job in cursor:
         job["id"] = str(job.pop("_id"))
-        jobs.append(job)
-    return jobs
+        rows.append(job)
+
+    def rank(job):
+        hint = job.get("apply_type_hint")
+        confirmed = job.get("apply_type")
+        # 0 = known good, 1 = unknown, 2 = probably a hand-off
+        tier = 0 if confirmed == "in_platform" else (2 if hint == "external" else
+                                                     0 if hint == "in_platform" else 1)
+        return (tier, -(job.get("match_score") or 0))
+
+    rows.sort(key=rank)
+    return rows[:limit]
 
 
 async def count_applications_today() -> int:
@@ -291,6 +326,45 @@ async def save_resume(resume: dict):
 async def get_resume() -> dict:
     db = get_db()
     return await db.resume.find_one({}, {"_id": 0})
+
+
+# --- Apply-run history ---
+
+async def record_run(summary: dict) -> str:
+    """
+    Persist the outcome of an auto-apply cycle. The orchestrator builds a full
+    per-job log and, until now, printed it to stdout and dropped it — which for
+    a system whose premise is "it works while you are away" is the wrong end of
+    the telescope. Today reads the latest of these.
+    """
+    from datetime import datetime
+    db = get_db()
+    doc = dict(summary)
+    doc["finished_at"] = datetime.utcnow()
+    result = await db.runs.insert_one(doc)
+    return str(result.inserted_id)
+
+
+async def get_last_run() -> dict:
+    db = get_db()
+    doc = await db.runs.find_one({}, sort=[("finished_at", -1)])
+    if doc:
+        doc.pop("_id", None)
+    return doc or {}
+
+
+async def ensure_indexes():
+    """
+    Indexes for the queries that run on every cycle. get_apply_candidates
+    filters on status + score + apply_type and sorts by score, which is a
+    collection scan and an in-memory sort without this.
+    """
+    db = get_db()
+    await db.jobs.create_index([("status", 1), ("match_score", -1)], name="apply_candidates")
+    await db.jobs.create_index([("apply_type", 1)], name="apply_type")
+    await db.jobs.create_index([("source", 1), ("match_score", -1)], name="source_score")
+    await db.applications.create_index([("job_id", 1)], name="job_id")
+    await db.runs.create_index([("finished_at", -1)], name="recent_runs")
 
 
 # --- Agent rules (Setup > Agent rules) ---

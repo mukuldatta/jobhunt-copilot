@@ -7,11 +7,13 @@ import {
   CheckCircle,
   CircleDashed,
   CircleNotch,
+  Check,
   X,
 } from '@phosphor-icons/react'
 import ResumeModal from './ResumeModal'
 import OutreachModal from './OutreachModal'
-import { autoApply, setJobStatus } from '../api'
+import { autoApply, setJobStatus, markApplied } from '../api'
+import { useAgent } from '../hooks/useAgent'
 import { useReducedMotion } from '../hooks/useMotion'
 import { agoLabel, scoreFill } from '../lib/format'
 
@@ -46,6 +48,7 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
   const [resumeTab, setResumeTab] = useState('resume')
   const [outreachOpen, setOutreachOpen] = useState(false)
   const [applying, setApplying] = useState(false)
+  const [marking, setMarking] = useState(false)
   const [notice, setNotice] = useState(null)
   // Score bars grow from zero when a job opens, so the shape of a match is
   // something you watch resolve rather than something already on screen.
@@ -60,9 +63,19 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
     return () => cancelAnimationFrame(t)
   }, [job.job_id, reduced])
 
+  const { applyDisabled } = useAgent()
   const breakdown = job.score_breakdown || {}
   const gaps = (job.gap_analysis || []).map((g) => g.replace(/^missing:\s*/i, ''))
   const applied = job.status === 'applied'
+
+  // Two independent reasons the agent can't submit this one: the board refuses
+  // automated sessions, or this specific posting hands off to the employer.
+  const boardReason = applyDisabled[job.source]
+  const isExternal = job.apply_type === 'external'
+  const canAutoApply = !boardReason && !isExternal
+  const handoffReason =
+    boardReason ||
+    (isExternal ? 'This posting applies on the employer’s own site.' : null)
   const questionCount = job.screening_questions_answered
 
   async function handleApply() {
@@ -76,6 +89,19 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
       setNotice(e.response?.data?.detail || 'Could not start the apply run.')
     } finally {
       setApplying(false)
+    }
+  }
+
+  async function handleMarkApplied() {
+    setMarking(true)
+    try {
+      await markApplied(job.job_id)
+      onStatusChange?.(job.job_id, 'applied')
+      setNotice('Recorded — it will show up in Pipeline.')
+    } catch (e) {
+      setNotice(e.response?.data?.detail || 'Could not record that application.')
+    } finally {
+      setMarking(false)
     }
   }
 
@@ -122,18 +148,44 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
         </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
+          {/* The agent can only submit on some boards, and only for postings
+              that don't hand off to the employer's own site. Offering "Apply
+              with tailored resume" where it cannot run is a promise the panel
+              can't keep — so the primary action becomes opening the posting,
+              and Mark applied records what you did there. */}
+          {canAutoApply ? (
+            <button
+              data-apply-button
+              onClick={handleApply}
+              disabled={applying || applied}
+              className="btn btn-accent"
+            >
+              {applying ? (
+                <CircleNotch size={14} className={reduced ? '' : 'animate-spin360'} />
+              ) : (
+                <PaperPlaneTilt size={14} />
+              )}
+              {applied ? 'Applied' : 'Apply with tailored resume'}
+            </button>
+          ) : (
+            <a
+              href={job.url}
+              target="_blank"
+              rel="noreferrer"
+              className="btn btn-accent"
+            >
+              <ArrowSquareOut size={14} />
+              Open &amp; apply
+            </a>
+          )}
           <button
-            data-apply-button
-            onClick={handleApply}
-            disabled={applying || applied}
-            className="btn btn-accent"
+            onClick={handleMarkApplied}
+            disabled={marking || applied}
+            className={`btn ${canAutoApply ? 'btn-neutral' : 'btn-neutral'}`}
+            title="Record an application you submitted yourself"
           >
-            {applying ? (
-              <CircleNotch size={14} className={reduced ? '' : 'animate-spin360'} />
-            ) : (
-              <PaperPlaneTilt size={14} />
-            )}
-            {applied ? 'Applied' : 'Apply with tailored resume'}
+            <Check size={14} />
+            {applied ? 'Applied' : marking ? 'Recording' : 'Mark applied'}
           </button>
           <button onClick={() => setOutreachOpen(true)} className="btn btn-neutral">
             <ChatCircle size={14} />
@@ -159,6 +211,12 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
           </a>
         </div>
 
+        {handoffReason && !applied && (
+          <p className="mt-3 text-xs+ text-neutral-600">
+            {handoffReason} The tailored resume and cover letter below are still yours to use —
+            apply in the tab, then Mark applied.
+          </p>
+        )}
         {notice && <p className="mt-3 text-xs+ text-neutral-600">{notice}</p>}
       </div>
 
@@ -187,6 +245,12 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
               )
             })}
           </div>
+          {job.skills_matched?.length > 0 && (
+            <p className="mt-2.5 text-xs+ leading-relaxed text-neutral-600">
+              Skills the posting names that your resume evidences:{' '}
+              <span className="text-neutral-500">{job.skills_matched.join(', ')}</span>
+            </p>
+          )}
         </Section>
 
         {gaps.length > 0 && (
