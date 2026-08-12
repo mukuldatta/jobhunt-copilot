@@ -116,9 +116,59 @@ class ScraperAgent:
                 if blocked_streak >= 2:
                     print("    Naukri: stopping early — blocked by Akamai "
                           "(needs a headed browser on a residential IP)")
+
+                jobs = jobs[:self.max_jobs_per_source]
+                # The search card carries a ~100-char teaser, which is not
+                # something a resume can be matched against — the scorer would
+                # be guessing. The detail page has the real JD and we already
+                # hold a warm, unblocked context, so fetch it while we can.
+                await self._fetch_naukri_descriptions(page, jobs)
             finally:
                 await context.close()
         return jobs[:self.max_jobs_per_source]
+
+    # Naukri renders the JD through CSS modules, so the class carries a build
+    # hash (styles_JDC__dang-inner-html__h0K4t) that changes on their deploys.
+    # Match on the stable stem instead, widest container last.
+    NAUKRI_JD_SELECTORS = (
+        "[class*='JDC__dang-inner-html']",
+        "[class*='job-desc-container']",
+        "div.dang-inner-html",
+    )
+
+    async def _fetch_naukri_descriptions(self, page, jobs: list):
+        """Replace each teaser with the full JD from the posting's own page."""
+        filled = fail_streak = 0
+        for job in jobs:
+            if fail_streak >= 3:
+                print("    Naukri descriptions: stopping early (3 consecutive failures)")
+                break
+            if len(job.get("description") or "") >= 600:
+                continue
+            try:
+                await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(random.uniform(1.5, 2.5))
+                text = ""
+                for sel in self.NAUKRI_JD_SELECTORS:
+                    el = await page.query_selector(sel)
+                    if el:
+                        text = (await el.inner_text()).strip()
+                        if len(text) > len(job.get("description") or ""):
+                            break
+                if len(text) < 200:
+                    fail_streak += 1
+                    continue
+                fail_streak = 0
+                # Keep the experience line the card gave us — the JD often omits it.
+                exp = (job.get("description") or "").split(".")[0]
+                job["description"] = clean_description(
+                    f"{exp}. {text}" if exp.lower().startswith("experience") else text
+                )
+                filled += 1
+                await asyncio.sleep(random.uniform(2, 4))
+            except Exception:
+                fail_streak += 1
+        print(f"    Naukri descriptions: {filled}/{len(jobs)} fetched")
 
     async def _headed_context(self, pw, name: str):
         """
@@ -437,7 +487,7 @@ class ScraperAgent:
                     # remaining job at ~2s each for nothing.
                     print("    LinkedIn descriptions: stopping early (3 consecutive failures)")
                     break
-                if job.get("description"):
+                if job.get("description") and job.get("apply_type_hint"):
                     continue
                 m = _re.search(r"/jobs/view/(?:.*-)?(\d+)", job.get("url", ""))
                 if not m:
@@ -450,6 +500,16 @@ class ScraperAgent:
                         fail_streak += 1
                         continue
                     fail_streak = 0
+
+                    # Free while we are already holding the page: LinkedIn marks
+                    # an off-site posting with an offsite-apply glyph on the
+                    # apply button. Measured 4/5 against hand-classified jobs, so
+                    # it is a HINT that reorders the queue — never a verdict.
+                    # Only a real apply run writes the authoritative apply_type.
+                    job["apply_type_hint"] = (
+                        "external" if "offsite-apply" in resp.text else "in_platform"
+                    )
+
                     soup = BeautifulSoup(resp.text, "html.parser")
                     el = (soup.select_one("div.show-more-less-html__markup")
                           or soup.select_one("div.description__text"))

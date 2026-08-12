@@ -78,7 +78,36 @@ def is_relevant_job(title: str) -> bool:
     return has_relevant and not has_irrelevant
 
 
+# Where a posting starts saying what it actually wants. Everything before this is
+# usually company boilerplate.
+_REQUIREMENT_MARKERS = (
+    "requirement", "qualification", "what you'll need", "what you will need",
+    "what we're looking for", "what we are looking for", "must have", "must-have",
+    "skills required", "required skills", "you should have", "you have",
+    "key skills", "desired skills", "eligibility", "who you are",
+)
+
+
 def truncate_description(text: str, max_chars: int = 4000) -> str:
+    """
+    Keep the opening AND the requirements when a posting is too long to send.
+
+    Plain head truncation was harmless while every description was a ~100-char
+    teaser. Real postings run 800-7000 chars and put the requirements last, so
+    cutting from the front threw away the only part that says what the employer
+    wants — leaving the scorer and the tailor working from company boilerplate.
+    """
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + "..."
+
+    head_budget = max_chars // 2
+    lowered = text.lower()
+    starts = [lowered.find(m) for m in _REQUIREMENT_MARKERS]
+    starts = [i for i in starts if i > head_budget]
+
+    if not starts:
+        return text[:max_chars] + "..."
+
+    cut = min(starts)
+    tail_budget = max_chars - head_budget
+    return f"{text[:head_budget].rstrip()}\n...\n{text[cut:cut + tail_budget]}"

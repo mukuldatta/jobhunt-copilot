@@ -67,6 +67,9 @@ async def run_scoring(limit: int = None) -> dict:
             "match_score": result["match_score"],
             "score_breakdown": result["score_breakdown"],
             "gap_analysis": result["gap_analysis"],
+            # Which of the resume's skills the posting actually named — turns
+            # the skills bar in Review from an assertion into evidence.
+            "skills_matched": result.get("skills_matched", []),
         })
         scored += 1
         await asyncio.sleep(delay)
