@@ -244,6 +244,36 @@ export default function Today() {
         </div>
       )}
 
+      {agent.last_run && (
+        <div className="mb-6 rounded border border-line px-[18px] py-3.5">
+          <div className="flex flex-wrap items-baseline gap-2">
+            <span className="section-label">Last run</span>
+            <span className="text-xs+ text-neutral-600">
+              {clockTime(agent.last_run.finished_at) || 'recently'}
+            </span>
+            <span className="ml-auto flex flex-wrap gap-3 text-base">
+              {Object.entries(agent.last_run.results || {}).length === 0 ? (
+                <span className="text-neutral-600">nothing to apply to</span>
+              ) : (
+                Object.entries(agent.last_run.results).map(([outcome, n]) => (
+                  <span key={outcome} className="text-neutral-500">
+                    <span className={outcome === 'applied' ? 'text-accent-400' : 'text-text'}>
+                      {n}
+                    </span>{' '}
+                    {outcome.replace(/_/g, ' ')}
+                  </span>
+                ))
+              )}
+            </span>
+          </div>
+          {(agent.last_run.log || []).some((l) => l.result === 'halted' || l.result === 'deferred') && (
+            <p className="mt-2 text-xs+ text-neutral-600">
+              {agent.last_run.log.find((l) => l.result === 'halted' || l.result === 'deferred')?.msg}
+            </p>
+          )}
+        </div>
+      )}
+
       <div className="mb-6 flex overflow-hidden rounded border border-line">
         <StatCell label="Tracked" value={stats?.total_jobs} />
         <StatCell label="Worth reviewing" value={stats?.high_match} accent />

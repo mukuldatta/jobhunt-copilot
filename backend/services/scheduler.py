@@ -30,12 +30,15 @@ async def setup_scheduler():
         if not rules["alerts_enabled"]:
             return
         logger.info("Scheduler: checking for high-match jobs to alert...")
+        from datetime import datetime
         high_match = await get_high_match_jobs(threshold=rules["min_score"])
         for job in high_match:
             send_email_alert(job)
             if rules["sms_alerts"]:
                 send_sms_alert(job)
-            await update_job(job["job_id"], {"status": "reviewed"})
+            # Record that you were told. Deliberately NOT a status change —
+            # status decides apply eligibility and is not ours to spend.
+            await update_job(job["job_id"], {"alerted_at": datetime.utcnow()})
         logger.info(f"Scheduler: sent alerts for {len(high_match)} jobs")
 
     async def cleanup_old_jobs():

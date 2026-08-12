@@ -71,7 +71,7 @@ def _next_scheduled_run():
 
 async def snapshot() -> dict:
     """Everything the sidebar's agent strip renders, in one call."""
-    from db.mongodb import count_applications_today
+    from db.mongodb import count_applications_today, get_last_run
     from services.settings_service import get_agent_rules
 
     rules = await get_agent_rules()
@@ -85,6 +85,16 @@ async def snapshot() -> dict:
         human = {**human, "since": _iso(human["since"]),
                  "waiting_seconds": int((datetime.utcnow() - _state["human_required"]["since"]).total_seconds())}
 
+    try:
+        last_run = await get_last_run()
+    except Exception:
+        last_run = {}
+    if last_run.get("finished_at"):
+        last_run = {"finished_at": _iso(last_run["finished_at"]),
+                    "status": last_run.get("status"),
+                    "results": last_run.get("results", {}),
+                    "log": last_run.get("log", [])[-6:]}
+
     next_run = _next_scheduled_run()
     return {
         "state": _state["state"],
@@ -94,4 +104,5 @@ async def snapshot() -> dict:
         "applied_today": applied_today,
         "daily_cap": rules["daily_cap"],
         "human_required": human,
+        "last_run": last_run or None,
     }
