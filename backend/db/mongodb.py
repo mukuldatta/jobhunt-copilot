@@ -195,6 +195,24 @@ async def get_applications(skip: int = 0, limit: int = 50) -> list:
     async for app in cursor:
         app["id"] = str(app.pop("_id"))
         apps.append(app)
+
+    # The pipeline board shows real job titles, not job_ids like
+    # "linkedin_4021887733" — so resolve them here in one extra query rather
+    # than making the client fetch the whole jobs collection to join it.
+    job_ids = [a["job_id"] for a in apps if a.get("job_id")]
+    if job_ids:
+        projection = {"job_id": 1, "title": 1, "company": 1, "location": 1,
+                      "match_score": 1, "source": 1, "url": 1, "_id": 0}
+        jobs = {}
+        async for job in db.jobs.find({"job_id": {"$in": job_ids}}, projection):
+            jobs[job["job_id"]] = job
+        for app in apps:
+            job = jobs.get(app.get("job_id"))
+            if job:
+                # Never let the job document clobber the application's own
+                # fields (status, applied_at, id) — only fill in what's missing.
+                for key, value in job.items():
+                    app.setdefault(key, value)
     return apps
 
 
@@ -273,6 +291,21 @@ async def save_resume(resume: dict):
 async def get_resume() -> dict:
     db = get_db()
     return await db.resume.find_one({}, {"_id": 0})
+
+
+# --- Agent rules (Setup > Agent rules) ---
+
+async def get_settings() -> dict:
+    db = get_db()
+    return await db.settings.find_one({}, {"_id": 0}) or {}
+
+
+async def save_settings(values: dict):
+    from datetime import datetime
+    db = get_db()
+    payload = dict(values)
+    payload["updated_at"] = datetime.utcnow()
+    await db.settings.update_one({}, {"$set": payload}, upsert=True)
 
 
 # --- Apply profile (questionnaire) + learned answers ---

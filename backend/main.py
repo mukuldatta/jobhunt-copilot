@@ -3,6 +3,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+# The apply agent narrates itself with print(). Under a process manager stdout
+# is a pipe, not a TTY, so those lines sit in a block buffer and a run that
+# fails looks like a run that produced nothing at all.
+sys.stdout.reconfigure(line_buffering=True)
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,8 +21,8 @@ from db.mongodb import (
     get_resume, save_resume, get_stats,
 )
 from models.schemas import (
-    ApplicationStatusUpdate, ScrapeRequest, AutoApplyRunRequest,
-    ApplyProfile, AnswerUpsert,
+    ApplicationStatusUpdate, JobStatusUpdate, ScrapeRequest, AutoApplyRunRequest,
+    ApplyProfile, AnswerUpsert, AgentRules,
 )
 from utils.resume_parser import parse_resume_pdf
 from utils.pdf_generator import generate_resume_pdf
@@ -34,7 +39,7 @@ load_dotenv()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    setup_scheduler()
+    await setup_scheduler()
     yield
     scheduler.shutdown()
 
@@ -149,9 +154,14 @@ async def auto_apply(job_id: str, background_tasks: BackgroundTasks):
     async def _run_apply():
         # ApplyAgent.apply() now owns dedup, job-status transitions, and
         # recording the application — so we just kick it off and log.
-        agent = ApplyAgent()
-        result = await agent.apply(job)
-        print(f"AutoApply [{job_id}]: {result.get('status')} — {result.get('message', '')}")
+        from services import agent_state
+        agent_state.start("applying")
+        try:
+            agent = ApplyAgent()
+            result = await agent.apply(job)
+            print(f"AutoApply [{job_id}]: {result.get('status')} — {result.get('message', '')}")
+        finally:
+            agent_state.finish()
 
     background_tasks.add_task(_run_apply)
     return {"message": "Auto-apply started in background. A browser window may open — watch the logs for result."}
@@ -175,6 +185,16 @@ async def generate_outreach(job_id: str):
     agent = OutreachAgent()
     message = await agent.generate(job)
     return {"outreach_message": message}
+
+
+@app.patch("/jobs/{job_id}/status")
+async def set_job_status(job_id: str, body: JobStatusUpdate):
+    """Move a job through new / reviewed / skipped without applying to it."""
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await update_job(job_id, {"status": body.status})
+    return {"message": f"Job marked {body.status}", "status": body.status}
 
 
 @app.post("/jobs/{job_id}/apply")
@@ -217,13 +237,52 @@ async def get_dashboard_stats():
     return await get_stats()
 
 
+# --- Agent state + rules ---
+
+@app.get("/agent/state")
+async def agent_state_route():
+    """
+    What the sidebar's agent strip renders: whether a run is in flight, when the
+    next scheduled one fires, today's applications against the daily cap, and
+    any application paused waiting for a human.
+    """
+    from services.agent_state import snapshot
+    return await snapshot()
+
+
+@app.get("/settings")
+async def get_settings_route():
+    from services.settings_service import get_agent_rules
+    return await get_agent_rules()
+
+
+@app.put("/settings")
+async def save_settings_route(body: AgentRules):
+    from services.settings_service import save_agent_rules
+    from services.scheduler import reschedule_auto_apply
+    # exclude_unset so a partial save never resets a rule the form didn't send.
+    rules = await save_agent_rules(body.model_dump(exclude_unset=True))
+    await reschedule_auto_apply()
+    return rules
+
+
 # --- Manual triggers ---
 
 @app.post("/scrape/trigger")
 async def trigger_scrape(background_tasks: BackgroundTasks, body: ScrapeRequest = ScrapeRequest()):
+    from services import agent_state
+
     agent = ScraperAgent()
     agent.max_jobs_per_source = min(body.max_jobs, 100)
-    background_tasks.add_task(agent.scrape_all)
+
+    async def _run():
+        agent_state.start("scraping")
+        try:
+            await agent.scrape_all()
+        finally:
+            agent_state.finish()
+
+    background_tasks.add_task(_run)
     return {"message": "Scrape started in background. Refresh jobs in a few minutes."}
 
 
@@ -324,5 +383,14 @@ async def auto_apply_run(background_tasks: BackgroundTasks, body: AutoApplyRunRe
 @app.post("/score/trigger")
 async def trigger_scoring(background_tasks: BackgroundTasks):
     from services.scoring_service import run_scoring
-    background_tasks.add_task(run_scoring)
+    from services import agent_state
+
+    async def _run():
+        agent_state.start("scoring")
+        try:
+            await run_scoring()
+        finally:
+            agent_state.finish()
+
+    background_tasks.add_task(_run)
     return {"message": "Scoring started in background. Refresh jobs in a few minutes."}

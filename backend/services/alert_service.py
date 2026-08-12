@@ -42,7 +42,7 @@ def send_email_alert(job: dict):
         <ul style="color: #FF5370;">{gaps_html}</ul>
         <div style="margin-top: 24px;">
             <a href="{url}" style="background: #4FC3F7; color: #0F1117; padding: 12px 24px; border-radius: 4px; text-decoration: none; margin-right: 12px;">Apply Now</a>
-            <a href="{os.environ.get('FRONTEND_URL', 'http://localhost:3000')}/jobs" style="background: #1A1D2E; color: #4FC3F7; padding: 12px 24px; border-radius: 4px; text-decoration: none; border: 1px solid #4FC3F7;">View Dashboard</a>
+            <a href="{os.environ.get('FRONTEND_URL', 'http://localhost:3000')}/review" style="background: #1A1D2E; color: #4FC3F7; padding: 12px 24px; border-radius: 4px; text-decoration: none; border: 1px solid #4FC3F7;">Open Review</a>
         </div>
     </div>
     """

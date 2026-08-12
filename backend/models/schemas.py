@@ -99,6 +99,10 @@ class ApplicationStatusUpdate(BaseModel):
     notes: Optional[str] = None
 
 
+class JobStatusUpdate(BaseModel):
+    status: JobStatus
+
+
 class Resume(BaseModel):
     version: int = 1
     uploaded_at: datetime = Field(default_factory=datetime.utcnow)
@@ -169,6 +173,22 @@ class AutoApplyRunRequest(BaseModel):
     max_apply: Optional[int] = None
     dry_run: bool = False
     force: bool = False
+
+
+class AgentRules(BaseModel):
+    """
+    The knobs Setup > Agent rules writes. Every field is optional: a saved value
+    overrides the matching env var, and anything left unset falls back to it.
+    """
+    min_score: Optional[int] = Field(default=None, ge=0, le=100)
+    daily_cap: Optional[int] = Field(default=None, ge=0, le=500)
+    per_run: Optional[int] = Field(default=None, ge=1, le=100)
+    interval_minutes: Optional[int] = Field(default=None, ge=5, le=1440)
+    region: Optional[str] = None
+    auto_apply_enabled: Optional[bool] = None
+    dry_run: Optional[bool] = None
+    alerts_enabled: Optional[bool] = None
+    sms_alerts: Optional[bool] = None
 
 
 class TailorRequest(BaseModel):
