@@ -5,7 +5,9 @@ Ties the pipeline together: pick high-match, unapplied jobs -> apply to each via
 ApplyAgent (which tailors + validates the resume, runs a headed session, and
 pauses for manual CAPTCHA) -> stop when a guardrail says so.
 
-Guardrails (all irreversibility protection — you can't un-apply):
+Guardrails (all irreversibility protection — you can't un-apply). Each reads
+from Setup > Agent rules if saved there, and from the env var named below
+otherwise:
   - AUTO_APPLY_ENABLED must be truthy (master kill switch). dry_run/force bypass.
   - AUTO_APPLY_DAILY_CAP caps applications per calendar day.
   - AUTO_APPLY_MIN_SCORE gates which jobs qualify.
@@ -22,13 +24,11 @@ import logging
 from dotenv import load_dotenv
 
 from db.mongodb import get_apply_candidates, count_applications_today
+from services import agent_state
+from services.settings_service import get_agent_rules
 
 load_dotenv()
 logger = logging.getLogger(__name__)
-
-
-def _truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "y")
 
 
 def _int(name: str, default: int) -> int:
@@ -40,14 +40,16 @@ def _int(name: str, default: int) -> int:
 
 async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
                                force: bool = False) -> dict:
-    min_score = _int("AUTO_APPLY_MIN_SCORE", 70)
-    daily_cap = _int("AUTO_APPLY_DAILY_CAP", 20)
-    per_run = max_apply if max_apply is not None else _int("AUTO_APPLY_PER_RUN", 5)
-    region = os.environ.get("AUTO_APPLY_REGION", "india")
+    rules = await get_agent_rules()
+    min_score = rules["min_score"]
+    daily_cap = rules["daily_cap"]
+    per_run = max_apply if max_apply is not None else rules["per_run"]
+    region = rules["region"]
 
-    if not _truthy("AUTO_APPLY_ENABLED") and not force and not dry_run:
+    if not rules["auto_apply_enabled"] and not force and not dry_run:
         return {"status": "disabled",
-                "message": "AUTO_APPLY_ENABLED is not set. Set it, or call with dry_run/force."}
+                "message": "Auto-apply is off. Turn it on in Setup > Agent rules "
+                           "(or set AUTO_APPLY_ENABLED), or call with dry_run/force."}
 
     applied_today = await count_applications_today()
     budget = max(0, daily_cap - applied_today)
@@ -72,6 +74,14 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
     from agents.apply_agent import ApplyAgent
     agent = ApplyAgent()
 
+    agent_state.start("applying")
+    try:
+        return await _apply_all(agent, candidates, daily_cap)
+    finally:
+        agent_state.finish()
+
+
+async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:
     results = {}
     log = []
     login_needed = set()   # platforms not signed in — skip their remaining jobs
@@ -93,6 +103,16 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
         log.append({"job": f"{job.get('title')} @ {job.get('company')}",
                     "result": st, "msg": result.get("message", "")})
         logger.info(f"AutoApply: [{st}] {job.get('title')} @ {job.get('company')} — {result.get('message','')}")
+
+        if st == "deferred":
+            # The quota wall is global, not per-job — every remaining candidate
+            # would hit it too, and each attempt still costs a browser launch.
+            # Stop; these jobs are still 'new' and come back on the next cycle.
+            log.append({"result": "deferred",
+                        "msg": f"LLM quota exhausted — {result.get('message', '')} "
+                               f"Remaining jobs left for the next run."})
+            logger.warning("AutoApply halted: LLM quota exhausted, jobs deferred")
+            break
 
         if st == "login_required":
             # No live session for this platform; stop trying it this cycle.

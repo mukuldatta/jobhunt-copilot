@@ -13,7 +13,12 @@ class TailorAgent:
     def __init__(self):
         self.llm = LLMProvider(provider=os.getenv("LLM_PROVIDER", "groq"))
 
-    async def tailor(self, job: dict) -> str:
+    async def tailor(self, job: dict, avoid: list = None) -> str:
+        """
+        Reframe the resume for one job. `avoid` carries the terms a previous
+        attempt was rejected for, so a retry is corrective rather than another
+        blind roll at the same prompt.
+        """
         resume = await get_resume()
         if not resume:
             raise ValueError("No resume found. Upload your resume first.")
@@ -23,14 +28,32 @@ class TailorAgent:
         title = job.get("title", "")
         company = job.get("company", "")
 
-        prompt = f"""You are a professional resume writer helping tailor a resume for a specific job.
+        # The old prompt said "never fabricate" and "use keywords from the job
+        # description" in the same breath, and the model resolved that tension by
+        # importing whatever the JD named. An explicit inventory turns an
+        # abstract prohibition into a checkable one.
+        inventory = ", ".join(resume.get("skills", [])) or "(see the resume text below)"
 
-CRITICAL RULES:
-- NEVER fabricate skills, experience, or education that does not exist in the original resume
-- Only reframe, reorder, and emphasize existing content to better match the job
-- Use keywords from the job description where they genuinely apply
-- Keep the same factual information, just present it more relevantly
+        correction = ""
+        if avoid:
+            correction = (
+                "\nA PREVIOUS ATTEMPT WAS REJECTED for introducing terms that are not in the "
+                f"resume: {', '.join(avoid)}.\nDo not mention "
+                f"{'them' if len(avoid) > 1 else 'it'} anywhere in your output, in any form.\n"
+            )
 
+        prompt = f"""You are a professional resume writer tailoring a resume for one job.
+
+THE ONE RULE THAT MATTERS:
+You may not name any technology, tool, platform, certification or employer that does
+not already appear in the original resume. Not in a bullet, not in a skills list, not
+as "familiar with" or "exposure to". If the job description asks for something the
+candidate does not have, leave it out entirely — a missing keyword is fine, an invented
+one is fraud and gets this application thrown away.
+
+TECHNOLOGIES THE CANDIDATE ACTUALLY HAS (the complete allowed set):
+{inventory}
+{correction}
 ORIGINAL RESUME:
 {resume_text}
 
@@ -38,12 +61,13 @@ TARGET JOB: {title} at {company}
 JOB DESCRIPTION:
 {job_description}
 
-Rewrite the resume to better match this job. Follow these steps:
-1. Move the most relevant experience to the top
-2. Rewrite bullet points to use keywords from the job description (only where factually accurate)
-3. Highlight skills that match the job requirements
-4. Keep all dates, companies, titles, and education exactly as-is
+What you SHOULD do:
+1. Move the most relevant existing experience to the top
+2. Rephrase existing bullets in the job's own vocabulary — but only where the
+   underlying work genuinely matches
+3. Foreground the skills above that the job asks for; drop emphasis on ones it does not
+4. Keep every date, company, job title and qualification exactly as written
 
-Return the full tailored resume text only. No explanations."""
+Return the full tailored resume text only. No explanations, no commentary."""
 
         return clean_resume_text(await asyncio.to_thread(self.llm.complete, prompt))

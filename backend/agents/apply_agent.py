@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import tempfile
 from datetime import datetime
@@ -10,6 +11,8 @@ from services.answer_service import AnswerResolver
 from utils.pdf_generator import generate_resume_pdf
 from utils.resume_validator import validate_tailored_resume, clean_resume_text
 from services.alert_service import send_manual_action_alert
+from services import agent_state
+from llm_provider import RateLimited, is_rate_limited, cooldown_remaining
 from db.mongodb import (
     get_application_by_job_id, claim_job_for_apply, finish_job_apply, record_application,
     save_auth_state, clear_auth_state,
@@ -35,6 +38,34 @@ PROFILE_ROOT = os.environ.get("BROWSER_PROFILE_DIR") or os.path.join(
     os.path.dirname(os.path.dirname(__file__)), ".browser_profiles"
 )
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs", "apply")
+
+# How each board says "this one is applied for on the employer's own site".
+# These are the only grounds for calling a posting external — without a positive
+# match the agent reports an honest failure instead, because a wrong "external"
+# is terminal (see ApplyAgent._no_apply_control) and reads like a real outcome.
+EXTERNAL_MARKERS = {
+    "naukri": (
+        "#company-site-button",
+        'button:has-text("Apply on company site")',
+        'a:has-text("Apply on company site")',
+    ),
+    "linkedin": (
+        # LinkedIn's off-site postings show a plain "Apply" with an external-link
+        # glyph plus this line, rather than the Easy Apply button.
+        ':text("Responses managed off LinkedIn")',
+        'button[aria-label*="company website" i]',
+        'a[aria-label*="company website" i]',
+        'a.jobs-apply-button[target="_blank"]',
+    ),
+    "indeed": (
+        'a[data-testid="applyButtonLinkContainer"]',
+        ':text("Apply on company site")',
+    ),
+    "dice": (
+        ':text("Apply on company site")',
+        'a[data-cy="external-apply"]',
+    ),
+}
 
 # Serialize applies process-wide: parallel headed Chrome logins are an instant
 # bot signal, and two runs must never submit the same job at once.
@@ -87,6 +118,7 @@ class ApplyAgent:
         self.user_email = os.environ.get("MY_EMAIL", "mukulmokkapati@gmail.com")
         self.user_phone = os.environ.get("MY_PHONE", "")
         self.answers = None   # AnswerResolver, loaded per apply (needs DB)
+        self.current_job = ""  # "Title @ Company" — names the job in a pause notice
 
         # Headed is required for manual CAPTCHA. Only go headless if explicitly asked.
         self.headless = os.environ.get("APPLY_HEADLESS", "").strip().lower() in ("1", "true", "yes")
@@ -101,6 +133,27 @@ class ApplyAgent:
     async def apply(self, job: dict) -> dict:
         job_id = job.get("job_id", "")
         source = job.get("source", "")
+        self.current_job = f"{job.get('title', '')} @ {job.get('company', '')}".strip(" @")
+
+        # Re-read here, not in __init__: the dry-run toggle lives in Setup and
+        # has to bind at apply time to be worth anything as a safety switch.
+        from services.settings_service import get_agent_rules
+        self.dry_run = (await get_agent_rules())["dry_run"]
+        # Why this job was put back, if it was. Any non-None value means no
+        # application was submitted and the job stays retryable.
+        self._defer_reason = None
+        self._resume_attached = False
+
+        # An application cannot be withdrawn, so a generic resume is not an
+        # acceptable degradation — we would be spending the one shot at this
+        # employer on a weaker application. Defer instead, before claiming the
+        # job or opening a browser, and pick it up when the quota refills.
+        if is_rate_limited():
+            return {"status": "deferred", "url": job.get("url", ""),
+                    "retry_after": round(cooldown_remaining()),
+                    "message": f"LLM quota exhausted — deferring this job for "
+                               f"{cooldown_remaining():.0f}s rather than applying "
+                               f"with an untailored resume."}
 
         if source not in LOGIN:
             return {
@@ -141,7 +194,7 @@ class ApplyAgent:
             })
         elif status in ("manual_required", "needs_review"):
             await finish_job_apply(job_id, "manual_required")
-        elif status in ("login_required", "dry_run"):
+        elif status in ("login_required", "dry_run", "deferred"):
             # Not a real apply — release it so it can be retried later.
             await finish_job_apply(job_id, "new")
         elif status == "already_applied":
@@ -162,6 +215,12 @@ class ApplyAgent:
                 # Generate documents only after login is confirmed, so a
                 # login_required job never burns LLM calls.
                 pdf_path, tailored_text = await self._make_resume(job)
+                if self._defer_reason:
+                    return {"status": "deferred", "url": job.get("url", ""),
+                            "retry_after": round(cooldown_remaining()),
+                            "message": f"{self._defer_reason} — deferred before touching "
+                                       f"the form. No application was submitted."}
+
                 cover_letter = await self._make_cover_letter(job)
                 await self._load_answers()
 
@@ -177,6 +236,20 @@ class ApplyAgent:
 
     # ── Resume ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _offending_terms(issues: list) -> list:
+        """
+        Pull the invented skill names back out of the validator's message so the
+        retry can be told exactly what not to say. Mirrors the wording built in
+        utils.resume_validator.validate_tailored_resume.
+        """
+        marker = "Introduces skills not in the original resume:"
+        terms = []
+        for issue in issues or []:
+            if marker in issue:
+                terms += [t.strip() for t in issue.split(marker, 1)[1].split(",") if t.strip()]
+        return terms
+
     async def _make_resume(self, job: dict):
         """
         Tailor + validate the resume. If validation fails (fabricated skills,
@@ -190,23 +263,54 @@ class ApplyAgent:
         except Exception:
             resume = None
 
-        try:
-            tailored_text = await TailorAgent().tailor(job)
-        except Exception as e:
-            print(f"ApplyAgent: tailoring failed: {e}")
-            tailored_text = None
+        async def _tailor_once(avoid: list = None):
+            try:
+                return await TailorAgent().tailor(job, avoid=avoid), None
+            except RateLimited as e:
+                return None, f"LLM quota exhausted while tailoring ({e})"
+            except Exception as e:
+                print(f"ApplyAgent: tailoring failed: {e}")
+                return None, None
+
+        tailored_text, defer = await _tailor_once()
+        if defer:
+            # Quota died mid-run. Distinct from a tailoring bug: falling back to
+            # the original resume would spend an irreversible application on a
+            # weaker document, so the caller defers the whole job instead.
+            print(f"ApplyAgent: {defer} — deferring.")
+            self._defer_reason = "LLM quota exhausted"
+            return None, None
 
         final_text = None
         if tailored_text and resume:
             v = validate_tailored_resume(tailored_text, resume,
                                          user_name=self.user_name, user_email=self.user_email)
+            if not v["ok"]:
+                # The tailor is stochastic, so a rejection is usually a bad roll
+                # rather than a systematic fault — re-roll once before giving up.
+                print(f"    Resume validation FAILED {v['issues']} — re-tailoring once.")
+                retry_text, defer = await _tailor_once(avoid=self._offending_terms(v["issues"]))
+                if defer:
+                    self._defer_reason = "LLM quota exhausted"
+                    return None, None
+                if retry_text:
+                    v = validate_tailored_resume(retry_text, resume,
+                                                 user_name=self.user_name,
+                                                 user_email=self.user_email)
+                    if v["ok"]:
+                        tailored_text = retry_text
+
             if v["ok"]:
                 final_text = v["text"]
                 if v["issues"]:
                     print(f"    Resume validation warnings: {v['issues']}")
             else:
-                print(f"    Resume validation FAILED {v['issues']} — using original resume instead.")
-                final_text = resume.get("parsed_text")
+                # Two rejections. Submitting the original here would quietly send
+                # a generic resume on a one-shot, irreversible application — so
+                # put the job back instead and let the next run try again.
+                print(f"    Resume validation FAILED twice {v['issues']} — deferring job.")
+                self._defer_reason = f"tailored resume failed validation twice ({'; '.join(v['issues'])[:120]})"
+                return None, None
         elif tailored_text:
             final_text = tailored_text  # no stored resume to validate against
         elif resume:
@@ -216,10 +320,15 @@ class ApplyAgent:
             return None, None
 
         try:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-            tmp.close()
-            generate_resume_pdf(final_text, tmp.name)
-            return tmp.name, final_text
+            # The filename reaches the recruiter, so it carries the candidate's
+            # name and the company — not tempfile's tmpsjrl69sg.pdf, which reads
+            # as machine output before anyone opens it.
+            safe = re.sub(r"[^A-Za-z0-9]+", "_", self.user_name or "Resume").strip("_")
+            company = re.sub(r"[^A-Za-z0-9]+", "_", job.get("company", "")).strip("_")
+            name = f"{safe}_{company}.pdf" if company else f"{safe}.pdf"
+            path = os.path.join(tempfile.mkdtemp(prefix="jobhunt_"), name)
+            generate_resume_pdf(final_text, path)
+            return path, final_text
         except Exception as e:
             print(f"ApplyAgent: PDF generation failed: {e}")
             return None, final_text
@@ -456,22 +565,28 @@ class ApplyAgent:
                 except Exception:
                     pass
 
-        waited, interval = 0, 5
-        while waited < timeout:
-            await asyncio.sleep(interval)
-            waited += interval
-            try:
-                if done_check is not None:
-                    if await done_check():
-                        print(f"    [RESUME] [{platform}] resolved after {waited}s — continuing.")
+        # Surface the pause on Today, so a run blocked behind a CAPTCHA shows up
+        # as something needing you rather than as a run that has simply stalled.
+        agent_state.begin_human_wait(platform, reason, self.current_job)
+        try:
+            waited, interval = 0, 5
+            while waited < timeout:
+                await asyncio.sleep(interval)
+                waited += interval
+                try:
+                    if done_check is not None:
+                        if await done_check():
+                            print(f"    [RESUME] [{platform}] resolved after {waited}s — continuing.")
+                            return True
+                    elif not await self._has_captcha(page):
+                        print(f"    [RESUME] [{platform}] challenge cleared after {waited}s — continuing.")
                         return True
-                elif not await self._has_captcha(page):
-                    print(f"    [RESUME] [{platform}] challenge cleared after {waited}s — continuing.")
-                    return True
-            except Exception:
-                pass
-        print(f"    [TIMEOUT] [{platform}] no human action within {timeout}s — giving up.")
-        return False
+                except Exception:
+                    pass
+            print(f"    [TIMEOUT] [{platform}] no human action within {timeout}s — giving up.")
+            return False
+        finally:
+            agent_state.end_human_wait()
 
     async def _guard_captcha(self, page, platform: str) -> bool:
         """
@@ -513,6 +628,45 @@ class ApplyAgent:
     def _external_apply(self, job: dict) -> dict:
         return {"status": "manual_required", "url": job.get("url", ""),
                 "message": "This posting applies on the company site — open the link and finish manually."}
+
+    async def _await_apply_control(self, page, selector: str, timeout: int = 15000):
+        """
+        Wait for the apply control to render instead of sampling the DOM once.
+        Both Naukri and LinkedIn hydrate that button client-side, so a bare
+        query_selector after a fixed sleep loses the race on a cold profile.
+        """
+        try:
+            await page.wait_for_selector(selector, timeout=timeout)
+        except Exception:
+            return None
+        return await page.query_selector(selector)
+
+    async def _no_apply_control(self, page, job: dict, platform: str) -> dict:
+        """
+        No apply control appeared. Only call that an external posting when the
+        page actually says so — either it offers a company-site button, or it
+        has already navigated off the platform.
+
+        Guessing "external" here is the expensive mistake: _finalize marks the
+        job manual_required, so it is never retried, and the message reads like
+        a legitimate business outcome rather than a failure. A render timeout
+        and a selector change both disappear into it silently.
+        """
+        if platform not in (page.url or "").lower():
+            return self._external_apply(job)
+
+        for selector in EXTERNAL_MARKERS.get(platform, ()):
+            try:
+                if await page.query_selector(selector):
+                    return self._external_apply(job)
+            except Exception:
+                continue
+
+        await self._screenshot(page, f"{platform}_no_apply_control")
+        return {"status": "needs_review", "url": page.url,
+                "message": f"No apply control found on {platform} after waiting. The page may "
+                           f"not have finished rendering, or the selector has drifted — this is "
+                           f"not a company-site posting. Screenshot in backend/logs/apply."}
 
     async def _dry_stop(self, page, platform: str, what: str) -> dict:
         await self._screenshot(page, f"dryrun_{platform}")
@@ -776,14 +930,9 @@ class ApplyAgent:
         # shows placeholders silently fails to open the modal.
         sel = ('button.jobs-apply-button, button[aria-label*="Easy Apply"], '
                'button:has-text("Easy Apply"), .jobs-s-apply button')
-        try:
-            await page.wait_for_selector(sel, timeout=15000)
-        except Exception:
-            return self._external_apply(job)
-
-        easy_apply = await page.query_selector(sel)
+        easy_apply = await self._await_apply_control(page, sel)
         if not easy_apply:
-            return self._external_apply(job)
+            return await self._no_apply_control(page, job, "linkedin")
 
         await easy_apply.click()
 
@@ -817,6 +966,58 @@ class ApplyAgent:
             await asyncio.sleep(step)
             waited += step
         return max(last, 0)
+
+    async def _upload_resume(self, page, pdf_path: str) -> bool:
+        """
+        Attach the tailored PDF on LinkedIn's resume step.
+
+        LinkedIn presents the resumes already on your profile as radio choices
+        and only renders the file input once you ask to upload a new one. Left
+        alone, the step arrives with one pre-selected and _answer_form_fields
+        happily confirms it — so the application goes out with whatever you last
+        uploaded, months old, and nothing anywhere reports a failure. That is
+        the whole tailoring pipeline quietly amounting to nothing, so this is
+        worth the extra click.
+        """
+        # Scope page-wide, not to dialog[open]: LinkedIn renders this input in a
+        # portal outside the dialog on some variants, and set_input_files works
+        # on hidden inputs, so there is nothing to gain from the tighter scope.
+        async def _file_input():
+            return await page.query_selector('input[type="file"]')
+
+        upload = await _file_input()
+        if not upload:
+            modal = self._modal(page)
+            for name in ("Upload resume", "Upload new resume", "Choose file"):
+                try:
+                    btn = modal.get_by_role("button", name=name, exact=False)
+                    if await btn.count() > 0:
+                        print(f"    revealing file input via '{name}'")
+                        await btn.first.click()
+                        await asyncio.sleep(1.5)
+                        break
+                except Exception:
+                    continue
+            upload = await _file_input()
+
+        if not upload:
+            # Say so loudly — a silent miss here is what sent months-old resumes.
+            labels = await page.evaluate("""() => {
+                const d = document.querySelector('dialog[open]');
+                if (!d) return 'no dialog';
+                return [...d.querySelectorAll('button,label,h3')]
+                    .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 12).join(' / ');
+            }""")
+            print(f"    no file input on this step. controls: {str(labels)[:220]}")
+            return False
+        try:
+            await upload.set_input_files(pdf_path)
+            await asyncio.sleep(2.5)   # LinkedIn parses the file before advancing
+            print(f"    [ok] uploaded tailored resume ({os.path.basename(pdf_path)})")
+            return True
+        except Exception as e:
+            print(f"    resume upload failed: {str(e)[:100]}")
+            return False
 
     async def _fill_linkedin_modal(self, page, pdf_path: str = None, cover_letter: str = None) -> dict:
         last_sig, stalled = None, 0
@@ -852,6 +1053,17 @@ class ApplyAgent:
             modal = self._modal(page)
             submit_btn = modal.get_by_role("button", name="Submit application")
             if await submit_btn.count() > 0:
+                # Last gate before the irreversible click. If we built a tailored
+                # resume and never managed to attach it, this application would
+                # carry whatever LinkedIn had on file — the exact silent
+                # downgrade the defer policy exists to prevent.
+                if pdf_path and not self._resume_attached:
+                    await self._screenshot(page, "linkedin_resume_not_attached")
+                    return {"status": "needs_review", "url": page.url,
+                            "message": ("Reached Submit but the tailored resume was never "
+                                        "attached — LinkedIn would have sent the copy already "
+                                        "on your profile. Not submitting. Screenshot in "
+                                        "backend/logs/apply.")}
                 if self.dry_run:
                     return await self._dry_stop(page, "linkedin", "Submit application")
                 await submit_btn.first.click()
@@ -860,15 +1072,8 @@ class ApplyAgent:
                     return confirmed
                 return {"status": "applied", "message": "Application submitted via LinkedIn Easy Apply."}
 
-            if pdf_path:
-                upload = await page.query_selector('dialog[open] input[type="file"]')
-                if upload:
-                    try:
-                        await upload.set_input_files(pdf_path)
-                        await asyncio.sleep(1)
-                        print("    [ok] uploaded tailored resume")
-                    except Exception:
-                        pass
+            if pdf_path and not self._resume_attached:
+                self._resume_attached = await self._upload_resume(page, pdf_path)
 
             # Paste the cover letter if this step has a message field.
             await self._fill_cover_letter(page, cover_letter)
@@ -925,11 +1130,12 @@ class ApplyAgent:
         if not await self._guard_captcha(page, "naukri"):
             return {"status": "needs_review", "url": page.url, "message": "CAPTCHA not cleared on Naukri."}
 
-        apply_btn = await page.query_selector(
-            'button#apply-button, a#apply-button, button.apply-button, button[title*="Apply"]'
+        apply_btn = await self._await_apply_control(
+            page,
+            'button#apply-button, a#apply-button, button.apply-button, button[title*="Apply"]',
         )
         if not apply_btn:
-            return self._external_apply(job)
+            return await self._no_apply_control(page, job, "naukri")
 
         if self.dry_run:
             return await self._dry_stop(page, "naukri", "Apply button")
@@ -957,12 +1163,13 @@ class ApplyAgent:
         await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(2)
 
-        apply_btn = await page.query_selector(
+        apply_btn = await self._await_apply_control(
+            page,
             'button[data-testid="indeedApplyButton"], button[id="indeedApplyButton"], '
-            'a[data-testid="apply-button"], span.indeed-apply-button'
+            'a[data-testid="apply-button"], span.indeed-apply-button',
         )
         if not apply_btn:
-            return self._external_apply(job)
+            return await self._no_apply_control(page, job, "indeed")
 
         await apply_btn.click()
         await asyncio.sleep(3)
@@ -1008,12 +1215,13 @@ class ApplyAgent:
         await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(2)
 
-        apply_btn = await page.query_selector(
+        apply_btn = await self._await_apply_control(
+            page,
             'apply-button-wc, button[data-cy="apply-button"], '
-            'a[data-cy="apply-button"], button[id*="apply"]'
+            'a[data-cy="apply-button"], button[id*="apply"]',
         )
         if not apply_btn:
-            return self._external_apply(job)
+            return await self._no_apply_control(page, job, "dice")
 
         await apply_btn.click()
         await asyncio.sleep(3)

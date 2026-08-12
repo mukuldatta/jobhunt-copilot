@@ -36,6 +36,38 @@ class RateLimited(Exception):
     """Every provider is currently rate limited — the caller should back off."""
 
 
+# When the whole chain comes back limited, remember it. complete() has no memory
+# between calls otherwise, so an exhausted quota costs a full walk of every
+# model of every provider on EVERY call — roughly a dozen doomed round trips per
+# document, on providers that already said no. The cooldown turns that into one
+# local check, and lets callers ask "is it worth spending a call?" before they
+# build a prompt.
+_COOLDOWN_UNTIL = 0.0
+
+
+def cooldown_remaining() -> float:
+    """Seconds until the LLM chain is worth trying again. 0.0 when it's live."""
+    return max(0.0, _COOLDOWN_UNTIL - time.time())
+
+
+def is_rate_limited() -> bool:
+    """True while every provider is known-exhausted. Cheap, no network."""
+    return cooldown_remaining() > 0
+
+
+def _open_cooldown(seconds: float):
+    global _COOLDOWN_UNTIL
+    _COOLDOWN_UNTIL = time.time() + seconds
+    print(f"LLM: all providers exhausted — pausing LLM work for {seconds:.0f}s")
+
+
+def _clear_cooldown():
+    global _COOLDOWN_UNTIL
+    if _COOLDOWN_UNTIL:
+        print("LLM: quota recovered")
+    _COOLDOWN_UNTIL = 0.0
+
+
 def _is_rate_limit(err: Exception) -> bool:
     s = str(err).lower()
     return ("429" in s or "rate limit" in s or "rate_limit" in s
@@ -80,6 +112,12 @@ class LLMProvider:
         Free tiers meter per model, so exhausting one model doesn't mean the
         provider is out — only that this bucket is.
         """
+        if not _tried and is_rate_limited():
+            # Nothing has refilled yet; skip the walk rather than re-prove it.
+            raise RateLimited(
+                f"All providers rate limited. retry_after={cooldown_remaining():.0f}s"
+            )
+
         last_err = None
         limited = False
 
@@ -93,6 +131,7 @@ class LLMProvider:
                 if model != self.model:
                     print(f"LLM: using {self.provider}/{model}")
                     self.model = model      # stick with what works
+                _clear_cooldown()           # something answered — quota is back
                 return out
             except Exception as e:
                 last_err = e
@@ -115,8 +154,10 @@ class LLMProvider:
         if limited:
             # Distinct from a hard failure: the caller can pause and retry
             # later instead of treating the job as unscoreable.
+            wait = _retry_after(last_err)
+            _open_cooldown(wait)
             raise RateLimited(
-                f"All providers/models rate limited. retry_after={_retry_after(last_err):.0f}s"
+                f"All providers/models rate limited. retry_after={wait:.0f}s"
             ) from last_err
         raise Exception(f"All providers failed. Check API keys and rate limits. {last_err}")
 
