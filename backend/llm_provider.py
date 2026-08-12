@@ -8,8 +8,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# gemini-1.5-flash was retired (404 on generateContent). Overridable via env.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+# Free tiers meter tokens PER MODEL, so when the big model hits its daily cap
+# the smaller ones still have their own untouched budget. Walking this chain
+# multiplies the usable free quota instead of stopping at the first wall.
+# Order: best quality first, cheapest/highest-allowance last.
+GROQ_MODELS = [m.strip() for m in os.getenv(
+    "GROQ_MODELS",
+    "llama-3.3-70b-versatile,openai/gpt-oss-120b,llama-3.1-8b-instant,openai/gpt-oss-20b"
+).split(",") if m.strip()]
+
+# gemini-1.5-flash was retired (404 on generateContent).
+GEMINI_MODELS = [m.strip() for m in os.getenv(
+    "GEMINI_MODELS", "gemini-flash-latest,gemini-flash-lite-latest"
+).split(",") if m.strip()]
+
+GEMINI_MODEL = GEMINI_MODELS[0]          # back-compat for existing imports
+
+ANTHROPIC_MODELS = ["claude-haiku-4-5-20251001"]
+
+
+def _models_for(provider: str) -> list:
+    return {"groq": GROQ_MODELS, "gemini": GEMINI_MODELS,
+            "anthropic": ANTHROPIC_MODELS}.get(provider, [])
 
 
 class RateLimited(Exception):
@@ -35,68 +55,78 @@ def _retry_after(err: Exception, default: float = 30.0) -> float:
 
 
 class LLMProvider:
-    def __init__(self, provider = "groq"):
-        self.provider = provider
+    def __init__(self, provider="groq"):
+        self.client = None
+        self.model = None
+        self._switch(provider)
 
-        if provider == "groq":
-            self.client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-            self.model = "llama-3.3-70b-versatile"
-        elif provider == "gemini":
-            genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-            self.model = GEMINI_MODEL
-            self.client = genai.GenerativeModel(self.model)
-        elif provider == "anthropic":
-            self.model = "claude-haiku-4-5-20251001"
-            self.client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-        
+    def _call(self, prompt: str, model: str) -> str:
+        if self.provider == "groq":
+            r = self.client.chat.completions.create(
+                model=model, messages=[{"role": "user", "content": prompt}])
+            return r.choices[0].message.content.strip()
+        if self.provider == "gemini":
+            return genai.GenerativeModel(model).generate_content(prompt).text.strip()
+        if self.provider == "anthropic":
+            r = self.client.messages.create(
+                model=model, max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}])
+            return r.content[0].text.strip()
+        raise Exception(f"Unknown provider '{self.provider}'")
+
     def complete(self, prompt: str, _tried: tuple = ()):
-        try:
-            if self.provider == "groq":
-                response = self.client.chat.completions.create(
-                    model = self.model,
-                    messages = [{"role": "user", "content": prompt}]
-                )
-                return response.choices[0].message.content.strip()
-            elif self.provider == "gemini":
-                response = self.client.generate_content(prompt)
-                return response.text.strip()
-            elif self.provider == "anthropic":
-                response = self.client.messages.create(
-                    model = self.model,
-                    max_tokens = 2048,
-                    messages = [{"role": "user", "content": prompt}]
-                )
-                return response.content[0].text.strip()
-            
-        except Exception as e:
-            limited = _is_rate_limit(e)
-            print(f"LLM error ({self.provider}): {str(e)[:160]}")
-            tried = _tried + (self.provider,)
+        """
+        Try each model of the current provider, then each remaining provider.
+        Free tiers meter per model, so exhausting one model doesn't mean the
+        provider is out — only that this bucket is.
+        """
+        last_err = None
+        limited = False
 
-            # Try the next configured provider before giving up.
-            for nxt, key in (("gemini", "GEMINI_API_KEY"), ("groq", "GROQ_API_KEY"),
-                             ("anthropic", "ANTHROPIC_API_KEY")):
-                if nxt in tried or not os.getenv(key):
+        # Start from the currently selected model, then the rest of the chain.
+        models = _models_for(self.provider)
+        ordered = ([self.model] + [m for m in models if m != self.model]) if self.model else models
+
+        for model in ordered:
+            try:
+                out = self._call(prompt, model)
+                if model != self.model:
+                    print(f"LLM: using {self.provider}/{model}")
+                    self.model = model      # stick with what works
+                return out
+            except Exception as e:
+                last_err = e
+                if _is_rate_limit(e):
+                    limited = True
+                    print(f"LLM {self.provider}/{model}: rate limited, trying next model")
                     continue
-                print(f"Falling back to {nxt}...")
-                self._switch(nxt)
-                return self.complete(prompt, tried)
+                print(f"LLM {self.provider}/{model}: {str(e)[:110]}")
+                continue
 
-            if limited:
-                # Distinct from a hard failure: the caller can pause and retry
-                # later instead of treating the job as unscoreable.
-                raise RateLimited(f"All providers rate limited. retry_after={_retry_after(e):.0f}s") from e
-            raise Exception(f"All providers failed. Check API keys and rate limits. {e}")
+        tried = _tried + (self.provider,)
+        for nxt, key in (("groq", "GROQ_API_KEY"), ("gemini", "GEMINI_API_KEY"),
+                         ("anthropic", "ANTHROPIC_API_KEY")):
+            if nxt in tried or not os.getenv(key):
+                continue
+            print(f"Falling back to provider {nxt}...")
+            self._switch(nxt)
+            return self.complete(prompt, tried)
+
+        if limited:
+            # Distinct from a hard failure: the caller can pause and retry
+            # later instead of treating the job as unscoreable.
+            raise RateLimited(
+                f"All providers/models rate limited. retry_after={_retry_after(last_err):.0f}s"
+            ) from last_err
+        raise Exception(f"All providers failed. Check API keys and rate limits. {last_err}")
 
     def _switch(self, provider: str):
         self.provider = provider
+        self.model = (_models_for(provider) or [None])[0]
         if provider == "groq":
             self.client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-            self.model = "llama-3.3-70b-versatile"
         elif provider == "gemini":
             genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-            self.model = GEMINI_MODEL
-            self.client = genai.GenerativeModel(GEMINI_MODEL)
+            self.client = None            # model chosen per call
         elif provider == "anthropic":
-            self.model = "claude-haiku-4-5-20251001"
             self.client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
