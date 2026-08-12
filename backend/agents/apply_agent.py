@@ -13,8 +13,10 @@ from utils.resume_validator import validate_tailored_resume, clean_resume_text
 from services.alert_service import send_manual_action_alert
 from services import agent_state
 from llm_provider import RateLimited, is_rate_limited, cooldown_remaining
+from platforms import apply_supported, disabled_reason
 from db.mongodb import (
     get_application_by_job_id, claim_job_for_apply, finish_job_apply, record_application,
+    update_job,
     save_auth_state, clear_auth_state,
 )
 from dotenv import load_dotenv
@@ -107,7 +109,10 @@ LOGIN = {
     },
 }
 
-SUPPORTED_PLATFORMS = list(LOGIN.keys())
+# Boards worth offering a Login button for. A board we will never submit to has
+# no reason to ask you to fight its sign-in flow, so it drops off Setup > Job
+# boards along with the apply path.
+SUPPORTED_PLATFORMS = [p for p in LOGIN if apply_supported(p)]
 
 
 class ApplyAgent:
@@ -155,6 +160,15 @@ class ApplyAgent:
                                f"{cooldown_remaining():.0f}s rather than applying "
                                f"with an untailored resume."}
 
+        if not apply_supported(source):
+            # Known board, deliberately not submitted to. Hand it back before
+            # spending a browser launch or a single LLM call on it.
+            return {
+                "status": "manual_required",
+                "url": job.get("url", ""),
+                "message": disabled_reason(source),
+            }
+
         if source not in LOGIN:
             return {
                 "status": "manual_required",
@@ -181,6 +195,53 @@ class ApplyAgent:
             await self._finalize(job_id, result)
             return result
 
+    # The in-platform apply control per board — the thing whose presence means
+    # "we can submit this ourselves".
+    APPLY_CONTROL = {
+        "linkedin": ('button.jobs-apply-button, button[aria-label*="Easy Apply"], '
+                     'button:has-text("Easy Apply"), .jobs-s-apply button'),
+        "naukri": 'button#apply-button, a#apply-button, button.apply-button, button[title*="Apply"]',
+        "dice": ('apply-button-wc, button[data-cy="apply-button"], '
+                 'a[data-cy="apply-button"], button[id*="apply"]'),
+    }
+
+    async def _preflight(self, page, job: dict, source: str):
+        """
+        Decide whether this posting is ours to submit, before any LLM spend.
+
+        Returns None to proceed, or the terminal result to hand back. Records
+        apply_type either way so the answer is durable and the candidate query
+        stops offering the same dead job on every cycle.
+        """
+        try:
+            await page.goto(job["url"], wait_until="domcontentloaded", timeout=25000)
+        except Exception as e:
+            return {"status": "error", "message": f"Could not open the posting: {type(e).__name__}"}
+        await asyncio.sleep(2)
+
+        job_id = job.get("job_id", "")
+
+        if await self._looks_expired(page):
+            await update_job(job_id, {"apply_type": "expired"})
+            return {"status": "expired", "url": page.url,
+                    "message": "This posting has closed — it is no longer accepting applications."}
+
+        for selector in EXTERNAL_MARKERS.get(source, ()):
+            try:
+                if await page.query_selector(selector):
+                    await update_job(job_id, {"apply_type": "external"})
+                    return self._external_apply(job)
+            except Exception:
+                continue
+
+        control = await self._await_apply_control(page, self.APPLY_CONTROL.get(source, ""))
+        if control:
+            await update_job(job_id, {"apply_type": "in_platform"})
+            return None
+
+        # No control and no marker — ambiguous, and not something to guess at.
+        return await self._no_apply_control(page, job, source)
+
     async def _finalize(self, job_id: str, result: dict):
         status = result.get("status")
         if status == "applied":
@@ -192,6 +253,9 @@ class ApplyAgent:
                 "cover_letter": result.pop("_cover_letter", None),
                 "notes": "Auto-applied via ApplyAgent",
             })
+        elif status == "expired":
+            # Terminal, and not your problem to finish by hand either.
+            await finish_job_apply(job_id, "expired")
         elif status in ("manual_required", "needs_review"):
             await finish_job_apply(job_id, "manual_required")
         elif status in ("login_required", "dry_run", "deferred"):
@@ -212,8 +276,16 @@ class ApplyAgent:
                 if not login["ok"]:
                     return login["result"]
 
-                # Generate documents only after login is confirmed, so a
-                # login_required job never burns LLM calls.
+                # Establish that this posting is actually submittable BEFORE
+                # spending anything on it. Tailoring plus a cover letter is two
+                # LLM calls, and roughly 70% of postings hand off to the
+                # employer's own site — so discovering that inside the handler,
+                # after the documents exist, wastes the scarcest resource on the
+                # jobs least able to use it.
+                preflight = await self._preflight(page, job, source)
+                if preflight is not None:
+                    return preflight
+
                 pdf_path, tailored_text = await self._make_resume(job)
                 if self._defer_reason:
                     return {"status": "deferred", "url": job.get("url", ""),
@@ -257,65 +329,32 @@ class ApplyAgent:
         honest document is submitted rather than a corrupted one. Returns
         (pdf_path, text_that_was_used).
         """
-        try:
-            from db.mongodb import get_resume
-            resume = await get_resume()
-        except Exception:
-            resume = None
+        from services.resume_service import build_tailored_resume
 
-        async def _tailor_once(avoid: list = None):
-            try:
-                return await TailorAgent().tailor(job, avoid=avoid), None
-            except RateLimited as e:
-                return None, f"LLM quota exhausted while tailoring ({e})"
-            except Exception as e:
-                print(f"ApplyAgent: tailoring failed: {e}")
-                return None, None
+        built = await build_tailored_resume(job, user_name=self.user_name,
+                                            user_email=self.user_email)
+        if built["cached"]:
+            print("    reusing the tailored resume already approved for this job")
 
-        tailored_text, defer = await _tailor_once()
-        if defer:
+        if built["rate_limited"]:
             # Quota died mid-run. Distinct from a tailoring bug: falling back to
             # the original resume would spend an irreversible application on a
             # weaker document, so the caller defers the whole job instead.
-            print(f"ApplyAgent: {defer} — deferring.")
+            print("    LLM quota exhausted while tailoring — deferring.")
             self._defer_reason = "LLM quota exhausted"
             return None, None
 
-        final_text = None
-        if tailored_text and resume:
-            v = validate_tailored_resume(tailored_text, resume,
-                                         user_name=self.user_name, user_email=self.user_email)
-            if not v["ok"]:
-                # The tailor is stochastic, so a rejection is usually a bad roll
-                # rather than a systematic fault — re-roll once before giving up.
-                print(f"    Resume validation FAILED {v['issues']} — re-tailoring once.")
-                retry_text, defer = await _tailor_once(avoid=self._offending_terms(v["issues"]))
-                if defer:
-                    self._defer_reason = "LLM quota exhausted"
-                    return None, None
-                if retry_text:
-                    v = validate_tailored_resume(retry_text, resume,
-                                                 user_name=self.user_name,
-                                                 user_email=self.user_email)
-                    if v["ok"]:
-                        tailored_text = retry_text
+        if not built["ok"]:
+            # Submitting the original here would quietly send a generic resume on
+            # a one-shot, irreversible application — put the job back instead.
+            print(f"    Resume rejected {built['issues']} — deferring job.")
+            self._defer_reason = (
+                f"tailored resume failed validation ({'; '.join(built['issues'])[:120]})")
+            return None, None
 
-            if v["ok"]:
-                final_text = v["text"]
-                if v["issues"]:
-                    print(f"    Resume validation warnings: {v['issues']}")
-            else:
-                # Two rejections. Submitting the original here would quietly send
-                # a generic resume on a one-shot, irreversible application — so
-                # put the job back instead and let the next run try again.
-                print(f"    Resume validation FAILED twice {v['issues']} — deferring job.")
-                self._defer_reason = f"tailored resume failed validation twice ({'; '.join(v['issues'])[:120]})"
-                return None, None
-        elif tailored_text:
-            final_text = tailored_text  # no stored resume to validate against
-        elif resume:
-            final_text = resume.get("parsed_text")
-
+        final_text = built["text"]
+        if built["issues"]:
+            print(f"    Resume validation warnings: {built['issues']}")
         if not final_text:
             return None, None
 
@@ -616,14 +655,26 @@ class ApplyAgent:
             if any(p in content for p in success):
                 return {"status": "applied", "message": "Confirmed: application submitted successfully."}
 
-            closed = ["no longer accepting", "position has been filled", "job has expired",
-                      "no longer available", "posting has been closed"]
-            if any(p in content for p in closed):
-                return {"status": "manual_required", "url": page.url,
+            if await self._looks_expired(page):
+                return {"status": "expired", "url": page.url,
                         "message": "Job is no longer accepting applications."}
         except Exception:
             pass
         return None
+
+    # A posting that has closed loses its apply control, which looks identical
+    # to a selector that has drifted. Checking this first keeps a dead job from
+    # being filed as a bug in our code.
+    CLOSED_PHRASES = ("no longer accepting", "position has been filled", "job has expired",
+                      "no longer available", "posting has been closed",
+                      "this job is no longer", "applications are closed")
+
+    async def _looks_expired(self, page) -> bool:
+        try:
+            content = (await page.content()).lower()
+        except Exception:
+            return False
+        return any(p in content for p in self.CLOSED_PHRASES)
 
     def _external_apply(self, job: dict) -> dict:
         return {"status": "manual_required", "url": job.get("url", ""),
@@ -652,6 +703,12 @@ class ApplyAgent:
         a legitimate business outcome rather than a failure. A render timeout
         and a selector change both disappear into it silently.
         """
+        # Closed postings lose their apply control too, and that is not a bug in
+        # our selectors — report it as what it is so the job stops being retried.
+        if await self._looks_expired(page):
+            return {"status": "expired", "url": page.url,
+                    "message": "This posting has closed — it is no longer accepting applications."}
+
         if platform not in (page.url or "").lower():
             return self._external_apply(job)
 
@@ -723,22 +780,58 @@ class ApplyAgent:
                 if (['hidden', 'file', 'submit', 'button'].includes(type)) return;
                 if (!e.offsetParent && type !== 'radio') return;   // not visible
 
+                // The resume chooser is not a screening question. _upload_resume
+                // owns it, and answering it here re-selects a stored resume on
+                // top of the tailored one we just attached.
+                const inResumeBlock = e.closest(
+                    '[class*="resume"], [id*="resume"], [data-test*="resume"]');
+                if (inResumeBlock) return;
+
+                const isChoice = type === 'radio' || type === 'checkbox';
+
                 let q = '';
-                if (e.id) {
+                // A radio's own label is its OPTION ("30 days", or a filename),
+                // never the question — that lives on the group. Read the group
+                // first for choice inputs, or every radio question gets recorded
+                // under the text of whichever option happened to come first.
+                if (isChoice) {
+                    const group = e.closest('fieldset, [role="radiogroup"], [role="group"]');
+                    if (group) {
+                        const legend = group.querySelector('legend');
+                        if (legend) q = (legend.innerText || '').trim();
+                        if (!q) q = (group.getAttribute('aria-label') || '').trim();
+                        if (!q) {
+                            const lb = group.getAttribute('aria-labelledby');
+                            if (lb) {
+                                const el = document.getElementById(lb);
+                                if (el) q = (el.innerText || '').trim();
+                            }
+                        }
+                    }
+                }
+
+                if (!q && e.id) {
                     let l = null;
                     try { l = root.querySelector('label[for="' + CSS.escape(e.id) + '"]'); } catch (_) {}
-                    if (l) q = (l.innerText || '').trim();
+                    if (l && !isChoice) q = (l.innerText || '').trim();
                 }
                 if (!q) q = (e.getAttribute('aria-label') || '').trim();
                 if (!q) {
-                    // nearest ancestor whose text is mostly the question
+                    // Nearest ancestor carrying the question. Prefer a line that
+                    // reads like one — taking line [0] blindly picks up headings
+                    // and option labels that happen to sit above the field.
                     let p = e.parentElement;
                     for (let i = 0; i < 5 && p && !q; i++, p = p.parentElement) {
                         const t = (p.innerText || '').trim();
-                        if (t && t.length > 5 && t.length < 300) q = t.split('\\n')[0].trim();
+                        if (!t || t.length <= 5 || t.length >= 300) continue;
+                        const lines = t.split('\\n').map(s => s.trim()).filter(Boolean);
+                        q = lines.find(s => s.endsWith('?')) ||
+                            lines.sort((a, b) => b.length - a.length)[0] || '';
                     }
                 }
                 if (!q || q.length < 4) return;
+                // A bare filename is never a question.
+                if (/\\.(pdf|docx?|rtf)$/i.test(q)) return;
 
                 if (!e.id) { e.setAttribute('data-jh-id', 'jh' + (n++)); }
                 const opts = e.tagName.toLowerCase() === 'select'
@@ -986,19 +1079,41 @@ class ApplyAgent:
             return await page.query_selector('input[type="file"]')
 
         upload = await _file_input()
-        if not upload:
-            modal = self._modal(page)
-            for name in ("Upload resume", "Upload new resume", "Choose file"):
-                try:
-                    btn = modal.get_by_role("button", name=name, exact=False)
-                    if await btn.count() > 0:
-                        print(f"    revealing file input via '{name}'")
-                        await btn.first.click()
-                        await asyncio.sleep(1.5)
-                        break
-                except Exception:
+        if upload:
+            # Input already in the DOM — setting files directly never opens the
+            # OS dialog at all.
+            try:
+                await upload.set_input_files(pdf_path)
+                await asyncio.sleep(2.5)
+                print(f"    [ok] uploaded tailored resume ({os.path.basename(pdf_path)})")
+                return True
+            except Exception as e:
+                print(f"    direct upload failed: {str(e)[:90]}")
+
+        # Otherwise the input only exists after asking to upload — and that click
+        # opens Chrome's native file chooser, which is an OS window Playwright
+        # cannot reach afterwards: set_input_files does not dismiss it, so it
+        # sits there blocking the browser. expect_file_chooser intercepts the
+        # request so the dialog is never actually shown.
+        modal = self._modal(page)
+        for name in ("Upload resume", "Upload new resume", "Choose file"):
+            try:
+                btn = modal.get_by_role("button", name=name, exact=False)
+                if await btn.count() == 0:
                     continue
-            upload = await _file_input()
+                print(f"    revealing file input via '{name}'")
+                async with page.expect_file_chooser(timeout=10000) as fc_info:
+                    await btn.first.click()
+                chooser = await fc_info.value
+                await chooser.set_files(pdf_path)
+                await asyncio.sleep(2.5)
+                print(f"    [ok] uploaded tailored resume ({os.path.basename(pdf_path)})")
+                return True
+            except Exception as e:
+                print(f"    upload via '{name}' failed: {str(e)[:90]}")
+                continue
+
+        upload = await _file_input()
 
         if not upload:
             # Say so loudly — a silent miss here is what sent months-old resumes.

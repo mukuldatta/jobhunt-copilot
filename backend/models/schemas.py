@@ -23,6 +23,8 @@ class JobStatus(str, Enum):
     reviewed = "reviewed"
     applied = "applied"
     skipped = "skipped"
+    expired = "expired"          # posting closed — terminal, and not yours to finish
+    manual_required = "manual_required"
 
 
 class JobSource(str, Enum):
