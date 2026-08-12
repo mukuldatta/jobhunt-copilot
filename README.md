@@ -125,9 +125,12 @@ cp .env.example .env
 | `APPLY_HUMAN_TIMEOUT` | `300` | Seconds to wait for you to clear a CAPTCHA |
 | `LOGIN_TIMEOUT` | `420` | Seconds to wait for you to finish signing in |
 | `APPLY_DRY_RUN` | unset | Fill forms and screenshot, but never submit |
+| `ALERT_COOLDOWN_SEC` | `900` | Min gap between "solve this CAPTCHA" alerts |
 | `SCORE_DELAY_SEC` | `4` | Pace between scoring calls (free tiers ≈15/min) |
 | `SCORE_PER_RUN` | `60` | Max jobs scored per run |
+| `SCRAPE_CHALLENGE_TIMEOUT` | `180` | Seconds to wait for you to clear a scraper bot check |
 | `NAUKRI_DISABLED` | unset | Skip Naukri (needs a headed browser + local IP) |
+| `GROQ_MODELS` / `GEMINI_MODELS` | see below | Model fallback chains, best quality first |
 
 Screening-question answers come from the **Profile** page, not env vars.
 
@@ -300,9 +303,23 @@ DELETE /profile/questions?question=...
 
 ## Notes and limits
 
-- **Free LLM tiers run out.** Groq's daily token cap and Gemini's quota will
-  stop scoring mid-run. That is handled: jobs are left unscored (never saved as
-  a fake `0`) and retried next cycle, paced by `SCORE_DELAY_SEC` with backoff.
+- **Free LLM tiers meter tokens per model, not per account.** So when the big
+  model hits its daily cap, the smaller ones still have untouched budgets. On a
+  rate limit the app walks every model in the chain before moving to the next
+  provider — roughly six independent buckets instead of one:
+
+  ```
+  groq/llama-3.3-70b → groq/gpt-oss-120b → groq/llama-3.1-8b → groq/gpt-oss-20b
+      → gemini/flash-latest → gemini/flash-lite → anthropic (if a key is set)
+  ```
+
+  If everything is exhausted anyway, jobs are left unscored (never saved as a
+  fake `0`) and retried next cycle, paced by `SCORE_DELAY_SEC` with backoff.
+- **Bot checks pause instead of looping.** Naukri and Indeed sometimes show a
+  Cloudflare/Akamai check. The scraper stops, waits for you to clear it in the
+  visible window, and remembers the clearance cookie in a persistent profile.
+  If nobody clears it, it gives up after two blocked pages rather than grinding
+  through every query.
 - **Many postings are external.** LinkedIn "Apply" (as opposed to "Easy Apply")
   redirects to the company's site; those return `manual_required` rather than a
   fake submission.
