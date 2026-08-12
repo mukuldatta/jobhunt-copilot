@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { X } from '@phosphor-icons/react'
 import { generateOutreach } from '../api'
 
 export default function OutreachModal({ job, onClose }) {
@@ -8,10 +9,16 @@ export default function OutreachModal({ job, onClose }) {
 
   useEffect(() => {
     generateOutreach(job.job_id)
-      .then(res => setMessage(res.data.outreach_message))
-      .catch(() => setMessage('Error generating outreach message.'))
+      .then((res) => setMessage(res.data.outreach_message))
+      .catch(() => setMessage('Could not generate an outreach message.'))
       .finally(() => setLoading(false))
   }, [job.job_id])
+
+  useEffect(() => {
+    const onKey = (e) => e.key === 'Escape' && onClose()
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
 
   function handleCopy() {
     navigator.clipboard.writeText(message)
@@ -19,36 +26,41 @@ export default function OutreachModal({ job, onClose }) {
     setTimeout(() => setCopied(false), 2000)
   }
 
+  const overLimit = message.length > 300
+
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-card border border-border rounded-xl w-full max-w-lg">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border">
-          <h2 className="text-textPrimary font-semibold">LinkedIn Outreach</h2>
-          <button onClick={onClose} className="text-textSecondary hover:text-textPrimary text-xl">&times;</button>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+      <div className="w-full max-w-lg rounded border border-line bg-bg animate-viewIn">
+        <div className="flex items-center justify-between border-b border-line px-6 py-4">
+          <h2 className="text-lg">LinkedIn outreach</h2>
+          <button onClick={onClose} aria-label="Close" className="btn btn-neutral btn-icon">
+            <X size={14} />
+          </button>
         </div>
 
         <div className="p-6">
-          <p className="text-textSecondary text-xs mb-3">{job.company} · {job.title}</p>
+          <p className="mb-3 text-xs+ text-neutral-600">
+            {job.company} · {job.title}
+          </p>
           {loading ? (
-            <div className="text-textSecondary text-center py-6">Generating message...</div>
+            <div className="flex flex-col gap-2">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <div key={i} className="skeleton h-3" style={{ width: `${70 + ((i * 11) % 30)}%` }} />
+              ))}
+            </div>
           ) : (
-            <div className="bg-bg rounded-lg p-4 border border-border">
-              <p className="text-textPrimary text-sm leading-relaxed">{message}</p>
-              <p className={`text-xs mt-2 ${message.length > 300 ? 'text-danger' : 'text-textSecondary'}`}>
-                {message.length} / 300 chars
+            <div className="rounded border border-line p-4">
+              <p className="text-base leading-relaxed text-text">{message}</p>
+              <p className={`mt-2 text-xs ${overLimit ? 'text-accent-400' : 'text-neutral-600'}`}>
+                {message.length} / 300 characters
               </p>
             </div>
           )}
         </div>
 
-        <div className="px-6 py-4 border-t border-border flex justify-end gap-2">
-          <button onClick={handleCopy}
-            className="px-4 py-2 text-sm bg-accent/10 text-accent rounded hover:bg-accent/20 transition-colors">
-            {copied ? 'Copied!' : 'Copy'}
-          </button>
-          <button onClick={onClose}
-            className="px-4 py-2 text-sm bg-border text-textSecondary rounded hover:text-textPrimary transition-colors">
-            Close
+        <div className="flex justify-end gap-2 border-t border-line px-6 py-4">
+          <button onClick={handleCopy} className="btn btn-accent">
+            {copied ? 'Copied' : 'Copy'}
           </button>
         </div>
       </div>

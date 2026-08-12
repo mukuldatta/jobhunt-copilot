@@ -1,23 +1,33 @@
 import { useState, useEffect } from 'react'
+import { X } from '@phosphor-icons/react'
 import { tailorResume, generateCoverLetter, downloadTailoredPdf } from '../api'
 
-export default function ResumeModal({ job, onClose }) {
-  const [tab, setTab] = useState('resume')
+export default function ResumeModal({ job, onClose, initialTab = 'resume' }) {
+  const [tab, setTab] = useState(initialTab)
   const [resumeText, setResumeText] = useState('')
   const [coverText, setCoverText] = useState('')
   const [loading, setLoading] = useState(false)
+  const [copied, setCopied] = useState(false)
 
   useEffect(() => {
-    loadResume()
+    if (initialTab === 'cover') loadCoverLetter()
+    else loadResume()
   }, [])
 
+  useEffect(() => {
+    const onKey = (e) => e.key === 'Escape' && onClose()
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+
   async function loadResume() {
+    if (resumeText) return
     setLoading(true)
     try {
       const res = await tailorResume(job.job_id)
       setResumeText(res.data.tailored_resume)
-    } catch (e) {
-      setResumeText('Error generating tailored resume.')
+    } catch {
+      setResumeText('Could not generate a tailored resume.')
     } finally {
       setLoading(false)
     }
@@ -29,8 +39,8 @@ export default function ResumeModal({ job, onClose }) {
     try {
       const res = await generateCoverLetter(job.job_id)
       setCoverText(res.data.cover_letter)
-    } catch (e) {
-      setCoverText('Error generating cover letter.')
+    } catch {
+      setCoverText('Could not generate a cover letter.')
     } finally {
       setLoading(false)
     }
@@ -39,60 +49,65 @@ export default function ResumeModal({ job, onClose }) {
   function handleTabChange(t) {
     setTab(t)
     if (t === 'cover') loadCoverLetter()
+    else loadResume()
   }
 
-  function copyToClipboard(text) {
-    navigator.clipboard.writeText(text)
+  function copy() {
+    navigator.clipboard.writeText(tab === 'resume' ? resumeText : coverText)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
   }
 
   return (
-    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-      <div className="bg-card border border-border rounded-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border">
-          <div>
-            <h2 className="text-textPrimary font-semibold">{job.title}</h2>
-            <p className="text-textSecondary text-sm">{job.company}</p>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+      <div className="flex max-h-[80vh] w-full max-w-2xl flex-col rounded border border-line bg-bg animate-viewIn">
+        <div className="flex items-center justify-between border-b border-line px-6 py-4">
+          <div className="min-w-0">
+            <h2 className="truncate text-lg">{job.title}</h2>
+            <p className="text-xs+ text-neutral-600">{job.company}</p>
           </div>
-          <button onClick={onClose} className="text-textSecondary hover:text-textPrimary text-xl">&times;</button>
+          <button onClick={onClose} aria-label="Close" className="btn btn-neutral btn-icon">
+            <X size={14} />
+          </button>
         </div>
 
-        <div className="flex gap-1 px-6 pt-4">
-          {['resume', 'cover'].map(t => (
-            <button key={t} onClick={() => handleTabChange(t)}
-              className={`px-4 py-1.5 rounded text-sm font-medium transition-colors ${
-                tab === t ? 'bg-accent/10 text-accent' : 'text-textSecondary hover:text-textPrimary'
-              }`}>
-              {t === 'resume' ? 'Tailored Resume' : 'Cover Letter'}
+        <div className="flex gap-1.5 px-6 pt-4">
+          {[
+            ['resume', 'Tailored resume'],
+            ['cover', 'Cover letter'],
+          ].map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => handleTabChange(key)}
+              className={`chip ${tab === key ? 'chip-on' : 'chip-off'}`}
+            >
+              {label}
             </button>
           ))}
         </div>
 
         <div className="flex-1 overflow-auto p-6">
           {loading ? (
-            <div className="text-textSecondary text-center py-8">Generating with AI...</div>
+            <div className="flex flex-col gap-2">
+              {Array.from({ length: 10 }).map((_, i) => (
+                <div key={i} className="skeleton h-3" style={{ width: `${60 + ((i * 13) % 40)}%` }} />
+              ))}
+            </div>
           ) : (
-            <pre className="text-textPrimary text-xs whitespace-pre-wrap font-mono leading-relaxed">
+            <pre className="whitespace-pre-wrap font-mono text-sm leading-relaxed text-text">
               {tab === 'resume' ? resumeText : coverText}
             </pre>
           )}
         </div>
 
-        <div className="px-6 py-4 border-t border-border flex justify-end gap-2">
+        <div className="flex justify-end gap-2 border-t border-line px-6 py-4">
           {tab === 'resume' && (
-            <button
-              onClick={() => downloadTailoredPdf(job.job_id)}
-              className="px-4 py-2 text-sm bg-success/10 text-success rounded hover:bg-success/20 transition-colors">
+            <button onClick={() => downloadTailoredPdf(job.job_id)} className="btn btn-neutral">
               Download PDF
             </button>
           )}
-          <button
-            onClick={() => copyToClipboard(tab === 'resume' ? resumeText : coverText)}
-            className="px-4 py-2 text-sm bg-accent/10 text-accent rounded hover:bg-accent/20 transition-colors">
-            Copy
-          </button>
-          <button onClick={onClose}
-            className="px-4 py-2 text-sm bg-border text-textSecondary rounded hover:text-textPrimary transition-colors">
-            Close
+          <button onClick={copy} className="btn btn-accent">
+            {copied ? 'Copied' : 'Copy'}
           </button>
         </div>
       </div>

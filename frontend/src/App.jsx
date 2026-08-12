@@ -1,56 +1,35 @@
-import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
-import Dashboard from './pages/Dashboard'
-import Jobs from './pages/Jobs'
-import Applications from './pages/Applications'
-import Profile from './pages/Profile'
-import Settings from './pages/Settings'
-
-const NAV_LINKS = [
-  { to: '/', label: 'Dashboard' },
-  { to: '/jobs', label: 'Jobs' },
-  { to: '/applications', label: 'Applications' },
-  { to: '/profile', label: 'Profile' },
-  { to: '/settings', label: 'Settings' },
-]
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import Sidebar from './components/Sidebar'
+import { AgentProvider } from './hooks/useAgent'
+import Today from './pages/Today'
+import Review from './pages/Review'
+import Pipeline from './pages/Pipeline'
+import Setup from './pages/Setup'
 
 export default function App() {
   return (
     <BrowserRouter>
-      <div className="min-h-screen bg-bg flex">
-        <aside className="w-56 bg-card border-r border-border flex flex-col py-8 px-4 fixed h-full">
-          <div className="mb-10">
-            <h1 className="text-accent text-lg font-bold">JobHunt Copilot</h1>
-            <p className="text-textSecondary text-xs mt-1">AI-powered job search</p>
-          </div>
-          <nav className="flex flex-col gap-2">
-            {NAV_LINKS.map(({ to, label }) => (
-              <NavLink
-                key={to}
-                to={to}
-                end={to === '/'}
-                className={({ isActive }) =>
-                  `px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-                    isActive
-                      ? 'bg-accent/10 text-accent'
-                      : 'text-textSecondary hover:text-textPrimary hover:bg-border'
-                  }`
-                }
-              >
-                {label}
-              </NavLink>
-            ))}
-          </nav>
-        </aside>
-        <main className="ml-56 flex-1 p-8">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/jobs" element={<Jobs />} />
-            <Route path="/applications" element={<Applications />} />
-            <Route path="/profile" element={<Profile />} />
-            <Route path="/settings" element={<Settings />} />
-          </Routes>
-        </main>
-      </div>
+      <AgentProvider>
+        <div className="h-full flex bg-bg text-text">
+          <Sidebar />
+          <main className="flex-1 min-w-0 h-full overflow-hidden">
+            <Routes>
+              <Route path="/" element={<Today />} />
+              <Route path="/review" element={<Review />} />
+              <Route path="/review/:jobId" element={<Review />} />
+              <Route path="/pipeline" element={<Pipeline />} />
+              <Route path="/setup" element={<Navigate to="/setup/you" replace />} />
+              <Route path="/setup/:tab" element={<Setup />} />
+              {/* The five old routes are gone; send any bookmark somewhere real. */}
+              <Route path="/jobs" element={<Navigate to="/review" replace />} />
+              <Route path="/applications" element={<Navigate to="/pipeline" replace />} />
+              <Route path="/profile" element={<Navigate to="/setup/you" replace />} />
+              <Route path="/settings" element={<Navigate to="/setup/boards" replace />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </main>
+        </div>
+      </AgentProvider>
     </BrowserRouter>
   )
 }

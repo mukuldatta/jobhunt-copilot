@@ -6,20 +6,175 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
-  background-color: #0F1117;
-  color: #E0E0E0;
-  font-family: 'Inter', sans-serif;
+  background-color: #161826;
+  color: #e9e9ed;
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 13px;
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Headings carry weight 500, never bolder — hierarchy comes from size and space. */
+h1,
+h2,
+h3 {
+  font-weight: 500;
   margin: 0;
 }
 
 ::-webkit-scrollbar {
-  width: 6px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
-  background: #1A1D2E;
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #2A2D3E;
-  border-radius: 3px;
+  background: rgba(233, 233, 237, 0.16);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(233, 233, 237, 0.28);
+}
+
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid #9184d9;
+  outline-offset: 2px;
+}
+::selection {
+  background: rgba(145, 132, 217, 0.3);
+}
+
+@layer components {
+  /* Buttons are an outline and a label. Two weights: accent (the action this
+     screen is for) and neutral (everything else). */
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded border bg-transparent
+           font-medium transition-[background-color,border-color,color,transform] duration-180 ease-linear
+           disabled:opacity-40 disabled:cursor-not-allowed;
+    font-size: 13px;
+    padding: 7px 14px;
+  }
+  .btn:active:not(:disabled) {
+    transform: scale(0.97);
+    transition-duration: 120ms;
+  }
+  .btn-accent {
+    @apply border-accent text-accent-400;
+  }
+  .btn-accent:hover:not(:disabled) {
+    background: rgba(145, 132, 217, 0.12);
+  }
+  .btn-neutral {
+    @apply border-line text-neutral-500;
+  }
+  .btn-neutral:hover:not(:disabled) {
+    border-color: rgba(233, 233, 237, 0.4);
+    color: #e9e9ed;
+  }
+  .btn-sm {
+    font-size: 12px;
+    padding: 5px 12px;
+  }
+  .btn-sm:active:not(:disabled) {
+    transform: scale(0.96);
+  }
+  .btn-icon {
+    padding: 7px 12px;
+  }
+
+  /* The 11px uppercase label that opens every section. */
+  .section-label {
+    @apply text-xs uppercase text-neutral-600;
+    letter-spacing: 0.08em;
+  }
+
+  /* A bordered box with the value inside — the Setup field, and the read-only
+     twin of an input. */
+  .field-box {
+    @apply w-full rounded border border-line bg-transparent text-base text-text
+           transition-colors duration-180;
+    padding: 8px 11px;
+  }
+  .field-box:hover,
+  .field-box:focus {
+    border-color: rgba(233, 233, 237, 0.4);
+  }
+  .field-box::placeholder {
+    color: #75798c;
+  }
+
+  /* Checkboxes are chips: on = accent outline + check, off = faint outline. */
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded border transition-colors duration-180;
+    font-size: 12.5px;
+    padding: 5px 11px;
+  }
+  .chip-on {
+    @apply border-accent text-accent-400;
+  }
+  .chip-off {
+    @apply border-line text-neutral-600;
+  }
+  .chip-off:hover {
+    border-color: rgba(233, 233, 237, 0.4);
+  }
+
+  /* The freestanding rule fades out at both ends — a Nocturne signature. */
+  .rule-fade {
+    height: 1px;
+    background: linear-gradient(
+      to right,
+      transparent,
+      rgba(233, 233, 237, 0.16) 48px,
+      rgba(233, 233, 237, 0.16) calc(100% - 48px),
+      transparent
+    );
+  }
+
+  /* Skeleton rows while a list loads, instead of centred "Loading…" text. */
+  .skeleton {
+    background: linear-gradient(
+      90deg,
+      rgba(233, 233, 237, 0.06),
+      rgba(233, 233, 237, 0.12),
+      rgba(233, 233, 237, 0.06)
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.4s linear infinite;
+    border-radius: 4px;
+  }
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* Entrance and reveal animations are decoration; hover and press feedback are
+   not. Reduced motion keeps the second kind and drops the first, and the
+   looping run indicators stop — a run still reads as running from its label
+   and its filled button. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .skeleton {
+    animation: none;
+  }
 }
