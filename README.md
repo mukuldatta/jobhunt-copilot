@@ -61,15 +61,18 @@ jobhunt-copilot/
 ├── frontend/
 │   └── src/
 │       ├── pages/
-│       │   ├── Dashboard.jsx     # Stats + trigger scrape/score
-│       │   ├── Jobs.jsx          # Scraped jobs with filters
-│       │   ├── Applications.jsx  # Application tracker
-│       │   ├── Profile.jsx       # Application questionnaire + pending questions
-│       │   └── Settings.jsx      # Resume, platform logins, run auto-apply
-│       └── components/
-│           ├── JobCard.jsx       # Job card with auto-apply
-│           ├── ResumeModal.jsx   # Tailored resume + PDF download
-│           └── OutreachModal.jsx # Outreach message preview
+│       │   ├── Today.jsx         # What the agent did, and what it is blocked on
+│       │   ├── Review.jsx        # Job queue — list pane + detail pane
+│       │   ├── Pipeline.jsx      # Application board, five columns + table view
+│       │   └── Setup.jsx         # You / Resume / Job boards / Agent rules / Saved answers
+│       ├── components/
+│       │   ├── Sidebar.jsx       # Persistent shell + live agent strip
+│       │   ├── FilterMenu.jsx    # Dropdown filter chip
+│       │   ├── JobDetail.jsx     # Score breakdown, gaps, what the agent will do
+│       │   ├── ResumeModal.jsx   # Tailored resume + PDF download
+│       │   └── OutreachModal.jsx # Outreach message preview
+│       ├── hooks/                # Agent polling, reduced motion, scroll reveal
+│       └── lib/format.js         # Ages, locations, score colours
 ├── Dockerfile
 ├── docker-compose.yml
 ├── railway.toml
@@ -170,18 +173,19 @@ pauses and waits for you to solve it in that window.
 
 ## First run
 
-1. **Settings → Upload resume** (PDF). It is parsed for skills and used for
+1. **Setup → Resume** — drop in your PDF. It is parsed for skills and used for
    scoring and tailoring.
-2. **Profile →** fill in notice period, CTC, years per skill, languages. This is
-   what answers screening questions.
-3. **Settings → Login** for Naukri / LinkedIn. A browser window opens — sign in
-   by hand (2FA and CAPTCHA included). **Click Login, not "Sign in with
-   Google"**: Google blocks automated browsers. The session is then saved and
-   reused. **Check** re-probes it live.
-4. **Dashboard → Trigger scrape**, then **Trigger scoring**. Chrome windows open
-   for Naukri and Indeed — that is expected.
-5. **Settings → Dry run** to preview what would be applied to, then **Submit
-   applications**.
+2. **Setup → You** — fill in notice period, CTC, years per skill. This is what
+   answers screening questions.
+3. **Setup → Job boards → Login** for Naukri / LinkedIn. A browser window opens
+   — sign in by hand (2FA and CAPTCHA included). **Click Login, not "Sign in
+   with Google"**: Google blocks automated browsers. The session is then saved
+   and reused. **Check** re-probes it live.
+4. **Setup → Agent rules** — set the minimum score, the daily cap and the per-run
+   cap, and leave **Dry run only** on until you trust the selectors.
+5. **Today → Scrape**, then **Run agent**. Chrome windows open for Naukri and
+   Indeed — that is expected. Anything the agent cannot answer, or a login that
+   has expired, comes back as a row under **Needs you** on Today.
 
 ---
 
@@ -227,8 +231,8 @@ Frontend deploys to Vercel normally (root directory `frontend`, set
 
 ### Auto-apply
 
-1. Sign in once per session via **Settings → Login** (a browser opens; you sign
-   in, the session is saved to a persistent profile and reused)
+1. Sign in once per session via **Setup → Job boards → Login** (a browser opens;
+   you sign in, the session is saved to a persistent profile and reused)
 2. AI tailors your resume + generates a cover letter for the specific job, and
    the resume is validated (no fabricated skills) before submission
 3. Playwright opens the job in your signed-in session and fills the form —
@@ -236,10 +240,11 @@ Frontend deploys to Vercel normally (root directory `frontend`, set
    answer safely (or a CAPTCHA) pauses for you to handle in the window
 4. Submits and records the application
 
-Run it for a batch from **Settings → Check & Submit Applications** (dry-run
-preview, then submit), gated by a daily cap and min-score.
+Run it for a batch with **Run agent** on Today, gated by the daily cap and
+min-score from **Setup → Agent rules**.
 
-Set `APPLY_DRY_RUN=1` to fill forms and screenshot the final step **without
+Set `APPLY_DRY_RUN=1` (or the **Dry run only** toggle in Setup → Agent rules) to
+fill forms and screenshot the final step **without
 ever submitting** — useful when verifying a new form.
 
 ### Answering screening questions
@@ -283,9 +288,13 @@ POST /jobs/{job_id}/cover-letter
 POST /jobs/{job_id}/outreach
 POST /jobs/{job_id}/apply
 POST /jobs/{job_id}/auto-apply
-GET  /applications
+PATCH /jobs/{job_id}/status       # {status} — new / reviewed / applied / skipped
+GET  /applications                # each row joined to its job title, company, score
 PATCH /applications/{id}/status
 GET  /stats
+GET  /agent/state                 # run state, next scheduled run, applied today vs cap
+GET  /settings                    # agent rules, saved overrides layered over env vars
+PUT  /settings                    # save rules; reschedules the auto-apply job at once
 POST /scrape/trigger
 POST /score/trigger
 GET  /auth/status                 # per-platform sign-in state
