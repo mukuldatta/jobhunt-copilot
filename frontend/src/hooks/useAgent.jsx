@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { getAgentState, getStats, getPlatforms } from '../api'
 
 const AgentContext = createContext(null)
@@ -7,6 +7,10 @@ const AgentContext = createContext(null)
 // on its own short interval; the counts beside the nav change far more slowly.
 const STATE_POLL_MS = 5000
 const STATS_POLL_MS = 60000
+// A backend that is down does not recover faster for being asked twelve times
+// a minute. Back off to this while offline, and drop back to normal on the
+// first success.
+const OFFLINE_POLL_MS = 30000
 
 export function AgentProvider({ children }) {
   const [agent, setAgent] = useState({
@@ -23,13 +27,21 @@ export function AgentProvider({ children }) {
   // reads it so the two cannot drift.
   const [applyDisabled, setApplyDisabled] = useState({})
 
+  // setInterval fires on a fixed clock regardless of whether the previous
+  // request finished, so a slow backend used to stack overlapping polls.
+  const inFlight = useRef(false)
+
   const refreshAgent = useCallback(async () => {
+    if (inFlight.current) return
+    inFlight.current = true
     try {
       const res = await getAgentState()
       setAgent(res.data)
       setOffline(false)
     } catch {
       setOffline(true)
+    } finally {
+      inFlight.current = false
     }
   }, [])
 
@@ -50,15 +62,37 @@ export function AgentProvider({ children }) {
   }, [])
 
   useEffect(() => {
-    refreshAgent()
-    refreshStats()
-    const a = setInterval(refreshAgent, STATE_POLL_MS)
-    const s = setInterval(refreshStats, STATS_POLL_MS)
-    return () => {
-      clearInterval(a)
-      clearInterval(s)
+    let stateTimer = null
+    let statsTimer = null
+
+    // A hidden tab has nothing to render, so polling it is pure load on a
+    // backend that may be driving a real browser session at the time.
+    const hidden = () => document.visibilityState === 'hidden'
+
+    const start = () => {
+      stop()
+      if (hidden()) return
+      refreshAgent()
+      refreshStats()
+      stateTimer = setInterval(refreshAgent, offline ? OFFLINE_POLL_MS : STATE_POLL_MS)
+      statsTimer = setInterval(refreshStats, offline ? OFFLINE_POLL_MS : STATS_POLL_MS)
     }
-  }, [refreshAgent, refreshStats])
+
+    const stop = () => {
+      if (stateTimer) clearInterval(stateTimer)
+      if (statsTimer) clearInterval(statsTimer)
+      stateTimer = statsTimer = null
+    }
+
+    start()
+    // Re-entering the tab should show current state immediately, not after a
+    // full interval of staleness.
+    document.addEventListener('visibilitychange', start)
+    return () => {
+      document.removeEventListener('visibilitychange', start)
+      stop()
+    }
+  }, [refreshAgent, refreshStats, offline])
 
   const running = agent.state === 'running' || agent.state === 'paused'
 

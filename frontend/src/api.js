@@ -7,6 +7,49 @@ const api = axios.create({
   timeout: 60000,
 })
 
+const RETRIES = 2
+const RETRY_STATUS = [502, 503, 504]
+
+/**
+ * Retry a GET that failed for reasons unrelated to what was asked.
+ *
+ * Only GETs, and only on a network error or a gateway status — a POST here
+ * tailors a resume or submits an application, and neither is safe to repeat
+ * on a timeout you cannot prove was a timeout.
+ *
+ * Also attaches `userMessage`, so call sites stop rewriting
+ * `e.response?.data?.detail || '...'` — it appeared fourteen times.
+ */
+api.interceptors.response.use(
+  (r) => r,
+  async (error) => {
+    const config = error.config || {}
+    const status = error.response?.status
+    const retriable =
+      config.method === 'get' &&
+      (error.code === 'ECONNABORTED' || !error.response || RETRY_STATUS.includes(status))
+
+    if (retriable) {
+      config._retries = (config._retries || 0) + 1
+      if (config._retries <= RETRIES) {
+        await new Promise((r) => setTimeout(r, 400 * 2 ** (config._retries - 1)))
+        return api(config)
+      }
+    }
+
+    error.userMessage =
+      error.response?.data?.detail ||
+      (error.response
+        ? `Request failed (${status}).`
+        : 'Cannot reach the backend — is it running?')
+    return Promise.reject(error)
+  }
+)
+
+/** The message to show a user for any rejected request from this client. */
+export const errorMessage = (e, fallback = 'Something went wrong.') =>
+  e?.userMessage || e?.response?.data?.detail || e?.message || fallback
+
 export const getJobs = (params) => api.get('/jobs', { params })
 export const getJob = (jobId) => api.get(`/jobs/${jobId}`)
 export const tailorResume = (jobId) => api.post(`/jobs/${jobId}/tailor`)
@@ -26,8 +69,9 @@ export const uploadResume = (file) => {
 }
 
 export const downloadTailoredPdf = (jobId) => {
-  const base = import.meta.env.VITE_API_URL || '/api'
-  window.open(`${base}/jobs/${jobId}/tailor-pdf`, '_blank')
+  // Read the client's own baseURL rather than re-deriving it — two copies of
+  // this expression is two things to keep in step.
+  window.open(`${api.defaults.baseURL}/jobs/${jobId}/tailor-pdf`, '_blank')
 }
 export const autoApply = (jobId) => api.post(`/jobs/${jobId}/auto-apply`)
 

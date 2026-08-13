@@ -51,6 +51,12 @@ as "familiar with" or "exposure to". If the job description asks for something t
 candidate does not have, leave it out entirely — a missing keyword is fine, an invented
 one is fraud and gets this application thrown away.
 
+The same applies to NUMBERS. Never state a quantity the original does not — not years
+of experience, team sizes, percentages, user counts or project counts. If the original
+says two years, it is two years, even where the posting asks for five. Do not round up,
+do not aggregate separate figures into a larger one, and do not add a number where the
+original gave none.
+
 TECHNOLOGIES THE CANDIDATE ACTUALLY HAS (the complete allowed set):
 {inventory}
 {correction}

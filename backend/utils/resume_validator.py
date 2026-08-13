@@ -95,6 +95,70 @@ def _distinctive_tokens(lines: list) -> list:
     return list(toks)
 
 
+# Quantities worth checking — the units a resume inflates with.
+_QUANTITY_RE = re.compile(
+    r"(\d[\d,]*(?:\.\d+)?)\s*\+?\s*"
+    r"(years?|yrs?|%|percent|members?|people|engineers?|developers?|reports?|"
+    r"users?|customers?|clients?|million|billion|lakh|crore|projects?|models?)",
+    re.I,
+)
+
+_WORD_NUMBERS = {
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6",
+    "seven": "7", "eight": "8", "nine": "9", "ten": "10", "eleven": "11",
+    "twelve": "12", "fifteen": "15", "twenty": "20", "thirty": "30", "fifty": "50",
+}
+
+
+def _norm_num(raw: str) -> str:
+    """
+    "1,200" -> "1200", "3.0" -> "3", "2.50" -> "2.5", "100" -> "100".
+
+    Only a value that actually carries a decimal point may lose trailing
+    zeroes. Stripping them unconditionally turns 100 into 1 and 2020 into 202,
+    which is how a resume's graduation year came to vouch for an invented
+    "8 years of experience".
+    """
+    n = (raw or "").replace(",", "")
+    if "." in n:
+        n = n.rstrip("0").rstrip(".")
+    return n or "0"
+
+
+def _numbers_in(text: str) -> set:
+    """Every number the text asserts, digits and words alike."""
+    found = {_norm_num(n) for n in re.findall(r"\d[\d,]*(?:\.\d+)?", text or "")}
+    for word, digit in _WORD_NUMBERS.items():
+        if re.search(rf"(?<![a-z]){word}(?![a-z])", (text or "").lower()):
+            found.add(digit)
+    return found
+
+
+def _invented_quantities(tailored: str, original: str) -> list:
+    """
+    Quantities claimed in the tailored resume that the original never states.
+
+    Only counts numbers attached to a unit — a bare figure in an address or a
+    date is not a claim, and flagging those would defer honest resumes.
+
+    The comparison is document-wide, not per-claim: a number the original uses
+    anywhere licenses it anywhere in the tailored copy. That is deliberate —
+    tightening it to the sentence would defer honest rewording — and it is why
+    the Changes tab exists, so a human reads the additions before submission.
+    """
+    if not original:
+        return []
+    known = _numbers_in(original)
+    invented = []
+    for value, unit in _QUANTITY_RE.findall(tailored or ""):
+        if _norm_num(value) in known:
+            continue
+        claim = f"{value} {unit}"
+        if claim not in invented:
+            invented.append(claim)
+    return invented[:5]
+
+
 def validate_tailored_resume(tailored: str, resume: dict, *, user_name: str = None,
                              user_email: str = None) -> dict:
     """
@@ -128,7 +192,18 @@ def validate_tailored_resume(tailored: str, resume: dict, *, user_name: str = No
         issues.append(f"Introduces skills not in the original resume: {', '.join(added)}")
         escalate("fail")
 
-    # 2) Length sanity (truncation / bloat).
+    # 2) Invented quantities. The skills check above is lexical — it proves no
+    # new technology was named, but it cannot see "led a team of 12" replacing
+    # "led a team of 2", because every word already exists in the original.
+    # Numbers are the exception: inflation lives in them, and they ARE checkable.
+    # A quantity that materialises during tailoring is the sharpest fabrication
+    # signal available.
+    invented = _invented_quantities(cleaned, original)
+    if invented:
+        issues.append(f"States quantities not in the original resume: {', '.join(invented)}")
+        escalate("fail")
+
+    # 3) Length sanity (truncation / bloat).
     if original:
         ratio = len(cleaned) / max(len(original), 1)
         if ratio < 0.45:
@@ -138,7 +213,7 @@ def validate_tailored_resume(tailored: str, resume: dict, *, user_name: str = No
             issues.append(f"{int(ratio * 100)}% of original length — possible bloat/hallucination.")
             escalate("warn")
 
-    # 3) Identity preserved.
+    # 4) Identity preserved.
     if user_name:
         parts = [p for p in user_name.split() if len(p) > 1]
         if parts and not all(p.lower() in cleaned.lower() for p in parts):
@@ -148,7 +223,7 @@ def validate_tailored_resume(tailored: str, resume: dict, *, user_name: str = No
         issues.append("Contact email is missing.")
         escalate("warn")
 
-    # 4) Education preserved.
+    # 5) Education preserved.
     edu_tokens = _distinctive_tokens(resume.get("education") or [])
     if edu_tokens and not any(t in cleaned.lower() for t in edu_tokens):
         issues.append("Education section appears to be dropped.")

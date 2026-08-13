@@ -308,19 +308,10 @@ class ApplyAgent:
 
     # ── Resume ───────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _offending_terms(issues: list) -> list:
-        """
-        Pull the invented skill names back out of the validator's message so the
-        retry can be told exactly what not to say. Mirrors the wording built in
-        utils.resume_validator.validate_tailored_resume.
-        """
-        marker = "Introduces skills not in the original resume:"
-        terms = []
-        for issue in issues or []:
-            if marker in issue:
-                terms += [t.strip() for t in issue.split(marker, 1)[1].split(",") if t.strip()]
-        return terms
+    # The retry-with-avoid-list lives in services.resume_service._offending_terms,
+    # which is the single path that tailors a resume. A copy here went stale —
+    # it only knew the fabricated-skills marker, never the invented-quantities
+    # one — and nothing called it.
 
     async def _make_resume(self, job: dict):
         """

@@ -27,11 +27,18 @@ def _resume_version(resume: dict) -> str:
 
 
 def _offending_terms(issues: list) -> list:
-    marker = "Introduces skills not in the original resume:"
+    """
+    What the retry must be told not to say. Both rejection kinds are fed back —
+    a retry that isn't told what failed is just another roll of the same dice,
+    and a systematic fault would defer the job forever on a loop.
+    """
+    markers = ("Introduces skills not in the original resume:",
+               "States quantities not in the original resume:")
     terms = []
     for issue in issues or []:
-        if marker in issue:
-            terms += [t.strip() for t in issue.split(marker, 1)[1].split(",") if t.strip()]
+        for marker in markers:
+            if marker in issue:
+                terms += [t.strip() for t in issue.split(marker, 1)[1].split(",") if t.strip()]
     return terms
 
 

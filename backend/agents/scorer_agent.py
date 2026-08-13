@@ -5,7 +5,7 @@ import asyncio
 from llm_provider import LLMProvider, RateLimited
 from db.mongodb import get_resume
 from utils.job_parser import truncate_description
-from utils.score_rules import skills_match, location_points, SKILLS_MAX
+from utils.score_rules import skills_match, location_points, SKILLS_MAX, SCORER_VERSION
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -136,6 +136,7 @@ Return only JSON. The numbers are an EXAMPLE of shape, not values to copy:
                 # the model tends to restate the ones it was already shown.
                 "gap_analysis": _dedupe(skills["missing"] + gaps)[:5],
                 "skills_matched": skills["matched"],
+                "scorer_version": SCORER_VERSION,
             }
         except RateLimited as e:
             # Providers are throttled — surface the hint so the caller can back

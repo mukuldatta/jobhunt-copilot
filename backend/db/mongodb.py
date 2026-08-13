@@ -1,8 +1,12 @@
 import os
+import re
+import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 _client: AsyncIOMotorClient = None
 
@@ -47,7 +51,61 @@ async def insert_job(job: dict) -> bool:
     return True
 
 
-_INDIA_CITIES = "India|Hyderabad|Bangalore|Bengaluru|Pune|Chennai|Mumbai|Delhi|Noida|Gurugram|Gurgaon"
+def _india_regex() -> str:
+    from utils.job_parser import india_location_regex
+    return india_location_regex()
+
+
+_INDIA_CITIES = _india_regex()
+
+
+def _jobs_query(
+    min_score: int = None,
+    status: str = None,
+    source: str = None,
+    sponsorship: str = None,
+    search: str = None,
+    region: str = None,
+) -> dict:
+    """The filter shared by get_jobs and count_jobs, so a page and its total
+    can never be counted against different criteria."""
+    query = {}
+    if min_score is not None:
+        query["match_score"] = {"$gte": min_score}
+    if status:
+        query["status"] = status
+    if source:
+        query["source"] = source
+    if sponsorship:
+        query["sponsorship_status"] = sponsorship
+    if search:
+        # Escaped: this is a user-typed string from the Review search box, not a
+        # pattern. Unescaped, a stray "(" is a 500 and a nested quantifier is a
+        # ReDoS aimed at the database.
+        term = re.escape(search)
+        query["$or"] = [
+            {"title": {"$regex": term, "$options": "i"}},
+            {"company": {"$regex": term, "$options": "i"}},
+        ]
+    if region == "india":
+        query["$and"] = query.pop("$and", []) + [{"$or": [
+            {"region": "india"},
+            {"location": {"$regex": _INDIA_CITIES, "$options": "i"}},
+        ]}]
+    elif region == "us":
+        query["$and"] = query.pop("$and", []) + [{"$or": [
+            {"region": "us"},
+            {"region": {"$exists": False}, "location": {"$not": {"$regex": _INDIA_CITIES, "$options": "i"}}},
+        ]}]
+    return query
+
+
+_SORTS = {
+    "date_desc": ("scraped_at", -1),
+    "date_asc": ("scraped_at", 1),
+    "score_desc": ("match_score", -1),
+    "score_asc": ("match_score", 1),
+}
 
 
 async def get_jobs(
@@ -62,43 +120,30 @@ async def get_jobs(
     region: str = None,
 ) -> list:
     db = get_db()
-    query = {}
-    if min_score is not None:
-        query["match_score"] = {"$gte": min_score}
-    if status:
-        query["status"] = status
-    if source:
-        query["source"] = source
-    if sponsorship:
-        query["sponsorship_status"] = sponsorship
-    if search:
-        query["$or"] = [
-            {"title": {"$regex": search, "$options": "i"}},
-            {"company": {"$regex": search, "$options": "i"}},
-        ]
-    if region == "india":
-        query["$and"] = query.pop("$and", []) + [{"$or": [
-            {"region": "india"},
-            {"location": {"$regex": _INDIA_CITIES, "$options": "i"}},
-        ]}]
-    elif region == "us":
-        query["$and"] = query.pop("$and", []) + [{"$or": [
-            {"region": "us"},
-            {"region": {"$exists": False}, "location": {"$not": {"$regex": _INDIA_CITIES, "$options": "i"}}},
-        ]}]
-    sort_map = {
-        "date_desc": ("scraped_at", -1),
-        "date_asc": ("scraped_at", 1),
-        "score_desc": ("match_score", -1),
-        "score_asc": ("match_score", 1),
-    }
-    sort_field, sort_dir = sort_map.get(sort_by, ("scraped_at", -1))
+    query = _jobs_query(min_score, status, source, sponsorship, search, region)
+    sort_field, sort_dir = _SORTS.get(sort_by, ("scraped_at", -1))
     cursor = db.jobs.find(query).sort(sort_field, sort_dir).skip(skip).limit(limit)
     jobs = []
     async for job in cursor:
         job["id"] = str(job.pop("_id"))
         jobs.append(job)
     return jobs
+
+
+async def count_jobs(
+    min_score: int = None,
+    status: str = None,
+    source: str = None,
+    sponsorship: str = None,
+    search: str = None,
+    region: str = None,
+) -> int:
+    """How many jobs match the filter, ignoring the page window. Review showed
+    the page size instead, so a filter matching 400 jobs read as "25+ jobs"."""
+    db = get_db()
+    return await db.jobs.count_documents(
+        _jobs_query(min_score, status, source, sponsorship, search, region)
+    )
 
 
 async def get_job(job_id: str) -> dict:
@@ -115,13 +160,31 @@ async def update_job(job_id: str, updates: dict) -> bool:
     return result.modified_count > 0
 
 
-async def get_unscored_jobs() -> list:
+async def get_jobs_needing_score() -> list:
+    """
+    Never-scored jobs, plus jobs whose score came from a superseded scorer.
+
+    get_apply_candidates requires the current scorer_version, so selecting only
+    match_score None made a version bump permanently drain the apply queue: an
+    old job was neither eligible to apply nor eligible to be re-scored, and
+    nothing else would ever look at it again. Bumping SCORER_VERSION is the
+    migration; this selector is what carries it out.
+
+    Never-scored jobs sort first so a backfill of the archive cannot starve
+    today's scrape behind it.
+    """
+    from utils.score_rules import SCORER_VERSION
+
     db = get_db()
-    cursor = db.jobs.find({"match_score": None})
+    cursor = db.jobs.find({"$or": [
+        {"match_score": None},
+        {"scorer_version": {"$ne": SCORER_VERSION}},
+    ]})
     jobs = []
     async for job in cursor:
         job["id"] = str(job.pop("_id"))
         jobs.append(job)
+    jobs.sort(key=lambda j: j.get("match_score") is not None)
     return jobs
 
 
@@ -165,7 +228,14 @@ async def get_apply_candidates(min_score: int = 70, region: str = "india", limit
     # Never offer a posting a previous run proved we cannot submit. $nin also
     # matches documents with no apply_type at all, which is what we want: an
     # unclassified job is a candidate, and the preflight settles it cheaply.
+    from utils.score_rules import SCORER_VERSION
+
+    # Requiring the current scorer version is the guardrail that makes an armed
+    # batch safe on its own. A score from a superseded scorer is not a weaker
+    # signal, it is an untrusted one — and this queue spends irreversible
+    # applications strictly in score order. Stale jobs re-enter once re-scored.
     query = {"status": "new", "match_score": {"$gte": min_score},
+             "scorer_version": SCORER_VERSION,
              "apply_type": {"$nin": ["external", "expired"]}}
     if exclude_sources:
         query["source"] = {"$nin": list(exclude_sources)}
@@ -198,9 +268,21 @@ async def get_apply_candidates(min_score: int = 70, region: str = "india", limit
 
 
 async def count_applications_today() -> int:
-    from datetime import datetime
+    """
+    Applications since *local* midnight.
+
+    This backs the daily cap and the "applied today" readout in the sidebar.
+    Anchored on UTC midnight it rolled over at 05:30 IST, so a morning's
+    applications counted against the previous day's budget.
+    """
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
     db = get_db()
-    start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    tz = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Kolkata"))
+    start_local = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    # applied_at is stored naive-UTC, so compare against a naive-UTC instant.
+    start = start_local.astimezone(timezone.utc).replace(tzinfo=None)
     return await db.applications.count_documents({
         "applied_at": {"$gte": start},
         "status": {"$ne": "saved"},
@@ -208,20 +290,28 @@ async def count_applications_today() -> int:
 
 
 async def delete_old_jobs(days: int = 7) -> int:
+    """
+    Drop stale postings — but never one an application points at.
+
+    The pipeline board keeps no copy of a job's title or company: it joins back
+    to this collection (see get_applications). Deleting a job you applied to
+    therefore erased the identity of the application too, and a week after
+    applying the board showed a bare job_id. Age alone is not grounds for
+    removal; being spoken for outranks being old.
+    """
     db = get_db()
     from datetime import datetime, timedelta
     cutoff = datetime.utcnow() - timedelta(days=days)
-    result = await db.jobs.delete_many({"scraped_at": {"$lt": cutoff}})
+    spoken_for = await db.applications.distinct("job_id")
+    result = await db.jobs.delete_many({
+        "scraped_at": {"$lt": cutoff},
+        "status": {"$nin": ["applied", "applying"]},
+        "job_id": {"$nin": spoken_for},
+    })
     return result.deleted_count
 
 
 # --- Applications ---
-
-async def insert_application(application: dict) -> str:
-    db = get_db()
-    result = await db.applications.insert_one(application)
-    return str(result.inserted_id)
-
 
 async def get_applications(skip: int = 0, limit: int = 50) -> list:
     db = get_db()
@@ -288,6 +378,21 @@ async def record_application(job_id: str, doc: dict) -> str:
     db = get_db()
     payload = dict(doc)
     payload["job_id"] = job_id
+
+    # Snapshot what you applied to, at the moment you applied. get_applications
+    # otherwise reads these off the live job document, which makes the record of
+    # an application depend on the posting still existing — and postings do go
+    # away (cleanup, or a re-scrape that folds a twin into another row). The
+    # join still runs and still fills gaps; this just means it has nothing left
+    # to fill.
+    if not payload.get("title"):
+        job = await db.jobs.find_one(
+            {"job_id": job_id},
+            {"title": 1, "company": 1, "location": 1, "url": 1,
+             "match_score": 1, "source": 1, "_id": 0},
+        )
+        if job:
+            payload.update({k: v for k, v in job.items() if v is not None})
     result = await db.applications.update_one(
         {"job_id": job_id}, {"$set": payload}, upsert=True
     )
@@ -307,13 +412,23 @@ async def get_application(application_id: str) -> dict:
 
 
 async def update_application(application_id: str, updates: dict) -> bool:
+    """
+    True when the application exists, whether or not the write changed it.
+
+    modified_count is 0 when the new status equals the old one, which made
+    re-selecting the current status in the Pipeline dropdown return a 404 for
+    a row plainly on screen. Existence is the question the caller is asking.
+    """
     from bson import ObjectId
+    from bson.errors import InvalidId
+
     db = get_db()
-    result = await db.applications.update_one(
-        {"_id": ObjectId(application_id)},
-        {"$set": updates}
-    )
-    return result.modified_count > 0
+    try:
+        oid = ObjectId(application_id)
+    except (InvalidId, TypeError):
+        return False
+    result = await db.applications.update_one({"_id": oid}, {"$set": updates})
+    return result.matched_count > 0
 
 
 # --- Resume ---
@@ -353,18 +468,75 @@ async def get_last_run() -> dict:
     return doc or {}
 
 
+async def _ensure_index(coll, keys, name, **opts):
+    """
+    Create one index, reconciling with whatever is already on the collection.
+
+    Matching is on the *key spec*, not the name: an index built by an earlier
+    version (or by hand) carries Mongo's auto-generated name, so asking for the
+    same keys under our name raises IndexOptionsConflict, and dropping by our
+    name finds nothing to drop. Three cases:
+
+      - same keys, same uniqueness  -> nothing to do
+      - same keys, different options -> drop the one that exists, rebuild
+      - a unique index the data cannot satisfy -> fall back to non-unique
+
+    None of these is worth refusing to boot over, so a failure is reported and
+    the app continues with a slower query rather than no app at all.
+    """
+    from pymongo.errors import OperationFailure
+
+    want_unique = bool(opts.get("unique"))
+    existing = await coll.index_information()
+
+    for got_name, info in existing.items():
+        if [tuple(k) for k in info.get("key", [])] != [tuple(k) for k in keys]:
+            continue
+        if bool(info.get("unique")) == want_unique:
+            return                                    # already exactly right
+        logger.info("Index %s.%s: rebuilding as %s", coll.name, got_name,
+                    "unique" if want_unique else "non-unique")
+        await coll.drop_index(got_name)
+        break
+
+    try:
+        await coll.create_index(keys, name=name, **opts)
+    except OperationFailure as e:
+        if not (want_unique and e.code in (11000, 85, 86)):
+            raise
+        # Duplicates already in the collection. The index is still worth having
+        # for speed; uniqueness needs the duplicates cleaned up first.
+        logger.warning(
+            "Index %s.%s: duplicates present, creating non-unique instead (%s)",
+            coll.name, name, e,
+        )
+        await coll.create_index(keys, name=name)
+
+
 async def ensure_indexes():
     """
     Indexes for the queries that run on every cycle. get_apply_candidates
     filters on status + score + apply_type and sorts by score, which is a
     collection scan and an in-memory sort without this.
+
+    jobs.job_id is the hottest lookup in the application — insert_job, get_job,
+    update_job, claim_job_for_apply, finish_job_apply and the get_applications
+    join all key on it — and it is unique by construction, so the index both
+    speeds those up and closes the read-then-write race in insert_job.
     """
     db = get_db()
-    await db.jobs.create_index([("status", 1), ("match_score", -1)], name="apply_candidates")
-    await db.jobs.create_index([("apply_type", 1)], name="apply_type")
-    await db.jobs.create_index([("source", 1), ("match_score", -1)], name="source_score")
-    await db.applications.create_index([("job_id", 1)], name="job_id")
-    await db.runs.create_index([("finished_at", -1)], name="recent_runs")
+    await _ensure_index(db.jobs, [("job_id", 1)], "job_id", unique=True)
+    await _ensure_index(db.jobs, [("dedup_key", 1)], "dedup_key")
+    await _ensure_index(db.jobs, [("scraped_at", -1)], "scraped_at")
+    await _ensure_index(db.jobs, [("match_score", -1)], "match_score")
+    await _ensure_index(db.jobs, [("status", 1), ("match_score", -1)], "apply_candidates")
+    await _ensure_index(db.jobs, [("apply_type", 1)], "apply_type")
+    await _ensure_index(db.jobs, [("source", 1), ("match_score", -1)], "source_score")
+    await _ensure_index(db.applications, [("job_id", 1)], "job_id", unique=True)
+    await _ensure_index(db.applications, [("applied_at", -1)], "applied_at")
+    await _ensure_index(db.applications, [("status", 1)], "status")
+    await _ensure_index(db.pending_questions, [("question_norm", 1)], "question_norm")
+    await _ensure_index(db.runs, [("finished_at", -1)], "recent_runs")
 
 
 # --- Agent rules (Setup > Agent rules) ---
@@ -476,14 +648,29 @@ async def get_stats() -> dict:
         db = get_db()
     except RuntimeError:
         return {"total_jobs": 0, "high_match": 0, "medium_match": 0, "low_match": 0, "applied": 0, "interviews": 0, "last_scraped": None}
+
+    # "Worth reviewing" has to mean the same thing here as it does to the agent.
+    # These bands were fixed at 70/50 while min_score became a setting, so
+    # lowering the threshold to 60 left the dashboard still counting from 70 —
+    # the number on Today disagreed with the queue it linked to.
+    from services.settings_service import get_agent_rules
+    threshold = (await get_agent_rules())["min_score"]
+    medium_floor = max(0, threshold - 20)
+
     total = await db.jobs.count_documents({})
-    high = await db.jobs.count_documents({"match_score": {"$gte": 70}})
-    medium = await db.jobs.count_documents({"match_score": {"$gte": 50, "$lt": 70}})
-    low = await db.jobs.count_documents({"match_score": {"$lt": 50, "$ne": None}})
+    high = await db.jobs.count_documents({"match_score": {"$gte": threshold}})
+    medium = await db.jobs.count_documents({"match_score": {"$gte": medium_floor, "$lt": threshold}})
+    low = await db.jobs.count_documents({"match_score": {"$lt": medium_floor, "$ne": None}})
     applied = await db.applications.count_documents({"status": {"$ne": "saved"}})
     interviews = await db.applications.count_documents({
         "status": {"$in": ["recruiter_screen", "technical", "final_round"]}
     })
+    # Today's header counted this by fetching 200 job documents and filtering
+    # them in the browser. It is one indexed count.
+    from datetime import datetime, timedelta
+    since = datetime.utcnow() - timedelta(hours=24)
+    new_last_24h = await db.jobs.count_documents({"scraped_at": {"$gte": since}})
+
     last_job = await db.jobs.find_one({}, sort=[("scraped_at", -1)])
     return {
         "total_jobs": total,
@@ -492,5 +679,6 @@ async def get_stats() -> dict:
         "low_match": low,
         "applied": applied,
         "interviews": interviews,
+        "new_last_24h": new_last_24h,
         "last_scraped": last_job["scraped_at"] if last_job else None,
     }

@@ -26,6 +26,18 @@ GEMINI_MODEL = GEMINI_MODELS[0]          # back-compat for existing imports
 
 ANTHROPIC_MODELS = ["claude-haiku-4-5-20251001"]
 
+# No client here set a timeout, so a provider that accepted the connection and
+# then went quiet blocked the asyncio.to_thread worker forever. During an apply
+# run that is the whole cycle: the browser sits on a half-filled form until the
+# process is killed. A bounded failure can fall through to the next model; an
+# unbounded wait cannot.
+LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "90"))
+
+# A tailored resume runs well past 2048 tokens. Truncated output then trips the
+# validator's "likely truncated" check, so the job defers and the run reports a
+# resume problem that was really an output-length problem.
+MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+
 
 def _models_for(provider: str) -> list:
     return {"groq": GROQ_MODELS, "gemini": GEMINI_MODELS,
@@ -98,10 +110,11 @@ class LLMProvider:
                 model=model, messages=[{"role": "user", "content": prompt}])
             return r.choices[0].message.content.strip()
         if self.provider == "gemini":
-            return genai.GenerativeModel(model).generate_content(prompt).text.strip()
+            return genai.GenerativeModel(model).generate_content(
+                prompt, request_options={"timeout": LLM_TIMEOUT_SEC}).text.strip()
         if self.provider == "anthropic":
             r = self.client.messages.create(
-                model=model, max_tokens=2048,
+                model=model, max_tokens=MAX_TOKENS,
                 messages=[{"role": "user", "content": prompt}])
             return r.content[0].text.strip()
         raise Exception(f"Unknown provider '{self.provider}'")
@@ -165,9 +178,11 @@ class LLMProvider:
         self.provider = provider
         self.model = (_models_for(provider) or [None])[0]
         if provider == "groq":
-            self.client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+            self.client = Groq(api_key=os.environ.get("GROQ_API_KEY"),
+                               timeout=LLM_TIMEOUT_SEC)
         elif provider == "gemini":
             genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
             self.client = None            # model chosen per call
         elif provider == "anthropic":
-            self.client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+            self.client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"),
+                                              timeout=LLM_TIMEOUT_SEC)

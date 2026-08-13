@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import {
   HandWaving,
@@ -17,7 +17,9 @@ import {
   triggerScrape,
   runAutoApply,
   platformLogin,
+  errorMessage,
 } from '../api'
+import { useToast } from '../components/Toast'
 import { useAgent } from '../hooks/useAgent'
 import { useReducedMotion, useReveal, stagger } from '../hooks/useMotion'
 import { clockTime, scoreFill, scoreText, shortLocation, weekday } from '../lib/format'
@@ -61,9 +63,17 @@ export default function Today() {
   const [questions, setQuestions] = useState([])
   const [platforms, setPlatforms] = useState([])
   const [topJobs, setTopJobs] = useState([])
-  const [newToday, setNewToday] = useState(null)
   const [busy, setBusy] = useState(null)
   const [error, setError] = useState(null)
+  const [loading, setLoading] = useState(true)
+
+  const notify = useToast()
+
+  // Sign-in finishes in a browser window outside this app, so we re-check
+  // twice while that is likely happening. Tracked so navigating away cancels
+  // them rather than calling setState on an unmounted screen.
+  const pending = useRef([])
+  useEffect(() => () => pending.current.forEach(clearTimeout), [])
 
   const load = useCallback(async () => {
     const [q, a, j] = await Promise.allSettled([
@@ -77,23 +87,16 @@ export default function Today() {
     if (q.status === 'rejected' && a.status === 'rejected' && j.status === 'rejected') {
       setError('Could not reach the backend — is it running on port 8000?')
     }
+    setLoading(false)
   }, [])
 
   useEffect(() => {
     load()
   }, [load])
 
-  // How many arrived since this time yesterday — the "n new jobs" in the header.
-  useEffect(() => {
-    const since = new Date(Date.now() - 24 * 3600 * 1000)
-    getJobs({ limit: 200, sort_by: 'date_desc' })
-      .then((r) =>
-        setNewToday(
-          (r.data.jobs || []).filter((j) => new Date(j.scraped_at || j.posted_at) >= since).length
-        )
-      )
-      .catch(() => setNewToday(null))
-  }, [])
+  // The header's "n new jobs" is now one indexed count from /stats. It used to
+  // fetch 200 job documents and filter them here to arrive at one integer.
+  const newToday = stats?.new_last_24h ?? null
 
   async function handleScrape() {
     setBusy('scrape')
@@ -101,8 +104,12 @@ export default function Today() {
     try {
       await triggerScrape({ max_jobs: 50 })
       await refreshAgent()
+      // The scrape is what fills this list; without reloading, the screen that
+      // prompted the action was the one place that never showed its result.
+      await load()
+      refreshStats()
     } catch (e) {
-      setError(e.response?.data?.detail || 'Could not start a scrape.')
+      notify.err(errorMessage(e, 'Could not start a scrape.'), { retry: handleScrape })
     } finally {
       setBusy(null)
     }
@@ -116,7 +123,7 @@ export default function Today() {
       await refreshAgent()
       refreshStats()
     } catch (e) {
-      setError(e.response?.data?.detail || 'Could not start the agent.')
+      notify.err(errorMessage(e, 'Could not start the agent.'), { retry: handleRun })
     } finally {
       setBusy(null)
     }
@@ -125,10 +132,10 @@ export default function Today() {
   async function handleLogin(platform) {
     try {
       await platformLogin(platform)
-      setTimeout(load, 8000)
-      setTimeout(load, 30000)
+      notify.ok(`Sign in to ${PLATFORM_LABELS[platform] || platform} in the browser window that just opened.`)
+      pending.current.push(setTimeout(load, 8000), setTimeout(load, 30000))
     } catch (e) {
-      setError(e.response?.data?.detail || `Could not start the ${platform} sign-in.`)
+      notify.err(errorMessage(e, `Could not start the ${platform} sign-in.`))
     }
   }
 
@@ -168,7 +175,9 @@ export default function Today() {
         (paused.waiting_seconds || 0) / 60
       )}m`,
       action: 'Open window',
-      onAction: () => setError('Bring the open browser window to the front and clear the challenge.'),
+      // Information, not a failure — it went through the error banner before.
+      onAction: () =>
+        notify.ok('Bring the open browser window to the front and clear the challenge.'),
     })
   }
 
@@ -182,7 +191,9 @@ export default function Today() {
           <p className="mt-1 text-base text-neutral-500">
             {lastScrape ? `Last scrape ${lastScrape}` : 'No scrape yet'}
             {newToday != null && ` · ${newToday} new jobs`}
-            {stats && ` · ${stats.low_match + stats.medium_match + stats.high_match} scored`}
+            {/* Each band is guarded: one missing field rendered "NaN scored". */}
+            {stats &&
+              ` · ${(stats.low_match || 0) + (stats.medium_match || 0) + (stats.high_match || 0)} scored`}
           </p>
         </div>
         <div className="flex flex-none gap-2">
@@ -197,7 +208,7 @@ export default function Today() {
             onClick={handleRun}
             disabled={busy === 'run' || running}
             className="btn btn-accent"
-            style={running ? { background: 'rgba(145,132,217,.12)' } : undefined}
+            style={running ? { background: 'var(--accent-wash)' } : undefined}
           >
             {running || busy === 'run' ? (
               <CircleNotch size={14} className={reduced ? '' : 'animate-spin360'} />
@@ -219,14 +230,14 @@ export default function Today() {
       )}
 
       {needs.length > 0 && (
-        <div
-          className="relative mb-6 overflow-hidden rounded border border-line px-[18px] py-4"
-          style={{ background: 'linear-gradient(180deg,rgba(35,37,50,.9),rgba(22,24,38,.9))' }}
-        >
+        // No fill: bg is the only background in Nocturne, and elevation is an
+        // edge. This panel carried the app's one gradient card, in two colours
+        // that are not in the palette. The accent edge does the emphasis.
+        <div className="relative mb-6 overflow-hidden rounded border border-accent/40 px-[18px] py-4">
           {running && !reduced && (
             <div
               className="absolute left-0 top-0 h-px w-[30%] animate-sweep"
-              style={{ background: 'linear-gradient(90deg,transparent,#9184d9,transparent)' }}
+              style={{ background: 'linear-gradient(90deg,transparent,var(--accent),transparent)' }}
             />
           )}
           <div className="mb-3 flex flex-wrap items-center gap-2.5">
@@ -291,7 +302,16 @@ export default function Today() {
       </div>
 
       <div className="overflow-hidden rounded border border-line">
-        {topJobs.length === 0 ? (
+        {/* Pending is not the same as empty. topJobs starts [], so the first
+            paint used to assert "nothing to review" before the request had
+            even returned — the wrong message, not just a missing one. */}
+        {loading ? (
+          <div className="flex flex-col gap-3 px-4 py-4">
+            {Array.from({ length: 3 }).map((_, i) => (
+              <div key={i} className="skeleton h-3.5" style={{ width: `${55 + ((i * 17) % 35)}%` }} />
+            ))}
+          </div>
+        ) : topJobs.length === 0 ? (
           <p className="px-4 py-6 text-base text-neutral-600">
             Nothing new to review. Run a scrape to fetch more.
           </p>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getApplications, updateApplicationStatus } from '../api'
+import { getApplications, updateApplicationStatus, errorMessage } from '../api'
+import { useToast } from '../components/Toast'
 import { useReducedMotion } from '../hooks/useMotion'
 import { agoLabel, scoreText, titleCase } from '../lib/format'
 
@@ -74,16 +75,35 @@ export default function Pipeline() {
   const [error, setError] = useState(null)
   const [dragOver, setDragOver] = useState(null)
 
-  const load = useCallback(() => {
-    setLoading(true)
-    getApplications({ limit: 200 })
-      .then((r) => setApps(r.data.applications || []))
-      .catch((e) => setError(e.response?.data?.detail || 'Could not load applications.'))
+  const notify = useToast()
+
+  // silent: a background refresh must not blank the board it is refreshing.
+  const load = useCallback((silent = false) => {
+    if (!silent) setLoading(true)
+    return getApplications({ limit: 200 })
+      .then((r) => {
+        setApps(r.data.applications || [])
+        setError(null)
+      })
+      .catch((e) => setError(errorMessage(e, 'Could not load applications.')))
       .finally(() => setLoading(false))
   }, [])
 
   useEffect(() => {
     load()
+  }, [load])
+
+  // The agent applies to jobs while this page sits open, and nothing here ever
+  // refetched — the board silently diverged from what had actually happened.
+  // Refreshing on focus catches up without polling.
+  useEffect(() => {
+    const onFocus = () => document.visibilityState === 'visible' && load(true)
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onFocus)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onFocus)
+    }
   }, [load])
 
   const grouped = useMemo(() => {
@@ -110,7 +130,9 @@ export default function Pipeline() {
       await updateApplicationStatus(app.id, { status })
     } catch (e) {
       setApps((prev) => prev.map((a) => (a.id === app.id ? { ...a, status: previous } : a)))
-      setError(e.response?.data?.detail || 'Could not update that application.')
+      notify.err(errorMessage(e, 'Could not update that application.'), {
+        retry: () => changeStatus(app, status),
+      })
     }
   }
 

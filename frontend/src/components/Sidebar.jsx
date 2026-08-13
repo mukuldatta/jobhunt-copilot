@@ -91,7 +91,7 @@ export default function Sidebar() {
             className={`w-1.5 h-1.5 rounded-full bg-accent flex-none ${
               running && !reduced ? 'animate-dotPulse' : ''
             }`}
-            style={running && !reduced ? undefined : { boxShadow: '0 0 0 3px rgba(145,132,217,.18)' }}
+            style={running && !reduced ? undefined : { boxShadow: '0 0 0 3px var(--accent-glow)' }}
           />
           <span className="hidden lg:inline">{statusLine(agent)}</span>
         </div>

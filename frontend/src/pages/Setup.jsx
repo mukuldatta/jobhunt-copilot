@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { NavLink, useParams } from 'react-router-dom'
 import { Check, Plus, X } from '@phosphor-icons/react'
 import {
@@ -14,8 +14,10 @@ import {
   platformCheck,
   getSettings,
   saveSettings,
+  errorMessage,
 } from '../api'
 import { useReducedMotion } from '../hooks/useMotion'
+import { useToast } from '../components/Toast'
 
 const TABS = [
   { slug: 'you', label: 'You' },
@@ -27,11 +29,18 @@ const TABS = [
 
 const PLATFORM_LABELS = { naukri: 'Naukri', linkedin: 'LinkedIn', indeed: 'Indeed', dice: 'Dice' }
 
+let fieldSeq = 0
+
 function Field({ label, value, onChange, placeholder, type = 'text' }) {
+  // Without htmlFor/id the label was decoration — clicking it did nothing.
+  const id = useRef(`field-${fieldSeq++}`).current
   return (
     <div>
-      <label className="mb-[5px] block text-xs+ text-neutral-600">{label}</label>
+      <label htmlFor={id} className="mb-[5px] block text-xs+ text-neutral-600">
+        {label}
+      </label>
       <input
+        id={id}
         type={type}
         value={value ?? ''}
         placeholder={placeholder}
@@ -45,7 +54,13 @@ function Field({ label, value, onChange, placeholder, type = 'text' }) {
 /** Checkboxes become chips: on = accent outline + check, off = faint outline. */
 function Toggle({ label, on, onChange }) {
   return (
-    <button type="button" onClick={() => onChange(!on)} className={`chip ${on ? 'chip-on' : 'chip-off'}`}>
+    <button
+      type="button"
+      role="switch"
+      aria-checked={!!on}
+      onClick={() => onChange(!on)}
+      className={`chip ${on ? 'chip-on' : 'chip-off'}`}
+    >
       {on && <Check size={12} />}
       {label}
     </button>
@@ -91,6 +106,16 @@ export default function Setup() {
   const [file, setFile] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [checking, setChecking] = useState(null)
+  const [answersDirty, setAnswersDirty] = useState(false)
+
+  const notify = useToast()
+
+  // Sign-in happens in a browser window outside this app, so there is nothing
+  // to await — we re-check twice while you are likely to be finishing. The
+  // timers are tracked so leaving the page cancels them instead of calling
+  // setState on an unmounted screen.
+  const pending = useRef([])
+  useEffect(() => () => pending.current.forEach(clearTimeout), [])
 
   const load = useCallback(async () => {
     const [p, s, r, a, q] = await Promise.allSettled([
@@ -105,6 +130,7 @@ export default function Setup() {
       setSkillRows(Object.entries(p.value.data.skill_years || {}).map(([k, v]) => ({ k, v })))
     } else {
       setMessage('Could not load your profile — is the backend running?')
+      setAnswersDirty(false)
     }
     if (s.status === 'fulfilled') setRules(s.value.data)
     if (r.status === 'fulfilled') setResume(r.value.data)
@@ -128,8 +154,10 @@ export default function Setup() {
       })
       await saveProfile({ ...profile, skill_years })
       setSavedAt('Saved just now')
+      setAnswersDirty(false)
+      notify.ok('Profile saved.')
     } catch (e) {
-      setMessage(e.response?.data?.detail || 'Save failed.')
+      notify.err(errorMessage(e, 'Save failed.'), { retry: saveProfileTab })
     } finally {
       setSaving(false)
     }
@@ -142,8 +170,9 @@ export default function Setup() {
       const res = await saveSettings(rules)
       setRules(res.data)
       setSavedAt('Saved just now')
+      notify.ok('Agent rules saved.')
     } catch (e) {
-      setMessage(e.response?.data?.detail || 'Save failed.')
+      notify.err(errorMessage(e, 'Save failed.'), { retry: saveRules })
     } finally {
       setSaving(false)
     }
@@ -156,11 +185,11 @@ export default function Setup() {
     setMessage(null)
     try {
       const res = await uploadResume(target)
-      setMessage(`Resume uploaded — ${res.data.skills_found} skills found.`)
+      notify.ok(`Resume uploaded — ${res.data.skills_found} skills found.`)
       const r = await getResume()
       setResume(r.data)
     } catch (e) {
-      setMessage(e.response?.data?.detail || 'Upload failed.')
+      notify.err(errorMessage(e, 'Upload failed.'), { retry: () => handleUpload(target) })
     } finally {
       setUploading(false)
     }
@@ -175,7 +204,9 @@ export default function Setup() {
         prev.map((p) => (p.platform === platform ? { ...p, logged_in: res.data.logged_in } : p))
       )
     } catch (e) {
-      setMessage(e.response?.data?.detail || `Could not check ${platform}.`)
+      notify.err(errorMessage(e, `Could not check ${platform}.`), {
+        retry: () => handleCheck(platform),
+      })
     } finally {
       setChecking(null)
     }
@@ -185,20 +216,33 @@ export default function Setup() {
     setMessage(null)
     try {
       const res = await platformLogin(platform)
-      setMessage(res.data.message)
-      setTimeout(load, 8000)
-      setTimeout(load, 30000)
+      notify.ok(res.data.message)
+      pending.current.push(setTimeout(load, 8000), setTimeout(load, 30000))
     } catch (e) {
-      setMessage(e.response?.data?.detail || `Could not start the ${platform} sign-in.`)
+      notify.err(errorMessage(e, `Could not start the ${platform} sign-in.`))
     }
   }
+
+  // Only the two things an answer changes, rather than re-running all five
+  // requests to reflect one row.
+  const refreshAnswers = useCallback(async () => {
+    const [q, p] = await Promise.allSettled([getPendingQuestions(), getProfile()])
+    if (q.status === 'fulfilled') setQuestions(q.value.data.questions || [])
+    if (p.status === 'fulfilled') setProfile(p.value.data)
+  }, [])
 
   async function handleAnswer(question) {
     const answer = (drafts[question] || '').trim()
     if (!answer) return
-    await answerQuestion(question, answer)
-    setDrafts((d) => ({ ...d, [question]: '' }))
-    load()
+    try {
+      await answerQuestion(question, answer)
+      setDrafts((d) => ({ ...d, [question]: '' }))
+      await refreshAnswers()
+    } catch (e) {
+      notify.err(errorMessage(e, 'Could not save that answer.'), {
+        retry: () => handleAnswer(question),
+      })
+    }
   }
 
   const savedAnswers = profile?.qa || []
@@ -455,7 +499,7 @@ export default function Setup() {
                           p.logged_in ? 'bg-accent' : 'bg-neutral-700'
                         }`}
                         style={
-                          p.logged_in ? { boxShadow: '0 0 0 3px rgba(145,132,217,.18)' } : undefined
+                          p.logged_in ? { boxShadow: '0 0 0 3px var(--accent-glow)' } : undefined
                         }
                       />
                       <span className="text-base">{PLATFORM_LABELS[p.platform] || p.platform}</span>
@@ -574,7 +618,11 @@ export default function Setup() {
                             Save
                           </button>
                           <button
-                            onClick={() => dismissQuestion(q.question).then(load)}
+                            onClick={() =>
+                              dismissQuestion(q.question)
+                                .then(refreshAnswers)
+                                .catch((e) => notify.err(errorMessage(e, 'Could not dismiss that.')))
+                            }
                             className="btn btn-neutral btn-sm"
                           >
                             Dismiss
@@ -607,23 +655,25 @@ export default function Setup() {
                       <div className="flex-1 text-base text-neutral-500">{entry.question}</div>
                       <input
                         value={entry.answer}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          setAnswersDirty(true)
                           setProfile((prev) => ({
                             ...prev,
                             qa: prev.qa.map((x, j) =>
                               j === i ? { ...x, answer: e.target.value } : x
                             ),
                           }))
-                        }
+                        }}
                         className="field-box w-48 py-1 text-sm"
                       />
                       <button
-                        onClick={() =>
+                        onClick={() => {
+                          setAnswersDirty(true)
                           setProfile((prev) => ({
                             ...prev,
                             qa: prev.qa.filter((_, j) => j !== i),
                           }))
-                        }
+                        }}
                         aria-label="Remove answer"
                         className="mt-1.5 text-neutral-700 hover:text-text"
                       >
@@ -634,7 +684,10 @@ export default function Setup() {
                 </div>
               )}
 
-              {savedAnswers.length > 0 && (
+              {/* Also shown when the list is empty but dirty. Gating purely on
+                  length meant deleting your last answer unmounted the Save
+                  button, so that one deletion could never be persisted. */}
+              {(savedAnswers.length > 0 || answersDirty) && (
                 <div className="mt-6">
                   <SaveRow onSave={saveProfileTab} saving={saving} savedAt={savedAt} />
                 </div>

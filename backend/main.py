@@ -6,18 +6,39 @@ sys.path.insert(0, os.path.dirname(__file__))
 # The apply agent narrates itself with print(). Under a process manager stdout
 # is a pipe, not a TTY, so those lines sit in a block buffer and a run that
 # fails looks like a run that produced nothing at all.
-sys.stdout.reconfigure(line_buffering=True)
+#
+# The encoding is here for the same reason: on Windows stdout defaults to the
+# ANSI codepage, so an em dash in a status line came out as "needs_review ?" and
+# an emoji could raise UnicodeEncodeError mid-run. errors="replace" means the
+# worst case is one mangled character rather than a lost log line.
+sys.stdout.reconfigure(line_buffering=True, encoding="utf-8", errors="replace")
+
+# The scheduler, orchestrator and scoring service narrate their runs through
+# logging rather than print(). Without a root handler configured, the root
+# logger sits at WARNING and every one of those lines was discarded — the
+# agent worked in total silence, which is the one thing an unattended agent
+# must not do.
+import logging
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 from contextlib import asynccontextmanager
+import asyncio
+import re
 import tempfile
 from dotenv import load_dotenv
 
 from db.mongodb import (
-    get_jobs, get_job, update_job,
-    get_applications, get_application, insert_application, update_application,
+    get_jobs, count_jobs, get_job, update_job,
+    get_applications, record_application, update_application,
     get_resume, save_resume, get_stats,
 )
 from models.schemas import (
@@ -27,8 +48,6 @@ from models.schemas import (
 from utils.resume_parser import parse_resume_pdf
 from utils.pdf_generator import generate_resume_pdf
 from agents.scraper_agent import ScraperAgent
-from agents.scorer_agent import ScorerAgent
-from agents.tailor_agent import TailorAgent
 from agents.cover_letter_agent import CoverLetterAgent
 from agents.outreach_agent import OutreachAgent
 from agents.apply_agent import ApplyAgent
@@ -42,8 +61,10 @@ async def lifespan(app: FastAPI):
     try:
         from db.mongodb import ensure_indexes
         await ensure_indexes()
-    except Exception as e:
-        print(f"Index setup skipped ({e}) — the app still runs, queries are just slower.")
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Index setup skipped — the app still runs, queries are just slower."
+        )
     await setup_scheduler()
     yield
     scheduler.shutdown()
@@ -56,9 +77,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# This API has no auth in front of it, and it serves your parsed resume, your
+# answers to screening questions, and a POST that drives a real browser session.
+# "*" was harmless while it only ever listened on localhost; it stops being
+# harmless the first time this is deployed. Dev needs nothing set — the Vite
+# proxy makes those calls same-origin anyway. Set CORS_ORIGINS (comma separated)
+# when the frontend is served from somewhere else.
+CORS_ORIGINS = [
+    o.strip() for o in os.environ.get(
+        "CORS_ORIGINS",
+        os.environ.get("FRONTEND_URL", "http://localhost:3000,http://localhost:5173"),
+    ).split(",") if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -90,8 +124,17 @@ async def upload_resume(file: UploadFile = File(...)):
         tmp.write(content)
         tmp_path = tmp.name
 
-    parsed = parse_resume_pdf(tmp_path)
-    os.unlink(tmp_path)
+    # pdfplumber is synchronous CPU work; off the event loop it would stall
+    # every other request, including the sidebar's 5-second poll.
+    try:
+        parsed = await asyncio.to_thread(parse_resume_pdf, tmp_path)
+    finally:
+        # Not conditional on success: a parse failure used to leak the temp PDF.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
     await save_resume(parsed)
     return {"message": "Resume uploaded and parsed", "skills_found": len(parsed["skills"])}
 
@@ -115,7 +158,13 @@ async def list_jobs(
         source=source, sponsorship=sponsorship, sort_by=sort_by, search=search,
         region=region,
     )
-    return {"jobs": jobs, "count": len(jobs)}
+    # count is this page; total is the whole filtered set, which is what the
+    # header in Review is actually reporting.
+    total = await count_jobs(
+        min_score=min_score, status=status, source=source,
+        sponsorship=sponsorship, search=search, region=region,
+    )
+    return {"jobs": jobs, "count": len(jobs), "total": total}
 
 
 @app.get("/jobs/{job_id}")
@@ -167,15 +216,29 @@ async def download_tailored_pdf(job_id: str):
         user_name=f"{os.environ.get('USER_FIRST_NAME', '')} "
                   f"{os.environ.get('USER_LAST_NAME', '')}".strip() or None,
         user_email=os.environ.get("MY_EMAIL"))
+    # Same distinction the preview route draws: quota exhaustion is a "come
+    # back shortly", not a rejected document. This route used to report both
+    # as 422, so a rate limit looked like a failed integrity check.
+    if built["rate_limited"]:
+        raise HTTPException(status_code=429,
+                            detail="LLM quota exhausted — try again shortly.")
     if not built["ok"]:
         raise HTTPException(status_code=422,
                             detail=f"Tailored resume unavailable: {'; '.join(built['issues'])}")
     tailored_text = built["text"]
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.close()
-    generate_resume_pdf(tailored_text, tmp.name)
-    filename = f"resume_{job.get('company', 'job').replace(' ', '_')}.pdf"
-    return FileResponse(tmp.name, media_type="application/pdf", filename=filename)
+    # fpdf2 is synchronous CPU work — same reasoning as the upload route.
+    await asyncio.to_thread(generate_resume_pdf, tailored_text, tmp.name)
+    # The company name reaches a Content-Disposition header, so keep it to
+    # characters that cannot break out of the filename.
+    safe_company = re.sub(r"[^A-Za-z0-9]+", "_", job.get("company") or "job").strip("_")
+    filename = f"resume_{safe_company or 'job'}.pdf"
+    # delete=False is required (the file has to outlive this handler so it can be
+    # streamed), so the cleanup has to be scheduled — otherwise every download
+    # leaves a PDF behind in the temp directory forever.
+    return FileResponse(tmp.name, media_type="application/pdf", filename=filename,
+                        background=BackgroundTask(os.unlink, tmp.name))
 
 
 @app.post("/jobs/{job_id}/auto-apply")
@@ -237,7 +300,10 @@ async def mark_applied(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     from datetime import datetime
     await update_job(job_id, {"status": "applied"})
-    app_id = await insert_application({"job_id": job_id, "status": "applied", "applied_at": datetime.utcnow()})
+    # Idempotent upsert, like the auto-apply path: a plain insert meant a second
+    # click on "mark applied" created a second application row, which then
+    # double-counted in the pipeline and in /stats.
+    app_id = await record_application(job_id, {"status": "applied", "applied_at": datetime.utcnow()})
     return {"message": "Marked as applied", "application_id": app_id}
 
 

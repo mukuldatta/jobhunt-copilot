@@ -1,4 +1,6 @@
-version: '3.9'
+# In practice only the `mongo` service is used: the scraper and the apply agent
+# both need a headed real Chrome on a residential Indian IP, so the backend runs
+# locally under uvicorn rather than in a container. See README.
 
 services:
   mongo:
@@ -9,6 +11,11 @@ services:
     volumes:
       - mongo-data:/data/db    # named volume => data persists across restarts
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   backend:
     build: .
@@ -24,7 +31,8 @@ services:
     volumes:
       - ./resume:/app/resume:ro
     depends_on:
-      - mongo
+      mongo:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -32,6 +40,10 @@ services:
     working_dir: /app
     volumes:
       - ./frontend:/app
+      # Anonymous volume masking the bind mount: the host's node_modules is
+      # Windows-built, and esbuild/rollup ship platform-specific binaries that
+      # fail under alpine/musl.
+      - /app/node_modules
     ports:
       - "3000:3000"
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0"

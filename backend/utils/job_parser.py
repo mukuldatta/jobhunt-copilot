@@ -1,16 +1,38 @@
 import re
 import hashlib
+import unicodedata
 
-INDIA_CITIES = {"hyderabad", "bangalore", "bengaluru", "pune", "mumbai", "chennai", "delhi", "gurgaon", "noida"}
+# The one list of what counts as an Indian location. mongodb.py builds its
+# region filter from this; it used to keep a second, longer list of its own, so
+# a job in Gurugram was "in region" to the query layer and not to the parser.
+INDIA_LOCATIONS = (
+    "india", "hyderabad", "bangalore", "bengaluru", "pune", "chennai",
+    "mumbai", "delhi", "noida", "gurugram", "gurgaon", "kolkata", "ahmedabad",
+)
+
+INDIA_CITIES = set(INDIA_LOCATIONS)
+
+
+def india_location_regex() -> str:
+    """Alternation for a case-insensitive Mongo $regex on the location field."""
+    return "|".join(INDIA_LOCATIONS)
 
 
 def clean_description(text: str) -> str:
+    """
+    Strip markup and control characters, and leave the words alone.
+
+    This used to end with encode("ascii", "ignore"), which silently deleted
+    every non-Latin character from every posting — including the rupee sign, so
+    an Indian salary line read "12,00,000 per annum" with no unit at all. Only
+    control characters are unsafe to keep; the rest is the content.
+    """
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"\s+", " ", text)
-    text = text.encode("ascii", "ignore").decode()
+    text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
     return text.strip()
 
 
@@ -47,34 +69,37 @@ def extract_contract_type(title: str, description: str) -> str:
     return "fulltime"
 
 
-def is_india_job(location: str) -> bool:
-    loc = location.lower()
-    return any(city in loc for city in INDIA_CITIES) or "india" in loc
+_RELEVANT_KEYWORDS = [
+    "ai", "ml", "machine learning", "data", "engineer",
+    "software", "python", "backend", "llm", "genai",
+    "nlp", "deep learning", "analyst", "scientist",
+    "developer", "full stack", "fullstack", "devops",
+    "mlops", "platform", "infrastructure", "cloud",
+    "api", "microservices", "architect",
+]
 
-
-def is_priority_india_city(location: str) -> bool:
-    loc = location.lower()
-    return any(city in loc for city in {"hyderabad", "bangalore", "bengaluru", "pune"})
+_IRRELEVANT_KEYWORDS = [
+    "sales", "marketing", "hr", "recruiter", "finance",
+    "accountant", "graphic design", "ux designer", "ui designer",
+    "product manager", "project manager", "business analyst",
+    "content writer", "seo", "social media",
+]
 
 
 def is_relevant_job(title: str) -> bool:
-    title_lower = title.lower()
-    relevant_keywords = [
-        "ai", "ml", "machine learning", "data", "engineer",
-        "software", "python", "backend", "llm", "genai",
-        "nlp", "deep learning", "analyst", "scientist",
-        "developer", "full stack", "fullstack", "devops",
-        "mlops", "platform", "infrastructure", "cloud",
-        "api", "microservices", "architect",
-    ]
-    irrelevant_keywords = [
-        "sales", "marketing", "hr ", "recruiter", "finance",
-        "accountant", "graphic design", "ux designer", "ui designer",
-        "product manager", "project manager", "business analyst",
-        "content writer", "seo", "social media",
-    ]
-    has_relevant = any(kw in title_lower for kw in relevant_keywords)
-    has_irrelevant = any(kw in title_lower for kw in irrelevant_keywords)
+    """
+    Is this posting worth spending a scoring call on?
+
+    Matched on word boundaries via score_rules.mentions. As bare substrings,
+    "ai" admitted Maintenance Technician, Trainee and Captain; "ml" admitted
+    anything with "html"; "api" admitted Therapist and Rapid. Each one then
+    cost an LLM call to score and rank a job that was never a candidate.
+    """
+    from utils.score_rules import mentions
+
+    title_lower = (title or "").lower()
+    has_relevant = any(mentions(title_lower, kw) for kw in _RELEVANT_KEYWORDS)
+    has_irrelevant = any(mentions(title_lower, kw) for kw in _IRRELEVANT_KEYWORDS)
     return has_relevant and not has_irrelevant
 
 

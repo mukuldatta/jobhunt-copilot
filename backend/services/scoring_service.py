@@ -11,7 +11,7 @@ import asyncio
 import logging
 
 from agents.scorer_agent import ScorerAgent
-from db.mongodb import get_unscored_jobs, update_job
+from db.mongodb import get_jobs_needing_score, update_job
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,10 @@ async def run_scoring(limit: int = None) -> dict:
     per_run = int(limit or _f("SCORE_PER_RUN", 60))
 
     agent = ScorerAgent()
-    unscored = await get_unscored_jobs()
+    # Never-scored first, then jobs holding a superseded scorer's score. The
+    # per-run cap is what bounds the cost of a version backfill; successive
+    # cycles drain the rest.
+    unscored = await get_jobs_needing_score()
     queue = unscored[:per_run]
     scored = failed = 0
     backoffs = 0
@@ -70,6 +73,10 @@ async def run_scoring(limit: int = None) -> dict:
             # Which of the resume's skills the posting actually named — turns
             # the skills bar in Review from an assertion into evidence.
             "skills_matched": result.get("skills_matched", []),
+            # Stamps which scorer produced this. The apply queue requires the
+            # current one, so a score from a scorer we no longer trust cannot
+            # be selected for an irreversible application.
+            "scorer_version": result.get("scorer_version"),
         })
         scored += 1
         await asyncio.sleep(delay)

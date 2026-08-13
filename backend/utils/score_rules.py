@@ -16,6 +16,14 @@ left with only the two dimensions that genuinely need reading comprehension.
 
 import re
 
+# Bump whenever scoring changes in a way that makes old numbers incomparable.
+# Scores carry this, so stale ones can be found and re-run without wiping the
+# collection — and, more importantly, so the apply queue can refuse to select
+# from a judgement produced by a scorer we no longer trust.
+#   1 = single LLM call, "<0-40>" placeholders (produced the fabricated 100s)
+#   2 = skills and location computed; LLM judges experience and domain only
+SCORER_VERSION = 2
+
 SKILLS_MAX = 40
 LOCATION_MAX = 10
 
@@ -38,13 +46,31 @@ _ALIASES = {
 }
 
 
-def _mentions(haystack: str, term: str) -> bool:
+def mentions(haystack: str, term: str) -> bool:
+    """
+    Does `haystack` name `term`?
+
+    Short and ambiguous terms are matched on word boundaries — bare substring
+    matching for "ai" finds it inside "maintenance", "trainee" and "captain",
+    and for "go" inside "algorithm". Longer, more distinctive terms stay on
+    substring matching so "kubernetes" still matches "kubernetes-based".
+    """
     term = term.lower().strip()
     if not term:
         return False
-    if term in _NEEDS_WORD_BOUNDARY or len(term) <= 3:
-        return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", haystack) is not None
-    return term in haystack
+    # _ALIASES was written for exactly this and then never consulted, so a
+    # posting asking for "sklearn" or "k8s" counted as a gap against a resume
+    # that lists scikit-learn and Kubernetes.
+    for form in [term] + _ALIASES.get(term, []):
+        if form in _NEEDS_WORD_BOUNDARY or len(form) <= 3:
+            if re.search(rf"(?<![a-z0-9]){re.escape(form)}(?![a-z0-9])", haystack):
+                return True
+        elif form in haystack:
+            return True
+    return False
+
+
+_mentions = mentions        # the original private name, still used below
 
 
 def skills_match(description: str, resume_skills: list) -> dict:
@@ -64,6 +90,9 @@ def skills_match(description: str, resume_skills: list) -> dict:
     # the JD emphasises, so a single passing mention does not become a "gap".
     missing = []
     for term, count in _demanded_terms(text).items():
+        # Arguments are deliberately the other way round here: the question is
+        # whether some resume skill *covers* the demanded term ("spring" covers
+        # a JD asking for "spring boot"), so the term is the haystack.
         if count >= 2 and not any(_mentions(term, s.lower()) for s in (resume_skills or [])):
             if not _mentions(text_of(matched), term):
                 missing.append(term)

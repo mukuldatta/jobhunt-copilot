@@ -9,9 +9,8 @@ scheduler = AsyncIOScheduler()
 
 async def setup_scheduler():
     from agents.scraper_agent import ScraperAgent
-    from agents.scorer_agent import ScorerAgent
     from services.alert_service import send_email_alert, send_sms_alert
-    from db.mongodb import get_unscored_jobs, get_high_match_jobs, delete_old_jobs, update_job
+    from db.mongodb import get_high_match_jobs, delete_old_jobs, update_job
 
     async def scrape_jobs():
         logger.info("Scheduler: starting job scrape...")
@@ -45,10 +44,18 @@ async def setup_scheduler():
         deleted = await delete_old_jobs(days=7)
         logger.info(f"Scheduler: cleaned up {deleted} old jobs")
 
-    scheduler.add_job(scrape_jobs, IntervalTrigger(minutes=30), id="scrape_jobs", replace_existing=True)
-    scheduler.add_job(score_new_jobs, IntervalTrigger(minutes=30), id="score_jobs", replace_existing=True)
-    scheduler.add_job(send_alerts, IntervalTrigger(minutes=30), id="send_alerts", replace_existing=True)
-    scheduler.add_job(cleanup_old_jobs, IntervalTrigger(hours=24), id="cleanup_jobs", replace_existing=True)
+    # A scrape opens a headed browser and can pause for a manual CAPTCHA, and a
+    # scoring pass paces itself around free-tier rate limits — both can overrun
+    # the 30-minute interval. APScheduler's default 1-second misfire grace then
+    # drops the next execution silently. A 5-minute grace lets a late run still
+    # happen; max_instances=1 + coalesce keep it from stacking up behind itself.
+    common = {"replace_existing": True, "max_instances": 1,
+              "coalesce": True, "misfire_grace_time": 300}
+
+    scheduler.add_job(scrape_jobs, IntervalTrigger(minutes=30), id="scrape_jobs", **common)
+    scheduler.add_job(score_new_jobs, IntervalTrigger(minutes=30), id="score_jobs", **common)
+    scheduler.add_job(send_alerts, IntervalTrigger(minutes=30), id="send_alerts", **common)
+    scheduler.add_job(cleanup_old_jobs, IntervalTrigger(hours=24), id="cleanup_jobs", **common)
 
     # Autonomous apply is opt-in: it opens a real browser window and submits
     # applications, so it only runs on a schedule when it has been turned on in

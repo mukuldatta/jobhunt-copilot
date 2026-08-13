@@ -3,7 +3,9 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { MagnifyingGlass } from '@phosphor-icons/react'
 import FilterMenu from '../components/FilterMenu'
 import JobDetail from '../components/JobDetail'
-import { getJobs } from '../api'
+import { getJobs, errorMessage } from '../api'
+import { useToast } from '../components/Toast'
+import { useAgent } from '../hooks/useAgent'
 import { useReducedMotion, useReveal, stagger } from '../hooks/useMotion'
 import { age, scoreText, shortLocation } from '../lib/format'
 
@@ -85,9 +87,14 @@ export default function Review() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [hasMore, setHasMore] = useState(false)
   const [error, setError] = useState(null)
+  const [pageError, setPageError] = useState(null)
   const [selected, setSelected] = useState(null)
   const [searchInput, setSearchInput] = useState(params.get('search') || '')
   const [overlay, setOverlay] = useState(false)
+  const [showKeys, setShowKeys] = useState(false)
+
+  const notify = useToast()
+  const { refreshStats } = useAgent()
 
   const searchRef = useRef(null)
   const listRef = useRef(null)
@@ -140,11 +147,13 @@ export default function Review() {
         if (cancelled) return
         const rows = r.data.jobs || []
         setJobs(rows)
-        setTotal(rows.length)
+        // The real size of the filtered set, from the server. This was the
+        // length of the first page, so a filter matching 400 jobs read "25+".
+        setTotal(r.data.total ?? rows.length)
         setHasMore(rows.length === PAGE)
         listRef.current?.scrollTo({ top: 0 })
       })
-      .catch((e) => !cancelled && setError(e.response?.data?.detail || 'Could not load jobs.'))
+      .catch((e) => !cancelled && setError(errorMessage(e, 'Could not load jobs.')))
       .finally(() => !cancelled && setLoading(false))
     return () => {
       cancelled = true
@@ -155,14 +164,18 @@ export default function Review() {
   const loadMore = useCallback(async () => {
     if (loadingMore || !hasMore) return
     setLoadingMore(true)
+    setPageError(null)
     try {
       const r = await getJobs(query(jobs.length))
       const rows = r.data.jobs || []
       setJobs((prev) => [...prev, ...rows])
-      setTotal((prev) => (prev ?? 0) + rows.length)
+      if (r.data.total != null) setTotal(r.data.total)
       setHasMore(rows.length === PAGE)
-    } catch {
-      setHasMore(false)
+    } catch (e) {
+      // A dropped request is not the end of the list. Swallowing it here set
+      // hasMore false, so one blip permanently ended scrolling with no notice
+      // and no way back short of reloading the page.
+      setPageError(errorMessage(e, 'Could not load more jobs.'))
     } finally {
       setLoadingMore(false)
     }
@@ -243,14 +256,28 @@ export default function Review() {
         e.preventDefault()
         move(-1)
       } else if (e.key === 'Enter' && selectedJob) {
-        document.querySelector('[data-apply-button]')?.click()
+        // Enter submits a real application, which cannot be undone, so the
+        // keyboard path asks first — the mouse path has a button you had to
+        // aim at, and a stray Enter while skimming the queue did not.
+        const applyBtn = document.querySelector('[data-apply-button]')
+        if (!applyBtn) {
+          // External postings render a link instead, so this used to do
+          // nothing at all with no explanation.
+          notify.ok('This posting is applied to on the company site — use Open posting.')
+          return
+        }
+        if (window.confirm(`Apply to ${selectedJob.title} at ${selectedJob.company}?`)) {
+          applyBtn.click()
+        }
       } else if (e.key === 'e' && selectedJob) {
         document.querySelector('[data-skip-button]')?.click()
+      } else if (e.key === '?') {
+        setShowKeys((v) => !v)
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [move, selectedJob])
+  }, [move, selectedJob, notify])
 
   function submitSearch(e) {
     e.preventDefault()
@@ -260,6 +287,9 @@ export default function Review() {
   function onJobStatusChange(id, status) {
     setJobs((prev) => prev.map((j) => (j.job_id === id ? { ...j, status } : j)))
     setSelected((prev) => (prev && prev.job_id === id ? { ...prev, status } : prev))
+    // The sidebar counts derive from these statuses; without this they lagged
+    // by up to a minute behind an action taken right next to them.
+    refreshStats()
   }
 
   const dirty = Object.keys(DEFAULTS).some((k) => filters[k] !== DEFAULTS[k])
@@ -339,16 +369,36 @@ export default function Review() {
 
           <div className="mt-2.5 flex items-center justify-between text-xs+ text-neutral-600">
             <span>
-              {loading ? 'Loading' : `${total ?? 0}${hasMore ? '+' : ''} jobs`} · sorted by{' '}
+              {/* total is the server's count for this filter, so no "+". */}
+              {loading ? 'Loading' : `${total ?? 0} job${total === 1 ? '' : 's'}`} · sorted by{' '}
               {labelFor(SORT, filters.sort_by, '').toLowerCase()}
             </span>
-            {dirty && (
-              <button onClick={clearFilters} className="text-accent hover:text-accent-300">
-                Clear
+            <span className="flex items-center gap-3">
+              <button
+                onClick={() => setShowKeys((v) => !v)}
+                className="text-neutral-700 hover:text-text"
+                title="Keyboard shortcuts"
+              >
+                ?
               </button>
-            )}
+              {dirty && (
+                <button onClick={clearFilters} className="text-accent hover:text-accent-300">
+                  Clear
+                </button>
+              )}
+            </span>
           </div>
         </div>
+
+        {showKeys && (
+          <div className="border-b border-line px-[18px] py-2 text-xs+ text-neutral-600">
+            <span className="text-neutral-500">j / k</span> move ·{' '}
+            <span className="text-neutral-500">/</span> search ·{' '}
+            <span className="text-neutral-500">Enter</span> apply (confirms) ·{' '}
+            <span className="text-neutral-500">e</span> skip ·{' '}
+            <span className="text-neutral-500">?</span> this list
+          </div>
+        )}
 
         {error && (
           <div className="flex items-center justify-between border-b border-line px-[18px] py-2 text-xs+ text-accent-400">
@@ -417,8 +467,24 @@ export default function Review() {
                   </button>
                 )
               })}
-              <div ref={sentinel} className="h-px" />
+              {/* Parked while a page failed, so the observer does not
+                  immediately retry the request that just errored. */}
+              {!pageError && <div ref={sentinel} className="h-px" />}
               {loadingMore && <SkeletonRow />}
+              {pageError && (
+                <div className="flex items-center justify-between px-[18px] py-3 text-xs+ text-accent-400">
+                  {pageError}
+                  <button
+                    onClick={() => {
+                      setPageError(null)
+                      loadMore()
+                    }}
+                    className="text-accent hover:text-accent-300"
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
             </>
           )}
         </div>

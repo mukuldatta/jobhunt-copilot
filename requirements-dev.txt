@@ -1,0 +1,8 @@
+# Test dependencies. Install with:  pip install -r requirements-dev.txt
+#
+# The suite deliberately covers only pure functions — the ones that decide
+# whether an irreversible application gets spent, and whether a tailored resume
+# is honest. No mocks, no database, no browser: those need their own pass.
+-r requirements.txt
+
+pytest==8.2.2

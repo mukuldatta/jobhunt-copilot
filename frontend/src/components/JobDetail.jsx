@@ -12,7 +12,8 @@ import {
 } from '@phosphor-icons/react'
 import ResumeModal from './ResumeModal'
 import OutreachModal from './OutreachModal'
-import { autoApply, setJobStatus, markApplied } from '../api'
+import { autoApply, setJobStatus, markApplied, errorMessage } from '../api'
+import { useToast } from './Toast'
 import { useAgent } from '../hooks/useAgent'
 import { useReducedMotion } from '../hooks/useMotion'
 import { agoLabel, scoreFill } from '../lib/format'
@@ -64,9 +65,12 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
   }, [job.job_id, reduced])
 
   const { applyDisabled } = useAgent()
+  const notify = useToast()
   const breakdown = job.score_breakdown || {}
   const gaps = (job.gap_analysis || []).map((g) => g.replace(/^missing:\s*/i, ''))
-  const applied = job.status === 'applied'
+  // 'applying' counts too: the run is under way, and offering Apply again
+  // would queue a second submission for the same posting.
+  const applied = job.status === 'applied' || job.status === 'applying'
 
   // Two independent reasons the agent can't submit this one: the board refuses
   // automated sessions, or this specific posting hands off to the employer.
@@ -84,9 +88,13 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
     try {
       await autoApply(job.job_id)
       setNotice('Applying in the background. Anything it cannot answer comes back to you on Today.')
-      onStatusChange?.(job.job_id, 'applied')
+      // 'applying', not 'applied': the POST only queues the run. Claiming the
+      // submission here asserted an outcome the browser had not reached yet,
+      // and the row stayed wrong if the run then deferred or failed.
+      onStatusChange?.(job.job_id, 'applying')
     } catch (e) {
-      setNotice(e.response?.data?.detail || 'Could not start the apply run.')
+      notify.err(errorMessage(e, 'Could not start the apply run.'), { retry: handleApply })
+      setNotice(null)
     } finally {
       setApplying(false)
     }
@@ -97,20 +105,26 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
     try {
       await markApplied(job.job_id)
       onStatusChange?.(job.job_id, 'applied')
-      setNotice('Recorded — it will show up in Pipeline.')
+      notify.ok('Recorded — it will show up in Pipeline.')
     } catch (e) {
-      setNotice(e.response?.data?.detail || 'Could not record that application.')
+      notify.err(errorMessage(e, 'Could not record that application.'), {
+        retry: handleMarkApplied,
+      })
     } finally {
       setMarking(false)
     }
   }
 
   async function handleSkip() {
+    const previous = job.status
+    // Optimistic, and rolled back on failure — the row used to sit there
+    // looking unchanged until the request came back.
+    onStatusChange?.(job.job_id, 'skipped')
     try {
       await setJobStatus(job.job_id, 'skipped')
-      onStatusChange?.(job.job_id, 'skipped')
     } catch (e) {
-      setNotice(e.response?.data?.detail || 'Could not skip this job.')
+      onStatusChange?.(job.job_id, previous)
+      notify.err(errorMessage(e, 'Could not skip this job.'), { retry: handleSkip })
     }
   }
 
@@ -181,7 +195,7 @@ export default function JobDetail({ job, onStatusChange, onClose, overlay }) {
           <button
             onClick={handleMarkApplied}
             disabled={marking || applied}
-            className={`btn ${canAutoApply ? 'btn-neutral' : 'btn-neutral'}`}
+            className="btn btn-neutral"
             title="Record an application you submitted yourself"
           >
             <Check size={14} />

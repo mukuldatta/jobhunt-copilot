@@ -45,4 +45,4 @@ export const isApplied = (job) => job?.status === 'applied'
  * pair, so a list of forty rows is one ranked column.
  */
 export const scoreText = (score) => (score >= 75 ? 'text-accent-400' : 'text-neutral-500')
-export const scoreFill = (ratio) => (ratio >= 0.75 ? '#9184d9' : '#796cbf')
+export const scoreFill = (ratio) => (ratio >= 0.75 ? 'var(--accent)' : 'var(--accent-600)')

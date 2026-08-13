@@ -1,24 +1,25 @@
 import { useState, useEffect } from 'react'
 import { X } from '@phosphor-icons/react'
-import { generateOutreach } from '../api'
+import { generateOutreach, errorMessage } from '../api'
+import { useModal, backdropProps } from '../hooks/useModal'
 
 export default function OutreachModal({ job, onClose }) {
   const [message, setMessage] = useState('')
   const [loading, setLoading] = useState(true)
   const [copied, setCopied] = useState(false)
 
-  useEffect(() => {
-    generateOutreach(job.job_id)
-      .then((res) => setMessage(res.data.outreach_message))
-      .catch(() => setMessage('Could not generate an outreach message.'))
-      .finally(() => setLoading(false))
-  }, [job.job_id])
+  const dialogRef = useModal(onClose)
 
   useEffect(() => {
-    const onKey = (e) => e.key === 'Escape' && onClose()
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
+    let cancelled = false
+    generateOutreach(job.job_id)
+      .then((res) => !cancelled && setMessage(res.data.outreach_message))
+      .catch((e) => !cancelled && setMessage(errorMessage(e, 'Could not generate an outreach message.')))
+      .finally(() => !cancelled && setLoading(false))
+    return () => {
+      cancelled = true
+    }
+  }, [job.job_id])
 
   function handleCopy() {
     navigator.clipboard.writeText(message)
@@ -29,10 +30,20 @@ export default function OutreachModal({ job, onClose }) {
   const overLimit = message.length > 300
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-lg rounded border border-line bg-bg animate-viewIn">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      {...backdropProps(onClose)}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="outreach-modal-title"
+        tabIndex={-1}
+        className="w-full max-w-lg rounded border border-line bg-bg animate-viewIn focus:outline-none"
+      >
         <div className="flex items-center justify-between border-b border-line px-6 py-4">
-          <h2 className="text-lg">LinkedIn outreach</h2>
+          <h2 id="outreach-modal-title" className="text-lg">LinkedIn outreach</h2>
           <button onClick={onClose} aria-label="Close" className="btn btn-neutral btn-icon">
             <X size={14} />
           </button>
