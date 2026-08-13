@@ -16,11 +16,19 @@ const SCORE = [
   { label: '70%+', value: '70' },
   { label: '50%+', value: '50' },
 ]
+// The statuses the apply state machine actually writes. "Reviewed" and
+// "Skipped" sat here offering nothing — the alerting rewrite stopped writing
+// "reviewed" — while manual_required, the largest actionable bucket and the
+// only one that is a to-do list, could be reached by URL but not by dropdown.
 const STATUS = [
   { label: 'All statuses', value: '' },
+  { label: 'Needs manual apply', value: 'manual_required' },
   { label: 'New', value: 'new' },
-  { label: 'Reviewed', value: 'reviewed' },
+  { label: 'Applying', value: 'applying' },
   { label: 'Applied', value: 'applied' },
+  { label: 'Apply failed', value: 'apply_failed' },
+  { label: 'Sign-in needed', value: 'login_required' },
+  { label: 'Expired', value: 'expired' },
   { label: 'Skipped', value: 'skipped' },
 ]
 const SOURCE = [
