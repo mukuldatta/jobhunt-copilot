@@ -113,6 +113,19 @@ _REQUIREMENT_MARKERS = (
 )
 
 
+# Equal-opportunity and legal boilerplate uses the same vocabulary as a
+# requirements section — "decisions are made on the basis of qualifications,
+# merit, and business need" — and it sits at the foot of the posting where a
+# marker search is most likely to land on it. Taking it as the requirements
+# section hands the scorer HR legal text and leaves the real skills list
+# unread.
+_BOILERPLATE_NEAR_MARKER = re.compile(
+    r"regardless of|without regard to|on the basis of|equal opportunit|"
+    r"affirmative action|protected veteran|diversity|inclusi",
+    re.I,
+)
+
+
 def truncate_description(text: str, max_chars: int = 4000) -> str:
     """
     Keep the opening AND the requirements when a posting is too long to send.
@@ -121,14 +134,31 @@ def truncate_description(text: str, max_chars: int = 4000) -> str:
     teaser. Real postings run 800-7000 chars and put the requirements last, so
     cutting from the front threw away the only part that says what the employer
     wants — leaving the scorer and the tailor working from company boilerplate.
+
+    Only the LLM prompt is built from this. Skills, location and required years
+    are computed from the whole posting, because they are local regex passes
+    that cost no tokens and must not inherit whatever this cut happens to miss.
     """
     if len(text) <= max_chars:
         return text
 
     head_budget = max_chars // 2
     lowered = text.lower()
-    starts = [lowered.find(m) for m in _REQUIREMENT_MARKERS]
-    starts = [i for i in starts if i > head_budget]
+    starts = []
+    for m in _REQUIREMENT_MARKERS:
+        i = lowered.find(m)
+        if i <= head_budget:
+            continue
+        # Judge the sentence the marker sits in, not a window around it. A
+        # fixed window also catches the neighbouring sentence, which throws
+        # away a real "Key Skills:" heading whenever the EEO paragraph happens
+        # to end just before it — and that is exactly where it tends to sit.
+        start = lowered.rfind(".", 0, i) + 1
+        end = lowered.find(".", i)
+        sentence = lowered[start: end if end != -1 else len(lowered)]
+        if _BOILERPLATE_NEAR_MARKER.search(sentence):
+            continue
+        starts.append(i)
 
     if not starts:
         return text[:max_chars] + "..."

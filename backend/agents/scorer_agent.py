@@ -97,25 +97,35 @@ class ScorerAgent:
             return None
 
         resume_text = await self._get_resume_text()
-        # Keep the prompt lean — the free Groq tier has a daily token budget and
-        # a long resume+JD per job exhausts it after ~100 jobs.
+        # Keep the PROMPT lean — the free Groq tier has a daily token budget and
+        # a long resume+JD per job exhausts it after ~100 jobs. Only the model
+        # sees the truncated copy; see below.
         job_description = truncate_description(job.get("description", ""), max_chars=1500)
         title = job.get("title", "")
         company = job.get("company", "")
 
         location = job.get("location", "")
 
-        # Facts first — computed, not asked for.
+        # Facts first — computed, not asked for, and computed from the WHOLE
+        # posting. These are local regex passes that cost no tokens, so there
+        # was never a reason to feed them the truncated copy, and doing so was
+        # actively wrong: truncate_description looks for a requirements marker
+        # and will happily match "qualifications" inside the EEO boilerplate at
+        # the foot of a posting, handing the scorer HR legal text while the
+        # skills list sits untouched in the middle. Measured across the stored
+        # jobs, that cost nine postings their entire skill signal — they were
+        # skipped as naming no technology at all — understated another 51, and
+        # inflated 34 more by hiding the gaps that would have counted against
+        # them. Token budget constrains the prompt, not the arithmetic.
+        full_description = job.get("description", "") or ""
         resume = await get_resume() or {}
-        skills = skills_match(job_description, resume.get("skills", []))
-        location_score = location_points(location, job_description)
+        skills = skills_match(full_description, resume.get("skills", []))
+        location_score = location_points(location, full_description)
 
         # Years are read from the posting and compared against the profile.
         # Asked of the model, a 10-12 year role scored 28/30 against a 3-year
-        # resume and was applied to. Measured against the full description,
-        # not the truncated copy — the requirement often sits past the cut.
+        # resume and was applied to.
         my_years = await self._candidate_years()
-        full_description = job.get("description", "")
         experience_score = experience_points(full_description, my_years)
         needs_years = required_years(full_description)
 

@@ -160,6 +160,30 @@ class TestTruncateDescription:
         assert out.endswith("...")
         assert len(out) <= 403
 
+    def test_ignores_a_marker_inside_equal_opportunity_boilerplate(self):
+        """
+        EEO text uses requirements vocabulary — "decisions are made on the
+        basis of qualifications, merit, and business need" — and sits at the
+        foot of the posting, exactly where the marker search looks. Taken as
+        the requirements section it handed the scorer HR legal text and left
+        the real skills list unread.
+        """
+        boilerplate = "We are a mission-driven company. " * 60
+        eeo = (
+            "All decisions we make are made on the basis of qualifications, "
+            "merit, and business need. We are an equal opportunity employer. "
+        )
+        real = "Key Skills: Python, FastAPI, CrewAI, Kubernetes, Airflow."
+        out = truncate_description(boilerplate + eeo + real, max_chars=600)
+        assert "Python" in out
+        assert "merit, and business need" not in out
+
+    def test_still_finds_a_legitimate_qualifications_section(self):
+        # The exclusion must not swallow a real "Qualifications:" heading.
+        text = "About us. " * 80 + "Qualifications: Python, FastAPI and CrewAI required."
+        out = truncate_description(text, max_chars=500)
+        assert "Python" in out
+
 
 def test_india_regex_covers_the_target_cities():
     rx = india_location_regex()

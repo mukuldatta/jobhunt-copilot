@@ -24,7 +24,8 @@ from typing import Optional
 #   1 = single LLM call, "<0-40>" placeholders (produced the fabricated 100s)
 #   2 = skills and location computed; LLM judges experience and domain only
 #   3 = experience computed from the demanded years too; LLM judges domain only
-SCORER_VERSION = 3
+#   4 = computed dimensions read the whole posting, not the truncated prompt
+SCORER_VERSION = 4
 
 SKILLS_MAX = 40
 LOCATION_MAX = 10
