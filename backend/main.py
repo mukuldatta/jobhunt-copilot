@@ -492,14 +492,22 @@ async def auto_apply_run(background_tasks: BackgroundTasks, body: AutoApplyRunRe
 
 
 @app.post("/score/trigger")
-async def trigger_scoring(background_tasks: BackgroundTasks):
+async def trigger_scoring(background_tasks: BackgroundTasks,
+                          limit: int = Query(None, ge=1, le=1000)):
+    """
+    Score everything that needs it, newest-unscored first.
+
+    limit overrides SCORE_PER_RUN for this run only. Bumping SCORER_VERSION
+    queues every previously-scored job for re-scoring, and the default per-run
+    cap is sized for a 30-minute cycle rather than for catching up in one go.
+    """
     from services.scoring_service import run_scoring
     from services import agent_state
 
     async def _run():
         agent_state.start("scoring")
         try:
-            await run_scoring()
+            await run_scoring(limit=limit)
         finally:
             agent_state.finish()
 

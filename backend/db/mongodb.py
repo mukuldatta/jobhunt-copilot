@@ -213,6 +213,28 @@ async def get_high_match_jobs(threshold: int = 70) -> list:
     return jobs
 
 
+async def _max_apply_years():
+    """
+    The most years a posting may demand before auto-apply refuses it.
+
+    The candidate's own years plus a stretch, because postings routinely ask
+    for more than the job needs and a year or two over is worth a shot. Set
+    APPLY_YEARS_STRETCH to widen or narrow it; None when experience has never
+    been filled in, which disables the gate rather than guessing.
+    """
+    profile = await get_apply_profile() or {}
+    raw = profile.get("total_years_experience") or os.getenv("APPLY_YEARS_EXPERIENCE")
+    try:
+        mine = float(raw)
+    except (TypeError, ValueError):
+        return None
+    try:
+        stretch = float(os.getenv("APPLY_YEARS_STRETCH", "2"))
+    except ValueError:
+        stretch = 2.0
+    return mine + stretch
+
+
 async def get_apply_candidates(min_score: int = 70, region: str = "india", limit: int = 5,
                                exclude_sources: list = None) -> list:
     """
@@ -237,6 +259,19 @@ async def get_apply_candidates(min_score: int = 70, region: str = "india", limit
     query = {"status": "new", "match_score": {"$gte": min_score},
              "scorer_version": SCORER_VERSION,
              "apply_type": {"$nin": ["external", "expired"]}}
+
+    # A role years beyond the candidate's experience is not a near miss to be
+    # settled by score — it is somebody else's job, and an application spent on
+    # it is wasted. The score already penalises the gap; this stops a very
+    # strong skills overlap from carrying a 10-year role over the threshold
+    # anyway. Jobs whose postings never state a requirement are still eligible.
+    max_years = await _max_apply_years()
+    if max_years is not None:
+        query["$and"] = query.get("$and", []) + [{"$or": [
+            {"required_years": None},
+            {"required_years": {"$exists": False}},
+            {"required_years": {"$lte": max_years}},
+        ]}]
     if exclude_sources:
         query["source"] = {"$nin": list(exclude_sources)}
     if region == "india":

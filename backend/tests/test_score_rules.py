@@ -9,10 +9,13 @@ naming Java as a gap. These are the rules that replaced that.
 import pytest
 
 from utils.score_rules import (
+    EXPERIENCE_MAX,
     SCORER_VERSION,
     SKILLS_MAX,
+    experience_points,
     location_points,
     mentions,
+    required_years,
     skills_match,
 )
 
@@ -137,6 +140,113 @@ class TestLocationPoints:
 
     def test_reads_the_description_when_the_location_is_vague(self):
         assert location_points("", "This is a fully remote position.") == 5
+
+
+class TestRequiredYears:
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("Preferred candidate profile 3-5 years of Data Engineering", 3),
+            ("Job title: ML Engineer Experience: 3 - 6 Years Location: Pune", 3),
+            ("Experience: 6 to 12 years Job Type: Full-Time", 6),
+            ("Bachelors in CS with 5-9 years experience", 5),
+            ("Generative AI Lead or Engineer with 6+ years of experience", 6),
+            ("Key skill: Python, Gen AI Experience: 7+ Years Notice Period", 7),
+            ("Skills for success 12+ years experience in machine learning", 12),
+            ("Requirements 8-13 years of general IT experience", 8),
+            ("Additional Responsibilities 5 years of experience in Python", 5),
+            ("Experience Level : Mid to Senior [5+ Years] Department", 5),
+            ("looking for a GenAI Platform Engineer with 3–6 years", 3),
+            ("Gen AI, NLP, or Computer Vision; 4 to 27 years Openings", 4),
+        ],
+    )
+    def test_reads_the_lower_bound(self, text, expected):
+        assert required_years(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Iris Software is a 35 year old IT Service organization",
+            "founded the biotechnology industry more than 40 years ago",
+            "A 15 years full time education is required for this role",
+            "We are a mission-driven company. Apply today.",
+        ],
+    )
+    def test_ignores_text_that_is_not_a_requirement(self, text):
+        """
+        Company age, company history and Indian schooling notation (10+2+3 =
+        "15 years full time education") all print "N years" without asking for
+        any. Read as requirements they would gate away legitimate roles.
+        """
+        assert required_years(text) is None
+
+    def test_entry_level_zero_survives(self):
+        # 0 is a real answer and must not be confused with "unknown".
+        assert required_years("Experience: 0-5 Yrs. Any graduate.") == 0
+        assert required_years("0-3 years, fresh graduates welcome") == 0
+
+    def test_the_smallest_stated_requirement_wins(self):
+        # An incidental mention must not disqualify a job on its own.
+        assert required_years("3+ years Python, 8+ years leadership") == 3
+
+    def test_implausible_values_are_rejected(self):
+        """
+        Real rows carry "58 years" and "48 years" — ranges whose dash was
+        deleted back when clean_description stripped non-ASCII. Unknown is the
+        honest answer; guessing would gate the job away.
+        """
+        assert required_years("Masters degree and 58 years of experience") is None
+
+    def test_a_corrupted_row_is_rescued_by_a_second_mention(self):
+        # This is a real posting: "0-5 Yrs" in the highlights, mangled "2-4"
+        # further down. Taking the minimum reads it correctly as entry level.
+        text = "Experience: 0-5 Yrs. Job highlights Experience: 24 Years. Education: Any Graduate"
+        assert required_years(text) == 0
+
+    def test_handles_empty_input(self):
+        assert required_years("") is None
+        assert required_years(None) is None
+
+
+class TestExperiencePoints:
+    MINE = 3
+
+    def test_a_role_at_or_below_the_candidate_scores_full(self):
+        assert experience_points("3-5 years of experience", self.MINE) == EXPERIENCE_MAX
+        assert experience_points("2-4 years of experience", self.MINE) == EXPERIENCE_MAX
+
+    def test_the_curve_falls_as_the_gap_widens(self):
+        seq = [experience_points(f"{n}+ years of experience", self.MINE) for n in (4, 5, 6, 7, 8)]
+        assert seq == sorted(seq, reverse=True), seq
+        assert seq[0] > seq[-1]
+
+    def test_a_role_years_out_of_reach_scores_zero(self):
+        """
+        The case that started this: a Gen AI Engineer wanting 10-12 years took
+        28/30 on experience from the LLM, scored 94 overall, and was applied
+        to against a 3-year resume.
+        """
+        assert experience_points("10-12 years of experience", self.MINE) == 0
+        assert experience_points("12+ years experience in ML", self.MINE) == 0
+
+    def test_an_unstated_requirement_is_neutral(self):
+        # Silence is not evidence either way. Zero would bury every posting
+        # that simply does not mention years.
+        pts = experience_points("We build great products.", self.MINE)
+        assert 0 < pts < EXPERIENCE_MAX
+
+    def test_unknown_candidate_years_is_neutral(self):
+        assert experience_points("8+ years required", None) == 20
+        assert experience_points("8+ years required", "") == 20
+
+    def test_accepts_the_profile_string_form(self):
+        # total_years_experience is stored as a string, by design.
+        assert experience_points("10+ years", "3") == 0
+        assert experience_points("3+ years", "3") == EXPERIENCE_MAX
+
+    def test_never_leaves_its_range(self):
+        for text in ["1 year", "3-5 years", "20+ years", "no mention", ""]:
+            assert 0 <= experience_points(text, self.MINE) <= EXPERIENCE_MAX
 
 
 def test_scorer_version_is_a_positive_int():

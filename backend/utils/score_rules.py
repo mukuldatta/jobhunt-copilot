@@ -15,6 +15,7 @@ left with only the two dimensions that genuinely need reading comprehension.
 """
 
 import re
+from typing import Optional
 
 # Bump whenever scoring changes in a way that makes old numbers incomparable.
 # Scores carry this, so stale ones can be found and re-run without wiping the
@@ -22,7 +23,8 @@ import re
 # from a judgement produced by a scorer we no longer trust.
 #   1 = single LLM call, "<0-40>" placeholders (produced the fabricated 100s)
 #   2 = skills and location computed; LLM judges experience and domain only
-SCORER_VERSION = 2
+#   3 = experience computed from the demanded years too; LLM judges domain only
+SCORER_VERSION = 3
 
 SKILLS_MAX = 40
 LOCATION_MAX = 10
@@ -118,6 +120,100 @@ def skills_match(description: str, resume_skills: list) -> dict:
 
 def text_of(items) -> str:
     return " ".join(items).lower()
+
+
+# --- Experience -------------------------------------------------------------
+#
+# Years were being judged by the LLM, and it was not good at it: a Gen AI
+# Engineer posting asking for 10-12 years scored 28/30 on experience against a
+# 3-year resume, took a 94 overall, and got applied to. The demanded range is
+# printed in the posting and the candidate's years are in the profile, so this
+# is the same class of thing as skills and location — a fact, not a judgement.
+
+EXPERIENCE_MAX = 30
+
+# "3-5 years", "3 - 6 Years", "6 to 12 years", "5+ yrs", "5 years of experience".
+_YEARS_RE = re.compile(
+    r"(\d{1,2})\s*(?:\+|plus)?\s*(?:[-–—]|to)?\s*(\d{1,2})?\s*(?:\+|plus)?\s*"
+    r"(?:year|yr)s?\b",
+    re.I,
+)
+
+# Not every "N years" in a posting is a requirement:
+#   "a 35 year old IT services organization"  — corporate history
+#   "founded more than 40 years ago"          — the same, phrased differently
+#   "15 years full time education"            — Indian schooling notation (10+2+3)
+_NOT_A_REQUIREMENT = re.compile(
+    r"\byears?\s*old\b|\byears?\s+ago\b|\byears?\b[^.]{0,24}\beducation\b",
+    re.I,
+)
+
+# Nobody requires 30 years. A number this large is a scrape artefact: these are
+# ranges whose dash was destroyed back when clean_description stripped
+# non-ASCII, so "5–8 years" arrived as "58 years" and "3–5" as "35". Existing
+# rows still carry them; a re-scrape fixes the source.
+_MAX_PLAUSIBLE_YEARS = 25
+
+
+def required_years(description: str) -> Optional[int]:
+    """
+    The fewest years the posting asks for, or None when it does not say.
+
+    The lower bound is what matters — a "5-9 years" role is gated at 5. Where a
+    posting names several figures the smallest wins, so an incidental mention
+    cannot disqualify a job on its own. That also rescues the corrupted rows:
+    a listing reading "Experience: 0-5 Yrs" in one place and a mangled
+    "24 Years" in another is correctly read as entry level.
+
+    Zero is a real answer ("0-5 Yrs" is a graduate posting) and must survive as
+    0; None means unknown and must never be read as zero.
+    """
+    text = description or ""
+    found = []
+    for m in _YEARS_RE.finditer(text):
+        window = text[max(0, m.start() - 14): m.end() + 30]
+        if _NOT_A_REQUIREMENT.search(window):
+            continue
+        lo = int(m.group(1))
+        if 0 <= lo <= _MAX_PLAUSIBLE_YEARS:
+            found.append(lo)
+    return min(found) if found else None
+
+
+def experience_points(description: str, candidate_years) -> int:
+    """
+    Points out of EXPERIENCE_MAX for how the demanded years line up.
+
+    Postings inflate, and a year or two over is routine, so the curve starts
+    gently and then falls hard: by five years past the candidate's experience
+    the role is for somebody else, and a high skills overlap should not be able
+    to carry it into the apply queue.
+
+    An unstated requirement scores in the middle. Silence is not evidence of a
+    match, but it is not evidence against one either, and treating it as zero
+    would bury every posting that simply does not mention years.
+    """
+    try:
+        mine = float(candidate_years)
+    except (TypeError, ValueError):
+        mine = None
+
+    need = required_years(description)
+    if need is None or mine is None:
+        return 20
+
+    gap = need - mine
+    if gap <= 0:
+        return EXPERIENCE_MAX
+    if gap <= 1:
+        return 24
+    if gap <= 2:
+        return 18
+    if gap <= 3:
+        return 11
+    if gap <= 4:
+        return 5
+    return 0
 
 
 # Technologies worth noticing in a JD when the resume does not have them. Kept
