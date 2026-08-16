@@ -29,6 +29,46 @@ def _norm(text: str) -> str:
 _NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
 
 
+_JSON_OBJ_RE = re.compile(r"\{.*\}", re.S)
+
+
+def _parse_answer(raw: str):
+    """
+    Pull (answer, evidence) out of the model's reply.
+
+    Tolerant on the way in, strict on what it returns. Models wrap JSON in
+    prose or fences often enough that failing on it would turn the grounding
+    check into an outage: every answer discarded, every question emailed. A
+    reply that is not JSON at all is still read as a bare answer — it then has
+    to survive the grounding check with no evidence, which is exactly the
+    treatment an unsupported answer deserves.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return "", ""
+    m = _JSON_OBJ_RE.search(raw)
+    if m:
+        try:
+            obj = json.loads(m.group())
+            if isinstance(obj, dict):
+                return (str(obj.get("answer", "")).strip(),
+                        str(obj.get("evidence", "")).strip())
+        except (ValueError, TypeError):
+            pass
+    return raw.splitlines()[0].strip().strip('"').strip("'"), ""
+
+
+_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _flat(text) -> str:
+    """
+    Lowercase, punctuation-free, single-spaced — for asking "does this text
+    appear in that text" without a quote mark or a colon deciding the answer.
+    """
+    return " ".join(_ALNUM_RE.sub(" ", str(text or "").lower()).split())
+
+
 def numeric_text(value):
     """
     '38 LPA' -> '38', '3.5 years' -> '3.5', 'Immediately' -> None.
@@ -344,7 +384,7 @@ class AnswerResolver:
         opts = f"\nALLOWED ANSWERS (choose exactly one): {options}" if options else ""
 
         prompt = f"""You are filling a job application form on behalf of a candidate.
-Answer the question using ONLY the candidate profile below.
+Answer the question using ONLY the candidate profile and resume below.
 
 CANDIDATE PROFILE (JSON):
 {profile_json}
@@ -357,12 +397,19 @@ RESUME (the passages bearing on this question):
 
 FORM QUESTION ({kind}): {question}{opts}
 
+Reply with a JSON object and nothing else:
+{{"answer": "<the value to type>", "evidence": "<text copied word-for-word from the profile or resume above that establishes it>"}}
+
 RULES:
-- If the profile does not contain the information, reply exactly: UNKNOWN
-- Never invent salary, years of experience, dates, or qualifications.
-- For yes/no questions reply exactly Yes or No.
-- For numeric questions reply with digits only (e.g. 3).
-- Reply with the answer value ONLY — no explanation, no quotes, no punctuation."""
+- If the profile and resume do not establish an answer, reply exactly: {{"answer": "UNKNOWN", "evidence": ""}}
+- `evidence` must be copied verbatim from the material above. Do not paraphrase
+  it, do not summarise it, and do not write a sentence of your own. It is
+  checked against the source, and an answer whose evidence is not found there
+  is discarded.
+- Never invent salary, years of experience, dates, or qualifications. If a
+  number is not written above, the answer is UNKNOWN.
+- For yes/no questions the answer is exactly Yes or No.
+- For numeric questions the answer is digits only (e.g. 3)."""
 
         try:
             raw = (self.llm.complete(prompt) or "").strip()
@@ -374,15 +421,75 @@ RULES:
             print(f"    AnswerResolver LLM error: {e}")
             return None
 
-        answer = raw.splitlines()[0].strip().strip('"').strip("'") if raw else ""
+        answer, evidence = _parse_answer(raw)
         if not answer or answer.upper().startswith("UNKNOWN") or len(answer) > 120:
             self._llm_cache[cache_key] = None
             return None
+
+        if not self._is_grounded(answer, evidence, options):
+            # The model produced something the material does not support. That
+            # is the case this whole path exists to catch, and the honest
+            # outcome is the same as knowing nothing: ask.
+            print(f"    [ungrounded] {question[:52]} -> {answer!r} "
+                  f"(evidence: {evidence[:48]!r})")
+            self._llm_cache[cache_key] = None
+            return None
+
         if kind == "number":
             m = re.search(r"\d+", answer)
             answer = m.group() if m else answer
         self._llm_cache[cache_key] = answer
         return answer
+
+    def _is_grounded(self, answer: str, evidence: str, options: list = None) -> bool:
+        """
+        Is this answer supported by the profile or the resume?
+
+        Two checks, deliberately unequal, because the cost of being wrong is
+        unequal. A number is the thing that must never be invented — a
+        fabricated salary or year of experience goes onto a real application
+        and cannot be withdrawn — so any digit in the answer has to appear in
+        the evidence, and the evidence has to appear in the source material.
+
+        A "Yes" cannot be verified that way; nothing in a resume literally says
+        "yes". There the requirement is weaker but not nothing: the model still
+        has to point at real text, which is what separates an inference from an
+        invention.
+
+        Being too strict here has its own cost. Every rejection is an email to
+        you and a posting that waits, so the rule is aimed at fabrication
+        rather than at imperfect quoting.
+        """
+        haystack = _flat(self.resume_text) + " " + _flat(
+            json.dumps({k: v for k, v in self.profile.items()
+                        if k not in ("_id", "updated_at")}, default=str)
+        )
+        ev = _flat(evidence)
+
+        # An answer that is one of the form's own options is a choice, not a
+        # claim about a fact — the form wrote the words, we only picked one.
+        chosen_option = bool(options) and any(_flat(o) == _flat(answer) for o in options)
+
+        digits = re.findall(r"\d+(?:\.\d+)?", str(answer))
+        if digits:
+            if not ev:
+                return False
+            # The number has to be in the quote as a number in its own right,
+            # and the quote has to be in the source. Plain substring matching
+            # accepted "3" on the strength of a graduation year of 2023, which
+            # is how a fabricated figure sneaks past a check that looks strict.
+            for d in digits:
+                if not re.search(rf"(?<!\d){re.escape(d)}(?!\d)", ev):
+                    return False
+            return ev in haystack
+
+        if chosen_option or _flat(answer) in ("yes", "no"):
+            # Judgement from the material rather than a quote of it. Require a
+            # real citation when one was offered, and let a bare choice stand
+            # when it was not — the rules layer answers most of these anyway.
+            return not ev or ev in haystack
+
+        return bool(ev) and ev in haystack
 
     # ── option snapping ──────────────────────────────────────────────────────
 
