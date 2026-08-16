@@ -16,6 +16,7 @@ Never guesses: an unresolved question makes the apply flow pause for a human.
 import os
 import re
 import json
+import hashlib
 from llm_provider import LLMProvider, RateLimited
 from db.mongodb import get_apply_profile, record_pending_question
 
@@ -24,8 +25,96 @@ def _norm(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
+def question_token(question: str) -> str:
+    """
+    Short stable id for a question, derived from its normalised text.
+
+    Used to tie an emailed question to the reply that answers it. Derived rather
+    than stored so it needs no schema change and stays correct for questions
+    recorded before any of this existed: the same wording always yields the same
+    token, and pending questions are already keyed on the same normalisation.
+    """
+    return hashlib.sha1(_norm(question).encode("utf-8")).hexdigest()[:10]
+
+
 def _yn(flag: bool) -> str:
     return "Yes" if flag else "No"
+
+
+# Words that appear in nearly every form question, so matching a resume line on
+# them ranks the whole resume equally and selects nothing.
+_STOPWORDS = {
+    "a", "an", "and", "any", "are", "as", "at", "be", "by", "can", "do", "does",
+    "experience", "for", "from", "have", "how", "in", "is", "it", "many", "much",
+    "of", "on", "or", "please", "the", "this", "to", "what", "which", "will",
+    "with", "years", "year", "you", "your", "yes", "no", "if", "that", "we",
+}
+
+
+def _tokens(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9+#.]{2,}", (text or "").lower())
+            if w not in _STOPWORDS}
+
+
+def _relevant_resume(resume_text: str, question: str, budget: int = 6000) -> str:
+    """
+    Return the parts of the resume that bear on this question.
+
+    The prompt used to carry resume_text[:1200] — the first 1200 characters,
+    which on a real resume is the name, contact block and summary. A question
+    about years of Kubernetes never saw the line naming Kubernetes, so the LLM
+    correctly answered UNKNOWN and the question landed in the pending list even
+    though the resume said it plainly.
+
+    Ranking is keyword overlap, not embeddings: it is deterministic, needs no
+    extra service, and this only has to beat "the first 1200 characters".
+    Selected blocks are emitted in their original order so dates and employers
+    stay attached to the bullets underneath them.
+    """
+    if not resume_text:
+        return ""
+    if len(resume_text) <= budget:
+        return resume_text
+
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", resume_text) if b.strip()]
+    # A resume with no blank lines is one block; fall back to lines so there is
+    # something to rank at all.
+    if len(blocks) < 3:
+        blocks = [b.strip() for b in resume_text.splitlines() if b.strip()]
+
+    qt = _tokens(question)
+    if not qt:
+        return resume_text[:budget]
+
+    scored = []
+    for i, b in enumerate(blocks):
+        overlap = len(qt & _tokens(b))
+        if overlap:
+            # Normalise by length so a long block does not win on volume alone.
+            scored.append((overlap / (1 + len(b) / 400.0), i, b))
+    scored.sort(reverse=True)
+
+    chosen, used = set(), 0
+    for _, i, b in scored:
+        # A matched heading is worthless without the lines beneath it: the block
+        # "EDUCATION" is what a question about education scores against, while
+        # the degree that answers it sits in the next block and shares no words
+        # with the question at all.
+        candidates = (i, i + 1) if len(b) < 60 else (i,)
+        for j in candidates:
+            if j in chosen or j >= len(blocks):
+                continue
+            if used + len(blocks[j]) > budget:
+                continue
+            chosen.add(j)
+            used += len(blocks[j])
+    picked = [(j, blocks[j]) for j in chosen]
+    if not picked:
+        # Nothing matched — the head of the resume is still the best guess, and
+        # the prompt's UNKNOWN rule keeps a miss from turning into a fabrication.
+        return resume_text[:budget]
+    picked.sort()
+    return "\n\n".join(b for _, b in picked)
 
 
 class AnswerResolver:
@@ -197,8 +286,8 @@ CANDIDATE PROFILE (JSON):
 PREVIOUSLY ANSWERED QUESTIONS:
 {learned}
 
-RESUME EXCERPT:
-{self.resume_text[:1200]}
+RESUME (the passages bearing on this question):
+{_relevant_resume(self.resume_text, question)}
 
 FORM QUESTION ({kind}): {question}{opts}
 
