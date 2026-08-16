@@ -6,6 +6,7 @@ from datetime import datetime
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from db.mongodb import insert_job
+from platforms import NAUKRI_SCRAPE_PROFILE
 from utils.job_parser import (
     clean_description, generate_job_id, extract_contract_type, is_relevant_job
 )
@@ -25,11 +26,34 @@ INDIA_LOCATIONS = ["Hyderabad", "Bangalore", "Pune"]
 # Naukri one is a *different* profile from the apply agent's, and its name comes
 # from platforms so the two sides cannot disagree about which directory it is —
 # see the note there.
-from platforms import NAUKRI_SCRAPE_PROFILE
-
 PROFILE_ROOT = os.environ.get("BROWSER_PROFILE_DIR") or os.path.join(
     os.path.dirname(os.path.dirname(__file__)), ".browser_profiles"
 )
+
+
+def is_closed_error(e: Exception) -> bool:
+    """
+    Did this fail because the browser is gone, rather than because the page said
+    something we did not like?
+
+    The distinction had no representation in the scrape loops: every exception
+    was logged and followed by the next query. So closing the window mid-run
+    produced one error per remaining query/city pair — seventeen in a row
+    against a browser that no longer existed — and the source ended with 0 jobs
+    and seventeen lines that each looked like an unrelated page-load problem.
+
+    Matching on the message rather than the exception type because Playwright
+    raises this as a plain Error from several call sites, and the wording is the
+    only thing common to all of them.
+    """
+    msg = str(e).lower()
+    return any(s in msg for s in (
+        "has been closed",          # "Target page, context or browser has been closed"
+        "target closed",
+        "browser closed",
+        "connection closed",
+    ))
+
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -84,6 +108,7 @@ class ScraperAgent:
         jobs = []
         seen = set()
         blocked_streak = 0
+        browser_gone = False
         self._challenge_gave_up = False
         async with async_playwright() as pw:
             context = await self._headed_context(pw, NAUKRI_SCRAPE_PROFILE)
@@ -92,10 +117,10 @@ class ScraperAgent:
             page = context.pages[0] if context.pages else await context.new_page()
             try:
                 for query in INDIA_QUERIES:
-                    if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2:
+                    if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2 or browser_gone:
                         break
                     for city in INDIA_LOCATIONS:
-                        if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2:
+                        if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2 or browser_gone:
                             break
                         try:
                             rows = await self._load_naukri_page(page, query, city)
@@ -117,8 +142,16 @@ class ScraperAgent:
                             print(f"    Naukri '{query}' {city}: {added} jobs")
                             await asyncio.sleep(random.uniform(2, 4))
                         except Exception as e:
+                            if is_closed_error(e):
+                                print("    Naukri: the browser window is gone — "
+                                      "stopping this source.")
+                                browser_gone = True
+                                break
                             print(f"    Naukri error '{query}' {city}: {e}")
-                if blocked_streak >= 2:
+                if browser_gone:
+                    print(f"    Naukri: stopped early with {len(jobs)} job(s) — "
+                          f"the window closed mid-run.")
+                elif blocked_streak >= 2:
                     print("    Naukri: stopping early — blocked by Akamai "
                           "(needs a headed browser on a residential IP)")
 
@@ -127,7 +160,10 @@ class ScraperAgent:
                 # something a resume can be matched against — the scorer would
                 # be guessing. The detail page has the real JD and we already
                 # hold a warm, unblocked context, so fetch it while we can.
-                await self._fetch_naukri_descriptions(page, jobs)
+                # Unless there is no context left to hold: the teasers are worth
+                # keeping, and the jobs still land with what the cards gave us.
+                if not browser_gone:
+                    await self._fetch_naukri_descriptions(page, jobs)
             finally:
                 await context.close()
         return jobs[:self.max_jobs_per_source]
@@ -171,7 +207,14 @@ class ScraperAgent:
                 )
                 filled += 1
                 await asyncio.sleep(random.uniform(2, 4))
-            except Exception:
+            except Exception as e:
+                if is_closed_error(e):
+                    # The streak counter would have stopped this after three
+                    # tries anyway, but it would have blamed "3 consecutive
+                    # failures" — a description-selector problem — for a browser
+                    # that simply is not there any more.
+                    print(f"    Naukri descriptions: browser gone after {filled} — stopping.")
+                    return
                 fail_streak += 1
         print(f"    Naukri descriptions: {filled}/{len(jobs)} fetched")
 
@@ -209,7 +252,13 @@ class ScraperAgent:
                 "needs to review the security", "additional verification required",
                 "complete the security check",
             ))
-        except Exception:
+        except Exception as e:
+            # A page we cannot read is not a page without a challenge. Swallowing
+            # everything here meant a closed browser answered "no challenge",
+            # which _solve_challenge reported as "[RESUME] cleared" — a window
+            # you closed read as a bot check you had solved.
+            if is_closed_error(e):
+                raise
             return False
 
     async def _solve_challenge(self, page, label: str) -> bool:
@@ -230,7 +279,23 @@ class ScraperAgent:
         while waited < timeout:
             await asyncio.sleep(5)
             waited += 5
-            if not await self._is_challenged(page):
+            # Closing the window is a perfectly reasonable way to say "not now",
+            # and it has to be distinguishable from solving the puzzle. It was
+            # not: the read failed, the failure was read as "no challenge", and
+            # the scrape carried on against a browser that no longer existed.
+            if page.is_closed():
+                print(f"    [ABORT] {label}: the window was closed — nothing left to clear.")
+                self._challenge_gave_up = True
+                return False
+            try:
+                still_challenged = await self._is_challenged(page)
+            except Exception as e:
+                if is_closed_error(e):
+                    print(f"    [ABORT] {label}: the browser is gone — giving up on this source.")
+                    self._challenge_gave_up = True
+                    return False
+                raise
+            if not still_challenged:
                 print(f"    [RESUME] {label}: cleared after {waited}s — continuing.")
                 return True
         print(f"    [TIMEOUT] {label}: not cleared within {timeout}s.")
@@ -323,6 +388,7 @@ class ScraperAgent:
         jobs = []
         seen = set()
         blocked_streak = 0
+        browser_gone = False
         self._challenge_gave_up = False
         async with async_playwright() as pw:
             context = await self._headed_context(pw, "indeed")
@@ -331,10 +397,10 @@ class ScraperAgent:
             page = context.pages[0] if context.pages else await context.new_page()
             try:
                 for query in INDIA_QUERIES[:6]:
-                    if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2:
+                    if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2 or browser_gone:
                         break
                     for city in INDIA_LOCATIONS:
-                        if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2:
+                        if len(jobs) >= self.max_jobs_per_source or blocked_streak >= 2 or browser_gone:
                             break
                         try:
                             rows = await self._load_indeed_page(page, query, city)
@@ -357,8 +423,19 @@ class ScraperAgent:
                             # Indeed rate-limits bursts; pace requests generously.
                             await asyncio.sleep(random.uniform(5, 9))
                         except Exception as e:
+                            if is_closed_error(e):
+                                # Nothing after this point can succeed, and every
+                                # attempt would report the same thing in the
+                                # vocabulary of a page-load failure.
+                                print("    Indeed: the browser window is gone — "
+                                      "stopping this source.")
+                                browser_gone = True
+                                break
                             print(f"    Indeed error '{query}' {city}: {e}")
-                if blocked_streak >= 2:
+                if browser_gone:
+                    print(f"    Indeed: stopped early with {len(jobs)} job(s) — "
+                          f"the window closed mid-run.")
+                elif blocked_streak >= 2:
                     print("    Indeed: stopping early — bot check not cleared "
                           "(solve it once in the window and the session is remembered)")
             finally:
