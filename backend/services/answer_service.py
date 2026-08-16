@@ -19,7 +19,7 @@ import json
 import hashlib
 from llm_provider import LLMProvider, RateLimited
 from db.mongodb import get_apply_profile, record_pending_question
-from utils.question_key import question_key
+from utils.question_key import question_key, question_signature
 
 
 def _norm(text: str) -> str:
@@ -251,11 +251,19 @@ class AnswerResolver:
         # a trailing "*" or a duplicated fragment of the label must not read as
         # a different question. It already did, four times out of eight.
         q = question_key(question)
+        sig = question_signature(question)
         for entry in self.profile.get("qa", []) or []:
             eq = question_key(entry.get("question", ""))
             if not eq:
                 continue
-            if eq == q or (len(eq) > 15 and (eq in q or q in eq)):
+            # Same words, or the same question wearing different words. The
+            # second is equality after canonicalisation rather than a
+            # similarity score — see question_signature for why a threshold
+            # cannot work here.
+            same = (eq == q
+                    or (len(eq) > 15 and (eq in q or q in eq))
+                    or (sig and question_signature(entry.get("question", "")) == sig))
+            if same:
                 val = (entry.get("answer") or "").strip()
                 if val:
                     return val
@@ -342,6 +350,28 @@ class AnswerResolver:
         if any_("background check", "background verification", "drug test", "willing to undergo"):
             return "Yes"
 
+        # "Do you have 4+ years of Python?" is a yes/no question that happens
+        # to contain a number. The years rule below saw the number and answered
+        # "3" — a bare figure typed into a Yes/No control, which is the same
+        # category error as "30 LPA" in a decimal box. The comparison is
+        # deterministic and reads only your own stated years, so it is a fact
+        # about the profile rather than a judgement about you.
+        need = re.search(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:or more\s*)?(?:years|yrs)", q)
+        if need and any_("do you have", "have you", "are you", "at least",
+                         "minimum", "min ", "atleast"):
+            mine = None
+            for skill, yrs in (p.get("skill_years") or {}).items():
+                if skill and _norm(skill) in q:
+                    mine = numeric_text(yrs)
+                    break
+            if mine is None:
+                mine = numeric_text(p.get("total_years_experience"))
+            if mine is not None:
+                try:
+                    return _yn(float(mine) >= float(need.group(1)))
+                except ValueError:
+                    pass
+
         # Years of experience — checked before the language rule, because forms
         # phrase skills as "Python (Programming Language)" and that word would
         # otherwise be treated as a spoken-language question.
@@ -355,7 +385,11 @@ class AnswerResolver:
             return str(p.get("total_years_experience") or "") or None
 
         # Spoken-language proficiency. "programming language" is not one.
-        if any_("proficiency", "fluency", "do you speak", "language") and "programming" not in q:
+        # "proficient" and "fluent" are how the same question is asked half the
+        # time; matching only the noun forms left a fully populated languages
+        # map unused and sent the question to you.
+        if any_("proficiency", "proficient", "fluency", "fluent",
+                "do you speak", "language") and "programming" not in q:
             langs = p.get("languages") or {}
             for lang, level in langs.items():
                 if lang and lang != "*" and _norm(lang) in q:
