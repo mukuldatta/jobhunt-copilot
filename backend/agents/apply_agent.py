@@ -135,6 +135,11 @@ def _js(body: str) -> str:
 # screening question.
 _DOC_NAME_RE = re.compile(r"\.(pdf|docx?|rtf)\b", re.I)
 
+
+def _norm_opt(text: str) -> str:
+    """Compare a chosen answer with an option's label, ignoring decoration."""
+    return " ".join(re.sub(r"[^a-z0-9+ ]", " ", str(text or "").lower()).split())
+
 # Questions whose answer LinkedIn will validate as a number even though the
 # input is a plain text box. The DOM hint (inputmode / pattern / type) is the
 # better signal and is checked first; this is the fallback for fields that
@@ -425,6 +430,212 @@ class ApplyAgent:
         "indeed": ("application submitted", "you've applied"),
         "dice": ("application submitted", "you have applied"),
     }
+
+    # ── Naukri's post-Apply questionnaire drawer ─────────────────────────────
+    #
+    # Clicking Apply on Naukri frequently does not submit: it opens a chatbot
+    # drawer down the right-hand side that asks the employer's screening
+    # questions one at a time, and the application completes only when the last
+    # one is answered. Seven of eight Naukri attempts in a 20-job batch stopped
+    # here, against ~100 eligible Naukri postings.
+    #
+    # Selectors read off the live DOM rather than guessed. Note the drawer is
+    # position:fixed, which makes offsetParent null — a visibility check written
+    # that way sees an empty page, which is how this went unexamined for so long.
+    NAUKRI_DRAWER = ".chatbot_Drawer, ._chatBotContainer .chatbot_DrawerContentWrapper"
+
+    async def _naukri_drawer(self, page):
+        """The drawer element if it is open, else None."""
+        try:
+            el = await page.query_selector(self.NAUKRI_DRAWER)
+            return el if el and await el.is_visible() else None
+        except Exception:
+            return None
+
+    async def _read_naukri_question(self, page) -> dict:
+        """
+        The question currently on screen, and how it wants to be answered.
+
+        Two shapes exist: a free-text box, and a set of choices. Both are read
+        here so the caller does not have to care which it is.
+        """
+        return await page.evaluate("""() => {
+            const drawer = document.querySelector('.chatbot_Drawer, ._chatBotContainer');
+            if (!drawer) return null;
+            // The bot's messages accumulate; the live question is the last one.
+            const asked = [...drawer.querySelectorAll('li.botItem, .botMsg')]
+                .map(e => (e.innerText || '').trim()).filter(Boolean);
+            const question = asked.length ? asked[asked.length - 1] : '';
+
+            // Choices, when the employer supplied them. Marked so the caller
+            // can click one without re-deriving which is which.
+            // Deduped by label: the selector below deliberately matches both
+            // an input and its wrapping label so neither markup is missed,
+            // which means every choice is found twice.
+            const options = [];
+            const seenLabels = new Set();
+            let n = 0;
+            drawer.querySelectorAll(
+                'input[type=checkbox], input[type=radio], [class*=chip] li, '
+                + '[class*=chip] [class*=item], [class*=Chip] li, label'
+            ).forEach(e => {
+                const isInput = ['input'].includes(e.tagName.toLowerCase());
+                const label = isInput
+                    ? ((e.closest('label') || {}).innerText
+                       || (document.querySelector('label[for="' + e.id + '"]') || {}).innerText
+                       || e.value || '')
+                    : (e.innerText || '');
+                const text = (label || '').trim();
+                if (!text || text.length > 70) return;
+                const key = text.toLowerCase();
+                if (seenLabels.has(key)) return;
+                seenLabels.add(key);
+                // Mark what a person would actually click. Naukri builds each
+                // choice as
+                //     div.ssrc__radio-btn-container > input + label.ssrc__label
+                // so the label is a SIBLING of the radio, not an ancestor:
+                // closest('label') finds nothing and falling back to the parent
+                // marks the container, which no click does anything to. The
+                // radio itself is invisible behind the label and times out.
+                let target = e;
+                if (isInput) {
+                    const byFor = e.id
+                        ? document.querySelector('label[for="'
+                            + ((window.CSS && CSS.escape) ? CSS.escape(e.id) : e.id) + '"]')
+                        : null;
+                    target = byFor
+                        || (e.parentElement && e.parentElement.querySelector('label'))
+                        || e;
+                }
+                const mark = 'jhopt' + (n++);
+                target.setAttribute('data-jh-opt', mark);
+                options.push({mark, text, checked: e.checked === true});
+            });
+
+            const box = drawer.querySelector('.textArea[contenteditable], [contenteditable=true]');
+            return {
+                question,
+                options,
+                hasTextBox: !!box,
+                saveDisabled: !!drawer.querySelector('.send.disabled'),
+            };
+        }""")
+
+    async def _fill_naukri_drawer(self, page, job: dict = None) -> dict:
+        """
+        Answer the drawer's questions until it completes, or hand them to you.
+
+        Same contract as the LinkedIn modal: answer only what the profile,
+        the learned store or a grounded model can support, and defer the rest
+        rather than typing something to make the form move.
+        """
+        unanswerable = []
+        last_question = None
+        for turn in range(8):
+            if not await self._naukri_drawer(page):
+                break                                   # the drawer closed: done asking
+            state = await self._read_naukri_question(page)
+            if not state or not state.get("question"):
+                break
+            question = state["question"]
+
+            # The same question twice means the answer did not take — a value
+            # the form rejected, or a Save that did not advance. Answering it
+            # again produces the same result, so stop rather than spending the
+            # whole budget on one question, which is what an unguarded loop did
+            # when Save was prevented from working.
+            if question == last_question:
+                self._say(f"    drawer did not advance past: {question[:52]}")
+                unanswerable.append({"question": question,
+                                     "options": [o["text"] for o in state.get("options", [])],
+                                     "hint": "the form did not accept the answer"})
+                break
+            last_question = question
+            options = [o["text"] for o in state.get("options", [])]
+            self._say(f"    drawer q{turn + 1}: {question[:64]}"
+                      + (f" {options}" if options else ""))
+
+            kind = "select" if options else (
+                "number" if any(k in question.lower() for k in NUMERIC_QUESTION_HINTS) else "text")
+            answer = await self.answers.answer(question, options=options or None, kind=kind)
+            if answer is None:
+                unanswerable.append({"question": question, "options": options, "hint": ""})
+                break
+
+            if options:
+                target = next((o for o in state["options"]
+                               if _norm_opt(o["text"]) == _norm_opt(str(answer))), None)
+                if target is None:
+                    target = next((o for o in state["options"]
+                                   if _norm_opt(str(answer)) in _norm_opt(o["text"])), None)
+                if target is None:
+                    unanswerable.append({"question": question, "options": options,
+                                         "hint": f"no option matches {answer!r}"})
+                    break
+                if not await self._click_option(page, target["mark"]):
+                    self._say(f"    could not pick {target['text']!r}")
+                    unanswerable.append({"question": question, "options": options, "hint": ""})
+                    break
+            else:
+                try:
+                    box = page.locator('.textArea[contenteditable], [contenteditable=true]').first
+                    await box.click(timeout=8000)
+                    await box.fill(str(answer))
+                except Exception as e:
+                    self._say(f"    could not type the answer: {str(e)[:60]}")
+                    unanswerable.append({"question": question, "options": options, "hint": ""})
+                    break
+
+            self._say(f"    drawer a{turn + 1}: {str(answer)[:44]}")
+            if self.dry_run:
+                return await self._dry_stop(page, "naukri", "the questionnaire drawer")
+            try:
+                await page.click(".sendMsgbtn_container .send, .sendMsg", timeout=8000)
+            except Exception as e:
+                self._say(f"    could not submit the answer: {str(e)[:60]}")
+                break
+            await asyncio.sleep(3)
+
+        if unanswerable:
+            await self._screenshot(page, "naukri_drawer_question")
+            return await self._defer_for_questions(page, unanswerable, job)
+        return None      # nothing left to ask — the caller confirms the outcome
+
+    async def _click_option(self, page, mark: str) -> bool:
+        """
+        Click a drawer choice, however it is built.
+
+        Two attempts, because these choices are not ordinary buttons: the real
+        input is hidden behind a styled label, and the label itself may be
+        covered by its own pseudo-element. A normal click times out on the live
+        drawer; dispatching one on the element works and is still a click the
+        page's own handlers see.
+        """
+        sel = f'[data-jh-opt="{mark}"]'
+        try:
+            await page.click(sel, timeout=4000)
+            return True
+        except Exception:
+            pass
+        try:
+            return await page.evaluate("""(sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                el.click();
+                // The control may be a sibling (Naukri) or a descendant
+                // (other boards). Click it directly if the label did not take.
+                const near = el.querySelector('input[type=checkbox], input[type=radio]')
+                    || (el.parentElement && el.parentElement.querySelector(
+                            'input[type=checkbox], input[type=radio]'));
+                if (near && !near.checked) {
+                    near.click();
+                    near.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+                return true;
+            }""", sel)
+        except Exception as e:
+            self._say(f"    option click failed: {str(e)[:60]}")
+            return False
 
     async def _visible_controls(self, page, limit: int = 10) -> list:
         """
@@ -1821,12 +2032,33 @@ class ApplyAgent:
         if self.dry_run:
             return await self._dry_stop(page, "naukri", "Apply button")
 
-        await apply_btn.click()
+        # page.click re-resolves the selector and waits for actionability.
+        # ElementHandle.click holds a node Naukri's re-render can detach
+        # underneath it, which surfaced as "Element is not attached to the DOM"
+        # and lost the posting to apply_failed.
+        try:
+            await page.click(self.APPLY_CONTROL["naukri"], timeout=15000)
+        except Exception:
+            await apply_btn.click()
         await asyncio.sleep(3)
 
         # Naukri may redirect to the company site for many roles.
         if "naukri.com" not in page.url.lower():
             return self._external_apply(job)
+
+        # The questionnaire drawer, if this employer has one. It takes a few
+        # seconds to render, and until it is answered the application is not
+        # submitted — which is why clicking Apply and looking for confirmation
+        # three seconds later found nothing on seven of eight postings.
+        for _ in range(4):
+            if await self._naukri_drawer(page):
+                self._say("    naukri opened its questionnaire drawer")
+                deferred = await self._fill_naukri_drawer(page, job)
+                if deferred:
+                    return deferred
+                await asyncio.sleep(3)
+                break
+            await asyncio.sleep(2)
 
         applied = await page.query_selector('[class*="applied"], button[disabled][title*="Applied"]')
         if applied:

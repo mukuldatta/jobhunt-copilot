@@ -58,6 +58,54 @@ def _parse_answer(raw: str):
     return raw.splitlines()[0].strip().strip('"').strip("'"), ""
 
 
+def _option_matches_number(option: str, value: float) -> bool:
+    """
+    Does this option describe a band that contains `value`?
+
+    Naukri's questionnaire offers experience as buckets — "No experience",
+    "<4 years", "4-5 years", ">8 years" — while the profile holds a single
+    number. Without this the resolver answers "3", nothing matches it, and a
+    question the profile settles completely is handed to a human instead.
+    """
+    t = " ".join(str(option or "").lower().split())
+    if not t:
+        return False
+    if re.search(r"\b(no|none|fresher|nil)\b", t) and not re.search(r"\d", t):
+        return value == 0
+    span = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d+(?:\.\d+)?)", t)
+    if span:
+        return float(span.group(1)) <= value <= float(span.group(2))
+    under = re.search(r"(?:<|≤|under|less than|below|upto|up to)\s*(\d+(?:\.\d+)?)", t)
+    if under:
+        return value < float(under.group(1)) if "<" in t or "less" in t or "below" in t \
+            else value <= float(under.group(1))
+    over = re.search(r"(?:>|≥|over|more than|above|\+)\s*(\d+(?:\.\d+)?)", t)
+    if over:
+        return value > float(over.group(1))
+    plus = re.search(r"(\d+(?:\.\d+)?)\s*\+", t)
+    if plus:
+        return value >= float(plus.group(1))
+    lone = re.fullmatch(r"[^\d]*(\d+(?:\.\d+)?)[^\d]*", t)
+    if lone:
+        return value == float(lone.group(1))
+    return False
+
+
+def _snap_number_to_range(answer, options: list):
+    """Pick the band an answer of "3" belongs to. None when nothing fits."""
+    n = numeric_text(answer)
+    if n is None or not options:
+        return None
+    try:
+        value = float(n)
+    except ValueError:
+        return None
+    for o in options:
+        if _option_matches_number(o, value):
+            return o
+    return None
+
+
 _ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -536,4 +584,4 @@ RULES:
             no = _norm(o)
             if no and (a in no or no in a):
                 return o
-        return None
+        return _snap_number_to_range(answer, options)
