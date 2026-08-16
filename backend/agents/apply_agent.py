@@ -377,6 +377,17 @@ class ApplyAgent:
 
         job_id = job.get("job_id", "")
 
+        # Have we been here before? The board knows even when we do not. An
+        # application submitted in a run that died before record_application
+        # leaves no trace on our side, so the job came back through the queue,
+        # found no apply button — because the board replaces it with
+        # "Application submitted" — and reported that as a drifted selector.
+        # It then spent its retries rediscovering the same thing.
+        if await self._already_applied_on_page(page, source):
+            await update_job(job_id, {"apply_type": "in_platform"})
+            return {"status": "already_applied", "url": page.url,
+                    "message": "Already applied — the board still shows this application."}
+
         if await self._looks_expired(page):
             await update_job(job_id, {"apply_type": "expired"})
             return {"status": "expired", "url": page.url,
@@ -397,6 +408,49 @@ class ApplyAgent:
 
         # No control and no marker — ambiguous, and not something to guess at.
         return await self._no_apply_control(page, job, source)
+
+    # How each board says "you have already applied to this one". Matched
+    # against VISIBLE text, never page HTML: LinkedIn ships the phrase
+    # "Application submitted" inside its own bundles on every job page, so
+    # searching the source would mark every posting as already applied and
+    # empty the queue in one pass.
+    # Phrases must be specific enough that ordinary posting furniture cannot
+    # trip them. A false positive here is terminal AND writes an application
+    # record for something never submitted, so "applied on" is deliberately not
+    # in this list — "applied on" appears in applicant counts and in "Apply on
+    # company site", and the cost of that mistake is a job silently marked done.
+    APPLIED_MARKERS = {
+        "linkedin": ("application submitted", "you've applied", "you applied"),
+        "naukri": ("you have already applied", "already applied", "application sent"),
+        "indeed": ("application submitted", "you've applied"),
+        "dice": ("application submitted", "you have applied"),
+    }
+
+    async def _visible_controls(self, page, limit: int = 10) -> list:
+        """
+        The buttons and headings actually on screen, for a failure message.
+
+        A verdict of "something went wrong" that does not say what was in front
+        of it costs a round trip through a screenshot and a human every time.
+        """
+        try:
+            return await page.evaluate(
+                """(n) => [...document.querySelectorAll('button, a[role=button], h1, h2, h3')]
+                    .filter(e => e.offsetParent !== null)
+                    .map(e => (e.innerText || '').trim())
+                    .filter(t => t && t.length < 60).slice(0, n)""", limit)
+        except Exception:
+            return []
+
+    async def _already_applied_on_page(self, page, platform: str) -> bool:
+        try:
+            visible = (await page.inner_text("body")).lower()
+        except Exception:
+            # Unreadable proves nothing. Saying "no" here means the run
+            # continues and discovers the truth further in, which is the
+            # direction that cannot lose an application.
+            return False
+        return any(p in visible for p in self.APPLIED_MARKERS.get(platform, ()))
 
     async def _finalize(self, job_id: str, result: dict):
         status = result.get("status")
@@ -446,7 +500,18 @@ class ApplyAgent:
             await finish_job_apply(job_id, "new" if attempts < self.max_apply_attempts
                                    else "manual_required")
         elif status == "already_applied":
-            pass
+            # Reachable two ways. Before the claim, when our own records already
+            # said so — nothing to finalize, and _finalize is not called. Or
+            # from the preflight, when the BOARD says so and we had no record:
+            # the job is claimed by then, so leaving it alone would strand it in
+            # 'applying' until the stale-claim sweep an hour later. Write the
+            # record we are missing, so this is the last time it is offered.
+            await finish_job_apply(job_id, "applied")
+            await record_application(job_id, {
+                "status": "applied",
+                "applied_at": datetime.utcnow(),
+                "notes": "Reconciled: the board reported an existing application.",
+            })
         else:  # error
             await finish_job_apply(job_id, "apply_failed")
 
@@ -1109,9 +1174,23 @@ class ApplyAgent:
                 const numericHint = type === 'number' ||
                     ['numeric', 'decimal'].includes((e.inputMode || '').toLowerCase()) ||
                     pat.indexOf('0-9') >= 0;
+                // A <select> resting on its own placeholder is EMPTY, whatever
+                // its value attribute says. LinkedIn ships these as
+                // <option>Select an option</option> with a non-blank value, so
+                // "has a value" was true and the field was skipped as already
+                // answered — never offered to the resolver, left untouched, and
+                // then rejected by the form's own validation as "Please enter a
+                // valid answer". Three of those on one posting, and a
+                // "Do you have minimum 3 yrs of experience?" that the profile
+                // could have answered outright, deferred to a human instead.
+                const sel = e.tagName.toLowerCase() === 'select';
+                const chosen = sel && e.selectedIndex >= 0 && e.options[e.selectedIndex]
+                    ? (e.options[e.selectedIndex].innerText || '').trim() : '';
+                const placeholder = sel && (!e.value || /^(select|choose|please|--)/i.test(chosen));
                 out.push({q, id: e.id || null, jh: e.getAttribute('data-jh-id'),
                           tag: e.tagName.toLowerCase(), type, numericHint,
-                          hasValue: !!(e.value && e.value.trim()), options: opts});
+                          hasValue: !!(e.value && e.value.trim()) && !placeholder,
+                          options: opts});
             });
             return out;
         }"""), LINKEDIN_MODAL_SEL)
@@ -1756,8 +1835,28 @@ class ApplyAgent:
         confirmed = await self._verify_submission(page)
         if confirmed:
             return confirmed
+
+        # Naukri often answers the click with a questionnaire drawer rather than
+        # a confirmation, and three seconds is not long enough to tell the two
+        # apart. Give it a moment and look again before concluding anything.
+        await asyncio.sleep(5)
+        if await self._already_applied_on_page(page, "naukri"):
+            return {"status": "applied", "message": "Successfully applied on Naukri."}
+        confirmed = await self._verify_submission(page)
+        if confirmed:
+            return confirmed
+
+        # This is where the run ends without knowing why, so it is exactly where
+        # a picture is worth having. Every LinkedIn failure today was diagnosable
+        # because it left one; this path returned the same verdict blind, and the
+        # nine seconds it took to reach were unreadable afterwards.
+        await self._screenshot(page, "naukri_after_apply_click")
+        controls = await self._visible_controls(page)
+        self._say(f"    naukri: no confirmation. controls on screen: {controls}")
         return {"status": "needs_review", "url": page.url,
-                "message": "Clicked Apply on Naukri — may need profile completion or extra steps."}
+                "message": (f"Clicked Apply on Naukri and saw no confirmation — it may want "
+                            f"profile completion or extra answers. On screen: {controls}. "
+                            f"Screenshot in backend/logs/apply.")}
 
     # ── Indeed Apply ─────────────────────────────────────────────────────────
 

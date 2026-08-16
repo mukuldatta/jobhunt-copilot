@@ -131,6 +131,15 @@ async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:
     log = []
     login_needed = set()   # platforms not signed in — skip their remaining jobs
     stuck = 0              # consecutive needs_review (unattended CAPTCHA, etc.)
+    # The guard was written when needs_review meant "paused on a bot check" —
+    # each one burning a full human timeout, so two in a row meant nobody was
+    # there and the rest of the batch would burn the same way. It now also
+    # covers outcomes that cost seconds and submit nothing: a control that
+    # never rendered, a click with no confirmation. Two of those are not
+    # evidence that the run should stop, and a batch measured for its success
+    # rate cannot get past them. Raise AUTO_APPLY_STUCK_LIMIT to look further;
+    # the default stays where it was.
+    stuck_limit = max(1, _int("AUTO_APPLY_STUCK_LIMIT", 2))
     delay_min = _int("AUTO_APPLY_DELAY_MIN_SEC", 20)
     delay_max = _int("AUTO_APPLY_DELAY_MAX_SEC", 40)
 
@@ -180,13 +189,13 @@ async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:
         # cycle rather than pausing on every remaining job.
         if st == "needs_review":
             stuck += 1
-            if stuck >= 2:
+            if stuck >= stuck_limit:
                 log.append({"result": "halted",
-                            "msg": "2 consecutive applications needed manual review "
-                                   "(likely an unattended CAPTCHA) — stopping cycle"})
-                logger.warning("AutoApply halted: 2 consecutive needs_review")
-                agent_state.log("halted: two applications in a row needed review "
-                                "(usually an unattended CAPTCHA)")
+                            "msg": f"{stuck} consecutive applications needed manual review "
+                                   f"(likely an unattended CAPTCHA) — stopping cycle"})
+                logger.warning(f"AutoApply halted: {stuck} consecutive needs_review")
+                agent_state.log(f"halted: {stuck} applications in a row needed review "
+                                f"(usually an unattended CAPTCHA)")
                 break
         else:
             stuck = 0
