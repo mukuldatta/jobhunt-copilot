@@ -8,6 +8,7 @@ naming Java as a gap. These are the rules that replaced that.
 
 import pytest
 
+
 from utils.score_rules import (
     EXPERIENCE_MAX,
     SCORER_VERSION,
@@ -18,6 +19,51 @@ from utils.score_rules import (
     required_years,
     skills_match,
 )
+
+
+class TestRequiredYearsDecimals:
+    """
+    Job boards emit "6.0-10.0 Years". The pattern only understood integers, so
+    the sole thing that matched was the "0" of the trailing ".0" immediately
+    before "Years" — a posting demanding six to ten years was recorded as
+    demanding none. required_years gates APPLY_YEARS_STRETCH, so the guardrail
+    switched itself off for precisely the postings it exists to catch, and a
+    6-10 year role was auto-applied to against a 3-year resume.
+    """
+
+    @pytest.mark.parametrize("text,expected", [
+        ("Years of Experience: 6.0-10.0 Years", 6),
+        ("6.0-10.0 Years of experience required", 6),
+        ("Minimum 5.5 years experience", 5),
+        ("10.0 years minimum", 10),
+        ("Experience 2.5 to 4.0 yrs", 2),
+    ])
+    def test_decimal_forms_read_the_lower_bound(self, text, expected):
+        assert required_years(text) == expected
+
+    @pytest.mark.parametrize("text,expected", [
+        ("Years of Experience: 6-10 Years", 6),
+        ("3+ years of experience", 3),
+        ("We need 6 to 10 years of experience", 6),
+        ("Experience: 0-5 Yrs", 0),          # zero is a real answer
+    ])
+    def test_integer_forms_still_work(self, text, expected):
+        assert required_years(text) == expected
+
+    @pytest.mark.parametrize("text", [
+        "a 35 year old IT services organization",
+        "founded more than 40 years ago",
+        "15 years full time education",
+        "no mention of duration at all",
+    ])
+    def test_non_requirements_stay_unknown(self, text):
+        # None means unknown and must never collapse into 0, which would read
+        # as "this posting asks for no experience" and always be eligible.
+        assert required_years(text) is None
+
+    def test_fraction_is_never_a_figure_of_its_own(self):
+        # The exact regression: ".0" before "Years" must not surface as 0.
+        assert required_years("6.0-10.0 Years") != 0
 
 
 class TestMentions:

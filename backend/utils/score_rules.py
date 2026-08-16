@@ -25,7 +25,11 @@ from typing import Optional
 #   2 = skills and location computed; LLM judges experience and domain only
 #   3 = experience computed from the demanded years too; LLM judges domain only
 #   4 = computed dimensions read the whole posting, not the truncated prompt
-SCORER_VERSION = 4
+#   5 = required_years understands decimal ranges. "6.0-10.0 Years" had matched
+#       only the "0" of the trailing ".0", so senior postings were scored as
+#       demanding no experience at all — full marks on a dimension they should
+#       have failed, and APPLY_YEARS_STRETCH waved them through.
+SCORER_VERSION = 5
 
 SKILLS_MAX = 40
 LOCATION_MAX = 10
@@ -133,9 +137,22 @@ def text_of(items) -> str:
 
 EXPERIENCE_MAX = 30
 
-# "3-5 years", "3 - 6 Years", "6 to 12 years", "5+ yrs", "5 years of experience".
+# "3-5 years", "3 - 6 Years", "6 to 12 years", "5+ yrs", "5 years of experience",
+# and the decimal forms job boards actually emit: "6.0-10.0 Years".
+#
+# The decimals matter more than they look. Without them, "6.0-10.0 Years" was
+# not read as 6 — the only thing that matched was the "0" of the trailing ".0"
+# sitting directly before "Years", so a posting demanding six to ten years was
+# recorded as demanding none. required_years feeds APPLY_YEARS_STRETCH, so that
+# turned the guardrail off for exactly the postings it exists to catch, and a
+# 6-10 year role was auto-applied to on a 3-year resume.
+#
+# The lookbehind is what fixes it: a captured number may not follow a digit or
+# a decimal point, so a fractional part can never be mistaken for a figure in
+# its own right.
 _YEARS_RE = re.compile(
-    r"(\d{1,2})\s*(?:\+|plus)?\s*(?:[-–—]|to)?\s*(\d{1,2})?\s*(?:\+|plus)?\s*"
+    r"(?<![\d.])(\d{1,2})(?:\.\d+)?\s*(?:\+|plus)?\s*"
+    r"(?:(?:[-–—]|to)\s*\d{1,2}(?:\.\d+)?\s*(?:\+|plus)?\s*)?"
     r"(?:year|yr)s?\b",
     re.I,
 )
