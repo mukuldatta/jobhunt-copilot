@@ -2,6 +2,7 @@ import os
 import re
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -406,6 +407,25 @@ async def finish_job_apply(job_id: str, status: str) -> bool:
         {"$set": {"status": status, "apply_finished_at": datetime.utcnow()}},
     )
     return result.modified_count > 0
+
+
+async def bump_apply_attempt(job_id: str) -> int:
+    """
+    Count one ambiguous apply attempt and return the new total.
+
+    Only inconclusive outcomes call this — a posting we could not read, not one
+    we read and rejected. It is what lets an unreadable job be retried a bounded
+    number of times instead of either being burned on the first bad render or
+    retried forever.
+    """
+    db = get_db()
+    doc = await db.jobs.find_one_and_update(
+        {"job_id": job_id},
+        {"$inc": {"apply_attempts": 1}},
+        projection={"apply_attempts": 1, "_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    return (doc or {}).get("apply_attempts", 1)
 
 
 async def record_application(job_id: str, doc: dict) -> str:

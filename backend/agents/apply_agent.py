@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import tempfile
+import time
 from datetime import datetime
 from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright
@@ -10,13 +11,13 @@ from agents.cover_letter_agent import CoverLetterAgent
 from services.answer_service import AnswerResolver
 from utils.pdf_generator import generate_resume_pdf
 from utils.resume_validator import validate_tailored_resume, clean_resume_text
-from services.alert_service import send_manual_action_alert
+from services.alert_service import send_manual_action_alert, send_question_email
 from services import agent_state
 from llm_provider import RateLimited, is_rate_limited, cooldown_remaining
 from platforms import apply_supported, disabled_reason
 from db.mongodb import (
     get_application_by_job_id, claim_job_for_apply, finish_job_apply, record_application,
-    update_job,
+    update_job, bump_apply_attempt, mark_question_emailed,
     save_auth_state, clear_auth_state,
 )
 from dotenv import load_dotenv
@@ -68,6 +69,78 @@ EXTERNAL_MARKERS = {
         'a[data-cy="external-apply"]',
     ),
 }
+
+# LinkedIn's Easy Apply modal was a native <dialog open>, and everything that
+# drove the form was scoped to it. It no longer carries dialog semantics at all
+# — no <dialog>, no role=dialog, no aria-modal — so all of it silently stopped
+# matching and the agent reported "the modal did not open" over a screenshot
+# showing it plainly open, populated and waiting on Next.
+#
+# Each of these is present ONLY while the modal is up: measured 0 before the
+# click, 1 while open, 0 after closing. dialog[open] stays first so this keeps
+# working if LinkedIn reverts or A/B tests the old markup back.
+#
+# One selector, used by both the Python locators and the in-page JS below — the
+# duplicated copy of the apply-button selector is exactly how the last drift
+# went unnoticed on one path while the other was fixed.
+LINKEDIN_MODAL_SEL = "dialog[open], [data-test-modal], .artdeco-modal"
+
+# Playwright's own selector engine pierces open shadow roots. document.querySelector
+# does not, and LinkedIn now renders the Easy Apply modal inside a shadow root on a
+# div.theme--light. So every page.evaluate() that looked for the modal found nothing
+# while the Playwright locators beside it found it fine — and the ones that fell back
+# to `|| document` went on to scrape the entire page instead. That is how a run
+# reported filling the form and its only "field" was the notification bell:
+#
+#     fields found in modal: ['Notifications', 'Gen AI Engineer, Bengaluru...']
+#     [ok] Notifications -> 0
+#
+# Anything reaching into the modal from in-page JS has to walk shadow roots, and
+# must return nothing rather than the page when the modal is absent: typing into
+# whatever the page happens to expose is worse than not answering at all.
+_DEEP_QUERY_JS = """
+    const deepQuery = (sel) => {
+        const direct = document.querySelector(sel);
+        if (direct) return direct;
+        const stack = [document];
+        while (stack.length) {
+            const root = stack.pop();
+            for (const el of root.querySelectorAll('*')) {
+                if (!el.shadowRoot) continue;
+                const hit = el.shadowRoot.querySelector(sel);
+                if (hit) return hit;
+                stack.push(el.shadowRoot);
+            }
+        }
+        return null;
+    };
+"""
+
+
+def _js(body: str) -> str:
+    """Inline the shadow-piercing helper wherever a body asks for it."""
+    return body.replace("__DEEP_QUERY__", _DEEP_QUERY_JS)
+
+
+# The modal's footer buttons, matched by ACCESSIBLE name — which is the
+# aria-label when one is present, not the visible text. LinkedIn's Next button
+# reads <button aria-label="Continue to next step">Next</button>, so the old
+# get_by_role(name="Next", exact=True) could never match it: the form filled
+# correctly, then stalled on step 1 every time because nothing advanced it.
+#
+# These stay scoped to the modal (see _modal), which is what stops the
+# recommended-jobs carousel's own "Next" from being picked up — the exact=True
+# that used to serve that purpose was the thing breaking it.
+# A control labelled with a document filename is a resume chooser, never a
+# screening question.
+_DOC_NAME_RE = re.compile(r"\.(pdf|docx?|rtf)\b", re.I)
+
+NEXT_NAME = re.compile(r"(^next$|continue to next|^continue$)", re.I)
+REVIEW_NAME = re.compile(r"^review", re.I)
+# Deliberately anchored. This is the irreversible click, and a loose pattern
+# that caught some other control would submit an application we never checked.
+# Missing it costs a retry; matching the wrong thing cannot be undone.
+SUBMIT_NAME = re.compile(r"^submit", re.I)
 
 # Serialize applies process-wide: parallel headed Chrome logins are an instant
 # bot signal, and two runs must never submit the same job at once.
@@ -129,6 +202,10 @@ class ApplyAgent:
         self.headless = os.environ.get("APPLY_HEADLESS", "").strip().lower() in ("1", "true", "yes")
         self.human_timeout = int(os.environ.get("APPLY_HUMAN_TIMEOUT", "300"))
         self.login_timeout = int(os.environ.get("LOGIN_TIMEOUT", "420"))
+        # How many inconclusive attempts a posting gets before we stop asking.
+        # See _finalize — this is what keeps selector drift from permanently
+        # burning a queue of perfectly applicable jobs.
+        self.max_apply_attempts = int(os.environ.get("APPLY_MAX_ATTEMPTS", "3"))
         # APPLY_DRY_RUN: navigate + fill the form but stop before the final submit
         # (screenshot it) — for safely tuning selectors without applying for real.
         self.dry_run = os.environ.get("APPLY_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
@@ -198,8 +275,18 @@ class ApplyAgent:
     # The in-platform apply control per board — the thing whose presence means
     # "we can submit this ourselves".
     APPLY_CONTROL = {
-        "linkedin": ('button.jobs-apply-button, button[aria-label*="Easy Apply"], '
-                     'button:has-text("Easy Apply"), .jobs-s-apply button'),
+        # LinkedIn ships per-build obfuscated class names and has moved the
+        # control from <button class="jobs-apply-button"> to an <a>, so every
+        # class- and tag-based selector we had matched nothing at all — the
+        # button was plainly visible in the failure screenshots while all four
+        # selectors returned zero. The accessible name is the only stable
+        # handle left.
+        #
+        # Do NOT reach for :has-text("Easy Apply") here: the recommended-jobs
+        # cards further down the page carry that text too, so it would resolve
+        # to a different posting and apply to the wrong job.
+        "linkedin": ('a[aria-label*="Easy Apply" i], button[aria-label*="Easy Apply" i], '
+                     '.jobs-apply-button, .jobs-s-apply button'),
         "naukri": 'button#apply-button, a#apply-button, button.apply-button, button[title*="Apply"]',
         "dice": ('apply-button-wc, button[data-cy="apply-button"], '
                  'a[data-cy="apply-button"], button[id*="apply"]'),
@@ -256,11 +343,39 @@ class ApplyAgent:
         elif status == "expired":
             # Terminal, and not your problem to finish by hand either.
             await finish_job_apply(job_id, "expired")
-        elif status in ("manual_required", "needs_review"):
+        elif status == "manual_required":
+            # A read answer: the posting itself says it applies elsewhere. Final.
             await finish_job_apply(job_id, "manual_required")
+        elif status == "needs_review":
+            # An unread answer: the control never appeared, the form stalled, a
+            # CAPTCHA went unattended. Selector drift and a slow render are
+            # indistinguishable here, and filing this terminally meant one bad
+            # run burned the posting forever — 53 live jobs were sitting in
+            # manual_required with working apply buttons because of it.
+            #
+            # Retry a bounded number of times instead. The retry is cheap: the
+            # control is checked in _preflight, before any tailoring, so a
+            # posting that is genuinely unreadable costs a page load and not an
+            # LLM call. After the budget it goes to manual_required and stops
+            # asking, so a permanently broken posting cannot spin forever.
+            attempts = await bump_apply_attempt(job_id)
+            if attempts < self.max_apply_attempts:
+                await finish_job_apply(job_id, "new")
+                print(f"    retryable: attempt {attempts}/{self.max_apply_attempts}, "
+                      f"returned to the queue")
+            else:
+                await finish_job_apply(job_id, "manual_required")
         elif status in ("login_required", "dry_run", "deferred"):
             # Not a real apply — release it so it can be retried later.
             await finish_job_apply(job_id, "new")
+        elif status == "question_pending":
+            # Waiting on you, not on us. Released so the next cycle retries it,
+            # but it still spends the ambiguity budget: reaching the questions
+            # costs a tailored resume and a cover letter, so a posting whose
+            # questions never get answered must not be re-tailored forever.
+            attempts = await bump_apply_attempt(job_id)
+            await finish_job_apply(job_id, "new" if attempts < self.max_apply_attempts
+                                   else "manual_required")
         elif status == "already_applied":
             pass
         else:  # error
@@ -656,16 +771,42 @@ class ApplyAgent:
     # A posting that has closed loses its apply control, which looks identical
     # to a selector that has drifted. Checking this first keeps a dead job from
     # being filed as a bug in our code.
+    # Phrases must stay specific. This runs against the whole page HTML, so a
+    # loose fragment like "is expired" also matches bundled script text and an
+    # unrelated banner, and a false positive here is terminal: the job is filed
+    # apply_type=expired and never looked at again.
     CLOSED_PHRASES = ("no longer accepting", "position has been filled", "job has expired",
                       "no longer available", "posting has been closed",
-                      "this job is no longer", "applications are closed")
+                      "this job is no longer", "applications are closed",
+                      # Naukri does not 404 a dead posting — it redirects to a
+                      # search page carrying this line. Nothing above matched it
+                      # ("is expired", not "has expired"), so closed Naukri jobs
+                      # were reaching _no_apply_control and being filed as our
+                      # bug rather than as a dead posting.
+                      "job you are looking for is expired")
 
     async def _looks_expired(self, page) -> bool:
+        """
+        Read the phrases off the *rendered* page, not the raw HTML.
+
+        page.content() returns the whole document including every bundled
+        script and i18n table, and LinkedIn ships strings like "no longer
+        accepting applications" inside those regardless of whether this
+        posting is open. That made expiry depend on which bundle happened to
+        be in the response: a live NTT DATA posting with a working Easy Apply
+        button was filed apply_type=expired, which is terminal and excludes it
+        from the apply queue for good.
+
+        Visible text can only say a posting is closed when the page actually
+        says so. If a banner ever hides somewhere inner_text cannot reach, the
+        job falls through to needs_review instead — retryable, which is the
+        right direction to fail in.
+        """
         try:
-            content = (await page.content()).lower()
+            visible = (await page.inner_text("body")).lower()
         except Exception:
             return False
-        return any(p in content for p in self.CLOSED_PHRASES)
+        return any(p in visible for p in self.CLOSED_PHRASES)
 
     def _external_apply(self, job: dict) -> dict:
         return {"status": "manual_required", "url": job.get("url", ""),
@@ -676,12 +817,43 @@ class ApplyAgent:
         Wait for the apply control to render instead of sampling the DOM once.
         Both Naukri and LinkedIn hydrate that button client-side, so a bare
         query_selector after a fixed sleep loses the race on a cold profile.
+
+        Poll for the first *visible, enabled* match rather than deferring to
+        wait_for_selector. These pages render the control twice — a sticky
+        header copy plus the one in the top card — and only one of the pair is
+        visible at a time. wait_for_selector resolves the selector to the first
+        node in DOM order and then waits for that specific node to become
+        visible, so a hidden duplicate sitting ahead of the real control times
+        out while a perfectly clickable button is on screen. Naukri serves
+        exactly that shape: two #apply-button nodes, one hidden.
+
+        Returning a hidden node is not the safer failure either — clicking it
+        throws or silently does nothing, which surfaces as a stalled form
+        rather than as the missing control it actually is.
         """
-        try:
-            await page.wait_for_selector(selector, timeout=timeout)
-        except Exception:
+        if not selector:
             return None
-        return await page.query_selector(selector)
+        deadline = time.monotonic() + timeout / 1000.0
+        while True:
+            try:
+                for el in await page.query_selector_all(selector):
+                    try:
+                        if not await el.is_visible():
+                            continue
+                        if not await el.is_enabled():
+                            continue
+                        # LinkedIn's anchor carries aria-disabled rather than the
+                        # disabled property, which is_enabled() cannot see.
+                        if (await el.get_attribute("aria-disabled") or "").lower() == "true":
+                            continue
+                        return el
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                return None
+            await asyncio.sleep(0.5)
 
     async def _no_apply_control(self, page, job: dict, platform: str) -> dict:
         """
@@ -733,11 +905,15 @@ class ApplyAgent:
 
     # ── Screening-question answering (structured profile, no guessing) ────────
 
-    async def _answer_form_fields(self, page) -> int:
+    async def _answer_form_fields(self, page) -> list:
         """
-        Fill screening questions using the answer profile. Returns the number of
-        required questions the profile could NOT answer — the caller pauses for a
-        human on those instead of guessing.
+        Fill screening questions using the answer profile.
+
+        Returns the questions the profile could NOT answer, as
+        [{"question": str, "options": list}]. The caller emails them and defers
+        the job rather than guessing — the count alone used to be enough when
+        the only response was "pause and let the human read the screen", but an
+        emailed question has to carry its own text and choices.
         """
         # Convenience fills that are always safe.
         if self.user_phone:
@@ -754,7 +930,7 @@ class ApplyAgent:
                     await el.fill(self.user_email)
                 break
 
-        unknown = 0
+        unknown = []
 
         # 1) Labelled text/number/select fields. LinkedIn's containers are
         # obfuscated, but each question's <label for> points at its field id, so
@@ -762,8 +938,12 @@ class ApplyAgent:
         # Walk every field in the dialog and derive its question text. LinkedIn
         # doesn't consistently use label[for], so fall back to aria-label and
         # then the nearest preceding text in the field's ancestry.
-        fields = await page.evaluate("""() => {
-            const root = document.querySelector('dialog[open]') || document;
+        fields = await page.evaluate(_js("""(MODAL_SEL) => {
+            __DEEP_QUERY__
+            // No modal means no questions to answer. Falling back to the page
+            // would offer up the nav and the notification bell as form fields.
+            const root = deepQuery(MODAL_SEL);
+            if (!root) return [];
             const out = [];
             let n = 0;
             root.querySelectorAll('input, select, textarea').forEach(e => {
@@ -834,7 +1014,7 @@ class ApplyAgent:
                           hasValue: !!(e.value && e.value.trim()), options: opts});
             });
             return out;
-        }""")
+        }"""), LINKEDIN_MODAL_SEL)
         print(f"    fields found in modal: {[f['q'][:40] for f in fields]}")
         for f in fields:
             q = f["q"]
@@ -853,14 +1033,14 @@ class ApplyAgent:
             ans = await self.answers.answer(q, options=f.get("options") or None, kind=kind)
             if ans is None:
                 print(f"    [?] no answer for: {q[:70]}")
-                unknown += 1
+                unknown.append({"question": q, "options": f.get("options") or []})
                 continue
             if numeric:
                 # "38 LPA" fails a field that asks for lakhs as a number.
                 ans = self._numeric_only(ans)
                 if ans is None:
                     print(f"    [?] no numeric value for: {q[:60]}")
-                    unknown += 1
+                    unknown.append({"question": q, "options": []})
                     continue
             loc = (page.locator(f'[id="{f["id"]}"]') if f["id"]
                    else page.locator(f'[data-jh-id="{f["jh"]}"]'))
@@ -876,8 +1056,10 @@ class ApplyAgent:
         # 2) Radio groups (yes/no). LinkedIn doesn't always wrap these in a
         # <fieldset><legend>, so group by the radios' shared name and derive the
         # question from the nearest ancestor text that isn't just the options.
-        groups = await page.evaluate("""() => {
-            const root = document.querySelector('dialog[open]') || document;
+        groups = await page.evaluate(_js("""(MODAL_SEL) => {
+            __DEEP_QUERY__
+            const root = deepQuery(MODAL_SEL);
+            if (!root) return [];
             const byName = new Map();
             root.querySelectorAll('input[type=radio]').forEach(r => {
                 const key = r.name || ('__' + (r.id || Math.random()));
@@ -932,14 +1114,23 @@ class ApplyAgent:
                 if (q && opts.length) out.push({q, radios: opts, anyChecked});
             }
             return out;
-        }""")
+        }"""), LINKEDIN_MODAL_SEL)
         for g in groups:
+            # The resume chooser is a radio group whose "question" is a filename.
+            # _upload_resume owns that choice and has just attached the tailored
+            # PDF; answering it here as if it were a screening question walked
+            # straight into "Deselect resume <tailored>.pdf / Select resume
+            # <old>.pdf" and would have sent a months-old resume. The labelled
+            # -field pass already skips filenames — this pass has to as well.
+            if _DOC_NAME_RE.search(g.get("q", "") or ""):
+                print(f"    [skip] resume chooser, not a question: {g['q'][:50]}")
+                continue
             opts = [r["label"] or r["value"] for r in g["radios"] if (r["label"] or r["value"])]
             ans = await self.answers.answer(g["q"], options=opts or None, kind="radio")
             if ans is None:
                 if not g["anyChecked"]:
                     print(f"    [?] no answer for: {g['q'][:70]}")
-                    unknown += 1
+                    unknown.append({"question": g["q"], "options": opts})
                 continue
             av = str(ans).lower()
             target = next((r for r in g["radios"]
@@ -951,7 +1142,7 @@ class ApplyAgent:
             if target is None:
                 print(f"    [?] no option matching {ans!r} for: {g['q'][:50]} "
                       f"| options={[(r['label'], r['value']) for r in g['radios']]}")
-                unknown += 1
+                unknown.append({"question": g["q"], "options": opts})
                 continue
 
             sel = f'[data-jh-radio="{target["mark"]}"]'
@@ -1011,10 +1202,11 @@ class ApplyAgent:
         await asyncio.sleep(2)
 
         # Wait for the job page to finish rendering — clicking while it still
-        # shows placeholders silently fails to open the modal.
-        sel = ('button.jobs-apply-button, button[aria-label*="Easy Apply"], '
-               'button:has-text("Easy Apply"), .jobs-s-apply button')
-        easy_apply = await self._await_apply_control(page, sel)
+        # shows placeholders silently fails to open the modal. The selector is
+        # the shared one: a second copy here drifted out of sync with
+        # APPLY_CONTROL once already, and preflight passing while the apply step
+        # finds nothing is the worst way to discover that.
+        easy_apply = await self._await_apply_control(page, self.APPLY_CONTROL["linkedin"])
         if not easy_apply:
             return await self._no_apply_control(page, job, "linkedin")
 
@@ -1022,14 +1214,14 @@ class ApplyAgent:
 
         # The dialog element appears within a few seconds of the click.
         try:
-            await page.wait_for_selector("dialog[open]", timeout=20000)
+            await page.wait_for_selector(LINKEDIN_MODAL_SEL, timeout=20000)
         except Exception:
             await self._screenshot(page, "linkedin_modal_never_opened")
             return {"status": "needs_review", "url": page.url,
                     "message": "Easy Apply clicked but the application modal did not open."}
 
         await self._wait_for_modal_content(page)
-        return await self._fill_linkedin_modal(page, pdf_path, cover_letter)
+        return await self._fill_linkedin_modal(page, pdf_path, cover_letter, job)
 
     async def _wait_for_modal_content(self, page, timeout: float = 10.0) -> int:
         """
@@ -1039,11 +1231,12 @@ class ApplyAgent:
         """
         waited, step, last = 0.0, 0.5, -1
         while waited < timeout:
-            count = await page.evaluate("""() => {
-                const d = document.querySelector('dialog[open]');
+            count = await page.evaluate(_js("""(MODAL_SEL) => {
+                __DEEP_QUERY__
+                const d = deepQuery(MODAL_SEL);
                 if (!d) return 0;
                 return d.querySelectorAll('label[for], fieldset legend, input[type=file]').length;
-            }""")
+            }"""), LINKEDIN_MODAL_SEL)
             if count and count == last:
                 return count           # stable => rendered
             last = count
@@ -1108,12 +1301,13 @@ class ApplyAgent:
 
         if not upload:
             # Say so loudly — a silent miss here is what sent months-old resumes.
-            labels = await page.evaluate("""() => {
-                const d = document.querySelector('dialog[open]');
-                if (!d) return 'no dialog';
+            labels = await page.evaluate(_js("""(MODAL_SEL) => {
+                __DEEP_QUERY__
+                const d = deepQuery(MODAL_SEL);
+                if (!d) return 'no modal';
                 return [...d.querySelectorAll('button,label,h3')]
                     .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 12).join(' / ');
-            }""")
+            }"""), LINKEDIN_MODAL_SEL)
             print(f"    no file input on this step. controls: {str(labels)[:220]}")
             return False
         try:
@@ -1125,7 +1319,8 @@ class ApplyAgent:
             print(f"    resume upload failed: {str(e)[:100]}")
             return False
 
-    async def _fill_linkedin_modal(self, page, pdf_path: str = None, cover_letter: str = None) -> dict:
+    async def _fill_linkedin_modal(self, page, pdf_path: str = None, cover_letter: str = None,
+                                   job: dict = None) -> dict:
         last_sig, stalled = None, 0
         for step in range(12):
             await asyncio.sleep(1.5)
@@ -1135,11 +1330,12 @@ class ApplyAgent:
             # If the same step renders twice running, Next/Review isn't advancing
             # (usually a validation error we can't satisfy) — stop rather than
             # spinning through all 12 iterations.
-            sig = await page.evaluate("""() => {
-                const d = document.querySelector('dialog[open]');
+            sig = await page.evaluate(_js("""(MODAL_SEL) => {
+                __DEEP_QUERY__
+                const d = deepQuery(MODAL_SEL);
                 if (!d) return 'closed';
                 return [...d.querySelectorAll('label')].map(l => (l.innerText || '').trim()).join('|').slice(0, 400);
-            }""")
+            }"""), LINKEDIN_MODAL_SEL)
             if sig == last_sig:
                 stalled += 1
                 if stalled >= 2:
@@ -1157,7 +1353,7 @@ class ApplyAgent:
             # Footer buttons carry only text, so match by accessible name — scoped
             # to the dialog so the page's carousel "Next" can't be picked up.
             modal = self._modal(page)
-            submit_btn = modal.get_by_role("button", name="Submit application")
+            submit_btn = modal.get_by_role("button", name=SUBMIT_NAME)
             if await submit_btn.count() > 0:
                 # Last gate before the irreversible click. If we built a tailored
                 # resume and never managed to attach it, this application would
@@ -1188,22 +1384,11 @@ class ApplyAgent:
             # can't answer safely is handed to you — the bot never guesses.
             unknown = await self._answer_form_fields(page)
             if unknown:
-                await self._wait_for_human(
-                    page, "linkedin",
-                    f"{unknown} screening question(s) I can't answer safely — please finish "
-                    f"and submit this application in the window",
-                    done_check=lambda: self._linkedin_modal_closed(page),
-                )
-                confirmed = await self._verify_submission(page)
-                if confirmed:
-                    return confirmed
-                return {"status": "needs_review", "url": page.url,
-                        "message": "Handed to you for screening questions — verify it submitted."}
+                return await self._defer_for_questions(page, unknown, job)
 
-            # Review (final step) before Next. "Review" matches both "Review" and
-            # "Review your application"; Next is exact to avoid "Next steps".
-            review_btn = modal.get_by_role("button", name="Review")
-            next_btn = modal.get_by_role("button", name="Next", exact=True)
+            # Review (final step) before Next.
+            review_btn = modal.get_by_role("button", name=REVIEW_NAME)
+            next_btn = modal.get_by_role("button", name=NEXT_NAME)
             if await review_btn.count() > 0:
                 await review_btn.first.click()
             elif await next_btn.count() > 0:
@@ -1215,18 +1400,65 @@ class ApplyAgent:
         return {"status": "needs_review", "url": page.url,
                 "message": "Partially filled — could not reach final submit. Some questions need manual answers."}
 
+    async def _defer_for_questions(self, page, unknown: list, job: dict = None) -> dict:
+        """
+        Email the questions we couldn't answer and release the job.
+
+        The run does not hold the browser open waiting for you. A screening
+        question can take hours to come back — blocking on it stalled the whole
+        cycle behind one posting, and the pause was useless unless you happened
+        to be at the desk. Deferring instead means the rest of the batch keeps
+        moving and this posting is retried once the answer is learned, from the
+        app or from an email reply.
+
+        Each distinct question is emailed once. record_pending_question already
+        ran inside AnswerResolver, so the question is in Setup > Saved answers
+        whether or not the email goes out.
+        """
+        job = job or {}
+        asked = []
+        for item in unknown:
+            question = (item.get("question") or "").strip()
+            if not question:
+                continue
+            try:
+                if await mark_question_emailed(question):
+                    await asyncio.to_thread(
+                        send_question_email,
+                        question, item.get("options") or [],
+                        job.get("title", ""), job.get("company", ""), job.get("url", ""),
+                    )
+                    asked.append(question)
+            except Exception as e:
+                print(f"    could not email question: {type(e).__name__}: {str(e)[:80]}")
+
+        n = len(unknown)
+        detail = f"; emailed {len(asked)}" if asked else " (already asked)"
+        print(f"    [DEFER] {n} unanswered screening question(s){detail}")
+        return {"status": "question_pending", "url": page.url,
+                "message": (f"{n} screening question(s) I can't answer from your profile or "
+                            f"resume. Emailed to you{'' if asked else ' previously'} — reply to "
+                            f"the email or answer in Setup > Saved answers, and this posting "
+                            f"is retried automatically. Nothing was submitted.")}
+
     async def _linkedin_modal_closed(self, page) -> bool:
-        # LinkedIn's Easy Apply modal is a native <dialog open> element — the one
-        # reliable signal. (Matching footer button text page-wide false-positives
-        # on the "Next" button of the recommended-jobs carousel.)
+        # The modal container disappears from the DOM when it closes, so its
+        # absence is the signal. (Matching footer button text page-wide
+        # false-positives on the "Next" button of the recommended-jobs carousel.)
         try:
-            return await page.locator("dialog[open]").count() == 0
+            return await page.locator(LINKEDIN_MODAL_SEL).count() == 0
         except Exception:
             return True
 
     def _modal(self, page):
-        """Locator scoped to the Easy Apply dialog."""
-        return page.locator("dialog[open]")
+        """
+        Locator scoped to the Easy Apply modal.
+
+        .first because the selector lists several equivalent anchors and a
+        single container can match more than one of them — get_by_role chained
+        off a multi-element locator would then be ambiguous.
+        """
+        return page.locator(LINKEDIN_MODAL_SEL).first
 
     # ── Naukri Apply ─────────────────────────────────────────────────────────
 
@@ -1236,10 +1468,10 @@ class ApplyAgent:
         if not await self._guard_captcha(page, "naukri"):
             return {"status": "needs_review", "url": page.url, "message": "CAPTCHA not cleared on Naukri."}
 
-        apply_btn = await self._await_apply_control(
-            page,
-            'button#apply-button, a#apply-button, button.apply-button, button[title*="Apply"]',
-        )
+        # Shared constant, not a second copy: the LinkedIn selector was
+        # duplicated exactly like this and the two halves drifted apart, so
+        # preflight found the control and the apply step then could not.
+        apply_btn = await self._await_apply_control(page, self.APPLY_CONTROL["naukri"])
         if not apply_btn:
             return await self._no_apply_control(page, job, "naukri")
 
