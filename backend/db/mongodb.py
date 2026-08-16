@@ -3,6 +3,7 @@ import re
 import logging
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
+from utils.question_key import question_key
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -673,9 +674,9 @@ async def upsert_learned_answer(question: str, answer: str):
     db = get_db()
     profile = await db.apply_profile.find_one({}) or {}
     qa = profile.get("qa", [])
-    q_norm = " ".join(question.lower().split())
+    q_norm = question_key(question)
     for entry in qa:
-        if " ".join(entry.get("question", "").lower().split()) == q_norm:
+        if question_key(entry.get("question", "")) == q_norm:
             entry["answer"] = answer
             break
     else:
@@ -691,7 +692,7 @@ async def record_pending_question(question: str, source: str = "", job_title: st
     """Log a question the system could not answer, for you to fill in later."""
     from datetime import datetime
     db = get_db()
-    q_norm = " ".join(question.lower().split())
+    q_norm = question_key(question)
     await db.pending_questions.update_one(
         {"question_norm": q_norm},
         {"$set": {"question": question, "question_norm": q_norm, "last_seen_at": datetime.utcnow(),
@@ -717,7 +718,7 @@ async def mark_question_emailed(question: str, reask_after_days: int = 7) -> boo
     """
     from datetime import datetime, timedelta
     db = get_db()
-    q_norm = " ".join(question.lower().split())
+    q_norm = question_key(question)
     cutoff = datetime.utcnow() - timedelta(days=reask_after_days)
     res = await db.pending_questions.update_one(
         {"question_norm": q_norm,

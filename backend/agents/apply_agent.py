@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright
 from agents.tailor_agent import TailorAgent
 from agents.cover_letter_agent import CoverLetterAgent
-from services.answer_service import AnswerResolver
+from services.answer_service import AnswerResolver, numeric_text
 from utils.pdf_generator import generate_resume_pdf
 from utils.resume_validator import validate_tailored_resume, clean_resume_text
 from services.alert_service import send_manual_action_alert, send_question_email
@@ -1278,10 +1278,15 @@ class ApplyAgent:
 
     @staticmethod
     def _numeric_only(value: str):
-        """'38 LPA' -> '38', '3.5 years' -> '3.5'. None if there's no number."""
-        import re as _re
-        m = _re.search(r"\d+(?:\.\d+)?", str(value))
-        return m.group() if m else None
+        """
+        '38 LPA' -> '38'. Delegates, rather than keeping a second copy.
+
+        The answering side has to apply exactly this rule on the way out of the
+        profile and the learned store, and the form-repair side has to apply it
+        to whatever ended up in the box. Two identical regexes in two files is
+        the setup for the two of them disagreeing later about what a number is.
+        """
+        return numeric_text(value)
 
     async def _select_option(self, select_el, value: str):
         if select_el is None:

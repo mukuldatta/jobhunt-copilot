@@ -19,10 +19,30 @@ import json
 import hashlib
 from llm_provider import LLMProvider, RateLimited
 from db.mongodb import get_apply_profile, record_pending_question
+from utils.question_key import question_key
 
 
 def _norm(text: str) -> str:
     return " ".join((text or "").lower().split())
+
+
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def numeric_text(value):
+    """
+    '38 LPA' -> '38', '3.5 years' -> '3.5', 'Immediately' -> None.
+
+    The single definition, because the profile stores its values with the unit
+    attached — expected_ctc is literally the string "30 LPA" — and a LinkedIn
+    salary box is a text input that validates as a decimal. Every source of an
+    answer therefore needs the same coercion on the way out, and a second copy
+    of this rule living somewhere else is how the two would stop agreeing.
+    """
+    if value is None:
+        return None
+    m = _NUMBER_RE.search(str(value))
+    return m.group() if m else None
 
 
 def question_token(question: str) -> str:
@@ -34,7 +54,7 @@ def question_token(question: str) -> str:
     recorded before any of this existed: the same wording always yields the same
     token, and pending questions are already keyed on the same normalisation.
     """
-    return hashlib.sha1(_norm(question).encode("utf-8")).hexdigest()[:10]
+    return hashlib.sha1(question_key(question).encode("utf-8")).hexdigest()[:10]
 
 
 def _yn(flag: bool) -> str:
@@ -148,9 +168,25 @@ class AnswerResolver:
         self._rate_limited = False
         ans = self._from_learned(question)
         if ans is None:
-            ans = self._from_rules(question)
+            ans = self._from_rules(question, kind)
         if ans is None:
             ans = self._from_llm(question, options, kind)
+
+        # A numeric field takes a number from whichever source answered. Doing
+        # this here rather than at each source is the point: the profile holds
+        # "30 LPA", the learned store holds "38 LPA" against a question that
+        # says *(in lakhs)*, and the LLM will happily write "3 years" — three
+        # sources, one field, one rule. Every one of those was typed verbatim
+        # into a box that wanted a decimal and rejected it.
+        if ans is not None and kind == "number":
+            coerced = numeric_text(ans)
+            if coerced is None:
+                # "Immediately" in a field counting days. We have an answer and
+                # it is not the kind of thing being asked for, so this is a
+                # question for you — not a number to be invented.
+                ans = None
+            else:
+                ans = coerced
 
         if ans is None:
             # Only record a question we genuinely couldn't answer. A rate-limited
@@ -171,9 +207,12 @@ class AnswerResolver:
     # ── 1. learned answers ───────────────────────────────────────────────────
 
     def _from_learned(self, question: str):
-        q = _norm(question)
+        # question_key, not _norm: the store is keyed the same way on write, and
+        # a trailing "*" or a duplicated fragment of the label must not read as
+        # a different question. It already did, four times out of eight.
+        q = question_key(question)
         for entry in self.profile.get("qa", []) or []:
-            eq = _norm(entry.get("question", ""))
+            eq = question_key(entry.get("question", ""))
             if not eq:
                 continue
             if eq == q or (len(eq) > 15 and (eq in q or q in eq)):
@@ -184,7 +223,7 @@ class AnswerResolver:
 
     # ── 2. deterministic rules ───────────────────────────────────────────────
 
-    def _from_rules(self, question: str):
+    def _from_rules(self, question: str, kind: str = "text"):
         p = self.profile
         q = _norm(question)
 
@@ -205,15 +244,45 @@ class AnswerResolver:
         if any_("felony", "convicted", "criminal record", "criminal history"):
             return "No"
 
-        if any_("immediate") and any_("join", "joiner", "available", "start"):
+        # "Are you an immediate joiner?" is a yes/no question. The same words in
+        # a numeric box are asking how many days, so the answer "Yes" would be
+        # thrown straight out.
+        if kind != "number" and any_("immediate") and any_("join", "joiner", "available", "start"):
             return "Yes"
-        if "notice" in q and any_("period", "days", "how many", "how long", "serving"):
-            return str(p.get("notice_period_days") or "") or None
 
-        if any_("current") and any_("ctc", "salary", "compensation", "pay"):
+        # When you can start, asked in either currency: a number of days, or a
+        # date/word. The profile carries both — notice_period_days is "0" and
+        # earliest_start is "Immediately" — and the rules only ever reached for
+        # the second. "How soon can you join?" matched no rule at all, so it
+        # fell through to the LLM, which answered "Immediately" into a field
+        # that wanted a decimal. The right answer was in the profile the whole
+        # time; nothing was asking for it.
+        if any_("notice period", "how soon", "when can you join", "when could you join",
+                "joining time", "join us", "start date", "when can you start",
+                "available to start", "earliest start", "date of joining",
+                # "Are you an immediate joiner?" is answered "Yes" above when
+                # there is somewhere to put a yes. In a numeric box the same
+                # question is asking how many days, and the answer is 0.
+                "immediate joiner", "joiner") or (
+                "notice" in q and any_("period", "days", "how many", "how long", "serving")):
+            wants_days = kind == "number" or any_("days", "notice")
+            first = "notice_period_days" if wants_days else "earliest_start"
+            second = "earliest_start" if wants_days else "notice_period_days"
+            for key in (first, second):
+                val = str(p.get(key) or "").strip()
+                if val:
+                    return val
+            return None
+
+        if any_("ctc", "salary", "compensation", "annual package", "in hand"):
+            # Which one is being asked for, and the unqualified case. A form
+            # that just says "What is your CTC?" means the one you are on —
+            # that is the convention every Indian posting uses, and it matched
+            # no rule at all before, so a fact already in the profile went to
+            # the model to guess at.
+            if any_("expected", "desired", "expecting", "asking"):
+                return str(p.get("expected_ctc") or "") or None
             return str(p.get("current_ctc") or "") or None
-        if any_("expected", "desired", "expecting") and any_("ctc", "salary", "compensation", "pay"):
-            return str(p.get("expected_ctc") or "") or None
 
         # Match on stems: "commute" never matches "commuting".
         if "relocat" in q:
@@ -226,9 +295,6 @@ class AnswerResolver:
 
         if any_("current location", "current city", "which city", "where are you located", "your location"):
             return str(p.get("current_city") or "") or None
-
-        if any_("start date", "when can you start", "available to start", "earliest start"):
-            return str(p.get("earliest_start") or "") or None
 
         if any_("bachelor", "degree", "graduate", "graduated", "qualification"):
             return _yn(bool(p.get("has_bachelors", True)))
