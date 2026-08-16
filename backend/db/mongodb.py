@@ -286,11 +286,26 @@ async def get_apply_candidates(min_score: int = 70, region: str = "india", limit
     # exclude: a wrong "external" hint would otherwise bury a good job forever,
     # and nothing would ever correct it. Confirmed apply_type, set by an actual
     # run, is what the query above filters on.
-    cursor = db.jobs.find(query).sort("match_score", -1).limit(max(limit * 4, 20))
-    rows = []
-    async for job in cursor:
-        job["id"] = str(job.pop("_id"))
-        rows.append(job)
+    # Jobs a previous run proved submittable are fetched in their own right,
+    # not hoped for inside a score-ranked window. The ranking below prefers
+    # them over unclassified jobs regardless of score — but it can only order
+    # what it was given, and the window is filled by score alone. With a small
+    # per_run the window is small, so a confirmed 91% job lost its place to
+    # twenty unclassified jobs scoring 94-98% and never reached the ranking at
+    # all. A batch of two then spent both slots re-discovering hand-offs while
+    # the jobs we already knew we could submit to sat behind them.
+    rows, seen = [], set()
+    async def _take(cur):
+        async for job in cur:
+            if job["job_id"] in seen:
+                continue
+            seen.add(job["job_id"])
+            job["id"] = str(job.pop("_id"))
+            rows.append(job)
+
+    await _take(db.jobs.find({**query, "apply_type": "in_platform"})
+                .sort("match_score", -1).limit(max(limit, 10)))
+    await _take(db.jobs.find(query).sort("match_score", -1).limit(max(limit * 4, 20)))
 
     def rank(job):
         hint = job.get("apply_type_hint")

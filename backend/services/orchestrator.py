@@ -35,6 +35,11 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+# Outcomes reached without ever opening a form. Nothing was submitted and
+# nothing was typed, so there is no pattern for the pacing delay to disguise.
+NO_FORM_OUTCOMES = {"manual_required", "already_applied", "expired", "login_required"}
+
+
 def _int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
@@ -186,11 +191,23 @@ async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:
         else:
             stuck = 0
 
-        # Say so, rather than going quiet for up to 40 seconds. An idle gap in a
-        # live log reads as a hang, and this one is deliberate pacing.
+        # The pause exists so a burst of real applications does not look like a
+        # burst of real applications. An outcome that never touched a form —
+        # a posting that hands off to the company site, a board we are not
+        # signed in to — costs a page load and nothing else, and pacing after
+        # it buys no plausibility while spending the run's time. A batch of two
+        # that met two hand-offs slept 32 seconds in the middle for nothing.
+        if st in NO_FORM_OUTCOMES:
+            continue
+
+        # And nothing to space out after the last one. The guard was on the log
+        # line only, so a finished run still sat for another half minute before
+        # reporting itself.
+        if i >= total:
+            continue
+
         pause = random.uniform(delay_min, delay_max)
-        if i < total:
-            agent_state.log(f"    waiting {pause:.0f}s before the next posting")
+        agent_state.log(f"    waiting {pause:.0f}s before the next posting")
         await asyncio.sleep(pause)
 
     summary = {
