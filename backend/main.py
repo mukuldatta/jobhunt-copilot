@@ -255,7 +255,7 @@ async def auto_apply(job_id: str, background_tasks: BackgroundTasks):
         try:
             agent = ApplyAgent()
             result = await agent.apply(job)
-            print(f"AutoApply [{job_id}]: {result.get('status')} — {result.get('message', '')}")
+            agent_state.log(f"    → {result.get('status')}: {result.get('message', '')}")
         finally:
             agent_state.finish()
 
@@ -347,6 +347,22 @@ async def agent_state_route():
     """
     from services.agent_state import snapshot
     return await snapshot()
+
+
+@app.get("/agent/log")
+async def agent_log_route(since: int = 0):
+    """
+    What the agent is doing right now, line by line.
+
+    Separate from /agent/state because the two are polled at different rates by
+    different screens: the sidebar wants a small snapshot every 5s on every
+    page, while the log is only worth fetching while someone is watching Today.
+    Pass the `seq` from the last response as `since` to receive only what is
+    new — the buffer holds a few hundred lines and re-sending them every two
+    seconds would be the most expensive thing on the page.
+    """
+    from services.agent_state import tail
+    return tail(since)
 
 
 @app.get("/platforms")

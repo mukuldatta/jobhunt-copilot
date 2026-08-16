@@ -210,12 +210,26 @@ class ApplyAgent:
         # (screenshot it) — for safely tuning selectors without applying for real.
         self.dry_run = os.environ.get("APPLY_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
+    def _say(self, msg: str):
+        """
+        One line of narration — to the terminal, and to the live agent log.
+
+        Every step of an apply used to print() and nothing more, which meant the
+        only way to see why a posting was deferred was to be watching the
+        process's stdout at the moment it happened. These lines are the actual
+        account of the run: which question went unanswered, whether the tailored
+        resume attached, which modal step it stalled on. They belong somewhere
+        you can read them afterwards.
+        """
+        agent_state.log(msg, job=self.current_job)
+
     # ── Public entrypoint ────────────────────────────────────────────────────
 
     async def apply(self, job: dict) -> dict:
         job_id = job.get("job_id", "")
         source = job.get("source", "")
         self.current_job = f"{job.get('title', '')} @ {job.get('company', '')}".strip(" @")
+        agent_state.set_job(self.current_job)
 
         # Re-read here, not in __init__: the dry-run toggle lives in Setup and
         # has to bind at apply time to be worth anything as a safety switch.
@@ -231,6 +245,8 @@ class ApplyAgent:
         # employer on a weaker application. Defer instead, before claiming the
         # job or opening a browser, and pick it up when the quota refills.
         if is_rate_limited():
+            self._say(f"    deferred before starting: LLM quota exhausted for "
+                      f"{cooldown_remaining():.0f}s")
             return {"status": "deferred", "url": job.get("url", ""),
                     "retry_after": round(cooldown_remaining()),
                     "message": f"LLM quota exhausted — deferring this job for "
@@ -240,6 +256,7 @@ class ApplyAgent:
         if not apply_supported(source):
             # Known board, deliberately not submitted to. Hand it back before
             # spending a browser launch or a single LLM call on it.
+            self._say(f"    skipped: {disabled_reason(source)}")
             return {
                 "status": "manual_required",
                 "url": job.get("url", ""),
@@ -247,6 +264,7 @@ class ApplyAgent:
             }
 
         if source not in LOGIN:
+            self._say(f"    skipped: auto-apply is not supported for '{source}'")
             return {
                 "status": "manual_required",
                 "url": job.get("url", ""),
@@ -361,8 +379,8 @@ class ApplyAgent:
             attempts = await bump_apply_attempt(job_id)
             if attempts < self.max_apply_attempts:
                 await finish_job_apply(job_id, "new")
-                print(f"    retryable: attempt {attempts}/{self.max_apply_attempts}, "
-                      f"returned to the queue")
+                self._say(f"    retryable: attempt {attempts}/{self.max_apply_attempts}, "
+                          f"returned to the queue")
             else:
                 await finish_job_apply(job_id, "manual_required")
         elif status in ("login_required", "dry_run", "deferred"):
@@ -401,6 +419,7 @@ class ApplyAgent:
                 if preflight is not None:
                     return preflight
 
+                self._say("    tailoring the resume for this posting")
                 pdf_path, tailored_text = await self._make_resume(job)
                 if self._defer_reason:
                     return {"status": "deferred", "url": job.get("url", ""),
@@ -408,9 +427,11 @@ class ApplyAgent:
                             "message": f"{self._defer_reason} — deferred before touching "
                                        f"the form. No application was submitted."}
 
+                self._say("    writing the cover letter")
                 cover_letter = await self._make_cover_letter(job)
                 await self._load_answers()
 
+                self._say(f"    filling the {source} application form")
                 handler = getattr(self, f"_apply_{source}")
                 result = await handler(page, job, pdf_path, cover_letter)
 
@@ -440,27 +461,27 @@ class ApplyAgent:
         built = await build_tailored_resume(job, user_name=self.user_name,
                                             user_email=self.user_email)
         if built["cached"]:
-            print("    reusing the tailored resume already approved for this job")
+            self._say("    reusing the tailored resume already approved for this job")
 
         if built["rate_limited"]:
             # Quota died mid-run. Distinct from a tailoring bug: falling back to
             # the original resume would spend an irreversible application on a
             # weaker document, so the caller defers the whole job instead.
-            print("    LLM quota exhausted while tailoring — deferring.")
+            self._say("    LLM quota exhausted while tailoring — deferring.")
             self._defer_reason = "LLM quota exhausted"
             return None, None
 
         if not built["ok"]:
             # Submitting the original here would quietly send a generic resume on
             # a one-shot, irreversible application — put the job back instead.
-            print(f"    Resume rejected {built['issues']} — deferring job.")
+            self._say(f"    Resume rejected {built['issues']} — deferring job.")
             self._defer_reason = (
                 f"tailored resume failed validation ({'; '.join(built['issues'])[:120]})")
             return None, None
 
         final_text = built["text"]
         if built["issues"]:
-            print(f"    Resume validation warnings: {built['issues']}")
+            self._say(f"    Resume validation warnings: {built['issues']}")
         if not final_text:
             return None, None
 
@@ -475,7 +496,7 @@ class ApplyAgent:
             generate_resume_pdf(final_text, path)
             return path, final_text
         except Exception as e:
-            print(f"ApplyAgent: PDF generation failed: {e}")
+            self._say(f"ApplyAgent: PDF generation failed: {e}")
             return None, final_text
 
     async def _load_answers(self):
@@ -489,7 +510,7 @@ class ApplyAgent:
             self.user_phone = p.get("phone") or self.user_phone
             self.user_email = p.get("email") or self.user_email
         except Exception as e:
-            print(f"    ApplyAgent: could not load apply profile ({e}); using defaults")
+            self._say(f"    ApplyAgent: could not load apply profile ({e}); using defaults")
             self.answers = AnswerResolver({})
 
     async def _make_cover_letter(self, job: dict) -> str:
@@ -497,7 +518,7 @@ class ApplyAgent:
         try:
             return clean_resume_text(await CoverLetterAgent().generate(job))
         except Exception as e:
-            print(f"ApplyAgent: cover letter generation failed: {e}")
+            self._say(f"ApplyAgent: cover letter generation failed: {e}")
             return ""
 
     async def _fill_cover_letter(self, page, text: str):
@@ -550,7 +571,7 @@ class ApplyAgent:
         try:
             return await pw.chromium.launch_persistent_context(user_dir, channel="chrome", **opts)
         except Exception as e:
-            print(f"    ApplyAgent: real Chrome unavailable ({e}); using bundled Chromium")
+            self._say(f"    ApplyAgent: real Chrome unavailable ({e}); using bundled Chromium")
             return await pw.chromium.launch_persistent_context(user_dir, **opts)
 
     # ── Session detection + interactive (manual) login ───────────────────────
@@ -695,8 +716,8 @@ class ApplyAgent:
         gone) or times out. `notify` pings you (skip it for button-initiated login).
         """
         timeout = timeout or self.human_timeout
-        print(f"    [PAUSE] MANUAL ACTION [{platform}]: {reason}")
-        print(f"            Act in the open browser window. Waiting up to {timeout}s...")
+        self._say(f"    [PAUSE] MANUAL ACTION [{platform}]: {reason}")
+        self._say(f"            Act in the open browser window. Waiting up to {timeout}s...")
         # Throttle: a batch run can pause on many jobs, and one email+SMS per
         # pause is just noise. Alert at most once every ALERT_COOLDOWN_SEC.
         if notify:
@@ -721,14 +742,14 @@ class ApplyAgent:
                 try:
                     if done_check is not None:
                         if await done_check():
-                            print(f"    [RESUME] [{platform}] resolved after {waited}s — continuing.")
+                            self._say(f"    [RESUME] [{platform}] resolved after {waited}s — continuing.")
                             return True
                     elif not await self._has_captcha(page):
-                        print(f"    [RESUME] [{platform}] challenge cleared after {waited}s — continuing.")
+                        self._say(f"    [RESUME] [{platform}] challenge cleared after {waited}s — continuing.")
                         return True
                 except Exception:
                     pass
-            print(f"    [TIMEOUT] [{platform}] no human action within {timeout}s — giving up.")
+            self._say(f"    [TIMEOUT] [{platform}] no human action within {timeout}s — giving up.")
             return False
         finally:
             agent_state.end_human_wait()
@@ -890,7 +911,7 @@ class ApplyAgent:
 
     async def _dry_stop(self, page, platform: str, what: str) -> dict:
         await self._screenshot(page, f"dryrun_{platform}")
-        print(f"    [DRY RUN] {platform}: reached '{what}', not submitting.")
+        self._say(f"    [DRY RUN] {platform}: reached '{what}', not submitting.")
         return {"status": "dry_run", "url": page.url,
                 "message": f"DRY RUN — filled the form and reached '{what}' without submitting. Screenshot saved to backend/logs/apply."}
 
@@ -899,7 +920,7 @@ class ApplyAgent:
             os.makedirs(LOG_DIR, exist_ok=True)
             path = os.path.join(LOG_DIR, f"{label}_{int(datetime.utcnow().timestamp())}.png")
             await page.screenshot(path=path, full_page=False)
-            print(f"    Screenshot saved: {path}")
+            self._say(f"    Screenshot saved: {path}")
         except Exception:
             pass
 
@@ -1015,7 +1036,7 @@ class ApplyAgent:
             });
             return out;
         }"""), LINKEDIN_MODAL_SEL)
-        print(f"    fields found in modal: {[f['q'][:40] for f in fields]}")
+        self._say(f"    fields found in modal: {[f['q'][:40] for f in fields]}")
         for f in fields:
             q = f["q"]
             ql = q.lower()
@@ -1032,14 +1053,14 @@ class ApplyAgent:
             kind = "number" if numeric else ("select" if f["tag"] == "select" else "text")
             ans = await self.answers.answer(q, options=f.get("options") or None, kind=kind)
             if ans is None:
-                print(f"    [?] no answer for: {q[:70]}")
+                self._say(f"    [?] no answer for: {q[:70]}")
                 unknown.append({"question": q, "options": f.get("options") or []})
                 continue
             if numeric:
                 # "38 LPA" fails a field that asks for lakhs as a number.
                 ans = self._numeric_only(ans)
                 if ans is None:
-                    print(f"    [?] no numeric value for: {q[:60]}")
+                    self._say(f"    [?] no numeric value for: {q[:60]}")
                     unknown.append({"question": q, "options": []})
                     continue
             loc = (page.locator(f'[id="{f["id"]}"]') if f["id"]
@@ -1049,9 +1070,9 @@ class ApplyAgent:
                     await self._select_option(await loc.element_handle(), str(ans))
                 else:
                     await loc.fill(str(ans))
-                print(f"    [ok] {q[:55]} -> {ans}")
+                self._say(f"    [ok] {q[:55]} -> {ans}")
             except Exception as e:
-                print(f"    [!] could not fill '{q[:40]}': {str(e)[:60]}")
+                self._say(f"    [!] could not fill '{q[:40]}': {str(e)[:60]}")
 
         # 2) Radio groups (yes/no). LinkedIn doesn't always wrap these in a
         # <fieldset><legend>, so group by the radios' shared name and derive the
@@ -1123,13 +1144,13 @@ class ApplyAgent:
             # <old>.pdf" and would have sent a months-old resume. The labelled
             # -field pass already skips filenames — this pass has to as well.
             if _DOC_NAME_RE.search(g.get("q", "") or ""):
-                print(f"    [skip] resume chooser, not a question: {g['q'][:50]}")
+                self._say(f"    [skip] resume chooser, not a question: {g['q'][:50]}")
                 continue
             opts = [r["label"] or r["value"] for r in g["radios"] if (r["label"] or r["value"])]
             ans = await self.answers.answer(g["q"], options=opts or None, kind="radio")
             if ans is None:
                 if not g["anyChecked"]:
-                    print(f"    [?] no answer for: {g['q'][:70]}")
+                    self._say(f"    [?] no answer for: {g['q'][:70]}")
                     unknown.append({"question": g["q"], "options": opts})
                 continue
             av = str(ans).lower()
@@ -1140,8 +1161,8 @@ class ApplyAgent:
                 target = next((r for r in g["radios"]
                                if r["label"] and av in r["label"].lower()), None)
             if target is None:
-                print(f"    [?] no option matching {ans!r} for: {g['q'][:50]} "
-                      f"| options={[(r['label'], r['value']) for r in g['radios']]}")
+                self._say(f"    [?] no option matching {ans!r} for: {g['q'][:50]} "
+                          f"| options={[(r['label'], r['value']) for r in g['radios']]}")
                 unknown.append({"question": g["q"], "options": opts})
                 continue
 
@@ -1156,19 +1177,19 @@ class ApplyAgent:
             label = target["label"] or target["value"]
             try:
                 await loc.check()
-                print(f"    [ok] {g['q'][:55]} -> {label}")
+                self._say(f"    [ok] {g['q'][:55]} -> {label}")
             except Exception:
                 # React radios often ignore .check(); dispatch a real click,
                 # falling back to the DOM so an overlay can't intercept it.
                 try:
                     await loc.click(force=True, timeout=5000)
-                    print(f"    [ok] {g['q'][:55]} -> {label} (click)")
+                    self._say(f"    [ok] {g['q'][:55]} -> {label} (click)")
                 except Exception:
                     try:
                         await page.eval_on_selector(sel, "e => e.click()")
-                        print(f"    [ok] {g['q'][:55]} -> {label} (dom)")
+                        self._say(f"    [ok] {g['q'][:55]} -> {label} (dom)")
                     except Exception as e:
-                        print(f"    [!] could not select for '{g['q'][:40]}': {str(e)[:60]}")
+                        self._say(f"    [!] could not select for '{g['q'][:40]}': {str(e)[:60]}")
         return unknown
 
     @staticmethod
@@ -1269,10 +1290,10 @@ class ApplyAgent:
             try:
                 await upload.set_input_files(pdf_path)
                 await asyncio.sleep(2.5)
-                print(f"    [ok] uploaded tailored resume ({os.path.basename(pdf_path)})")
+                self._say(f"    [ok] uploaded tailored resume ({os.path.basename(pdf_path)})")
                 return True
             except Exception as e:
-                print(f"    direct upload failed: {str(e)[:90]}")
+                self._say(f"    direct upload failed: {str(e)[:90]}")
 
         # Otherwise the input only exists after asking to upload — and that click
         # opens Chrome's native file chooser, which is an OS window Playwright
@@ -1285,16 +1306,16 @@ class ApplyAgent:
                 btn = modal.get_by_role("button", name=name, exact=False)
                 if await btn.count() == 0:
                     continue
-                print(f"    revealing file input via '{name}'")
+                self._say(f"    revealing file input via '{name}'")
                 async with page.expect_file_chooser(timeout=10000) as fc_info:
                     await btn.first.click()
                 chooser = await fc_info.value
                 await chooser.set_files(pdf_path)
                 await asyncio.sleep(2.5)
-                print(f"    [ok] uploaded tailored resume ({os.path.basename(pdf_path)})")
+                self._say(f"    [ok] uploaded tailored resume ({os.path.basename(pdf_path)})")
                 return True
             except Exception as e:
-                print(f"    upload via '{name}' failed: {str(e)[:90]}")
+                self._say(f"    upload via '{name}' failed: {str(e)[:90]}")
                 continue
 
         upload = await _file_input()
@@ -1308,15 +1329,15 @@ class ApplyAgent:
                 return [...d.querySelectorAll('button,label,h3')]
                     .map(e => (e.innerText || '').trim()).filter(Boolean).slice(0, 12).join(' / ');
             }"""), LINKEDIN_MODAL_SEL)
-            print(f"    no file input on this step. controls: {str(labels)[:220]}")
+            self._say(f"    no file input on this step. controls: {str(labels)[:220]}")
             return False
         try:
             await upload.set_input_files(pdf_path)
             await asyncio.sleep(2.5)   # LinkedIn parses the file before advancing
-            print(f"    [ok] uploaded tailored resume ({os.path.basename(pdf_path)})")
+            self._say(f"    [ok] uploaded tailored resume ({os.path.basename(pdf_path)})")
             return True
         except Exception as e:
-            print(f"    resume upload failed: {str(e)[:100]}")
+            self._say(f"    resume upload failed: {str(e)[:100]}")
             return False
 
     async def _fill_linkedin_modal(self, page, pdf_path: str = None, cover_letter: str = None,
@@ -1325,7 +1346,7 @@ class ApplyAgent:
         for step in range(12):
             await asyncio.sleep(1.5)
             await self._wait_for_modal_content(page)
-            print(f"    -- modal step {step + 1}")
+            self._say(f"    -- modal step {step + 1}")
 
             # If the same step renders twice running, Next/Review isn't advancing
             # (usually a validation error we can't satisfy) — stop rather than
@@ -1430,11 +1451,11 @@ class ApplyAgent:
                     )
                     asked.append(question)
             except Exception as e:
-                print(f"    could not email question: {type(e).__name__}: {str(e)[:80]}")
+                self._say(f"    could not email question: {type(e).__name__}: {str(e)[:80]}")
 
         n = len(unknown)
         detail = f"; emailed {len(asked)}" if asked else " (already asked)"
-        print(f"    [DEFER] {n} unanswered screening question(s){detail}")
+        self._say(f"    [DEFER] {n} unanswered screening question(s){detail}")
         return {"status": "question_pending", "url": page.url,
                 "message": (f"{n} screening question(s) I can't answer from your profile or "
                             f"resume. Emailed to you{'' if asked else ' previously'} — reply to "

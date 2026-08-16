@@ -10,8 +10,17 @@ either.
 
 Also tracks the one blocking condition the UI surfaces on Today: an application
 paused waiting for a human to clear a CAPTCHA / 2FA in the open browser window.
+
+And it keeps the narration: the running commentary of what the agent is doing
+step by step, which until now existed only as print() on the backend's stdout.
+That is the wrong place for it. A run drives a real browser and can pause for
+minutes on one posting, and the person who needs to know why is looking at
+Today, not at the terminal the server happens to be running in — which, when
+the backend is started detached, nobody is watching at all.
 """
 
+import sys
+from collections import deque
 from datetime import datetime, timedelta
 
 # "idle" | "running" | "paused" — paused means a run is up but blocked on a human.
@@ -20,15 +29,82 @@ _state = {
     "phase": None,          # short verb shown after the state: "scraping", "applying", "scoring"
     "started_at": None,
     "human_required": None,  # {platform, reason, job_title, since} while blocked
+    "job": "",              # "Title @ Company" the run is on right now
 }
+
+# The narration. Bounded, because a long run with a chatty modal produces
+# hundreds of lines and this must never be the reason the process grows.
+#
+# Deliberately NOT cleared when a run starts. The lines you most want are the
+# ones explaining a run that has already finished — "no answer for: expected
+# CTC", "the modal did not open" — and a buffer that empties on the next start
+# would throw them away at the moment they became useful.
+_LOG_MAX = 400
+_log = deque(maxlen=_LOG_MAX)
+_seq = 0
 
 
 def _iso(dt):
     return dt.isoformat() if isinstance(dt, datetime) else dt
 
 
+def log(msg: str, job: str = "") -> None:
+    """
+    Record one line of what the agent is doing, and print it.
+
+    The single sink for narration: it still reaches stdout exactly as before, so
+    nothing that was readable in a terminal stops being readable, and it is now
+    also readable from the app. Call sites pass their message indented for the
+    terminal; the stored copy is stripped, because the UI aligns its own rows
+    and leading spaces would just render as a ragged left edge.
+    """
+    global _seq
+    _seq += 1
+    _log.append({
+        "seq": _seq,
+        "at": datetime.utcnow().isoformat(),
+        "job": job or "",
+        "msg": (msg or "").strip(),
+    })
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        # A Windows console is cp1252, and these lines quote text scraped off a
+        # job posting — a question with a rupee sign, a company name in
+        # Devanagari, an emoji in a bullet. print() raising on that would
+        # propagate out of whatever step was narrating and abort the apply,
+        # which is a preposterous way to lose an application. The record above
+        # is already safe; only the terminal copy needs flattening.
+        enc = (sys.stdout.encoding or "ascii")
+        print(msg.encode(enc, "replace").decode(enc, "replace"))
+
+
+def tail(since: int = 0) -> dict:
+    """
+    The narration after `since`, for a poller that already has the earlier lines.
+
+    Returns `seq` so the caller can ask for exactly what it is missing next
+    time. If the buffer has rolled past what the caller last saw, it simply
+    receives everything still held — a gap in a log is not worth an error path.
+    """
+    lines = [l for l in _log if l["seq"] > since]
+    return {
+        "lines": lines,
+        "seq": _seq,
+        "state": _state["state"],
+        "phase": _state["phase"],
+        "job": _state["job"],
+    }
+
+
+def set_job(name: str):
+    """Name the posting the agent is on, so the log header can say so."""
+    _state["job"] = name or ""
+
+
 def start(phase: str = "applying"):
     _state.update(state="running", phase=phase, started_at=datetime.utcnow())
+    log(f"—— {phase} run started ——")
 
 
 def set_phase(phase: str):
@@ -37,7 +113,9 @@ def set_phase(phase: str):
 
 
 def finish():
-    _state.update(state="idle", phase=None, started_at=None, human_required=None)
+    phase = _state["phase"]
+    _state.update(state="idle", phase=None, started_at=None, human_required=None, job="")
+    log(f"—— {phase or 'run'} finished ——")
 
 
 def begin_human_wait(platform: str, reason: str, job_title: str = ""):

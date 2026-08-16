@@ -47,7 +47,11 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
     per_run = max_apply if max_apply is not None else rules["per_run"]
     region = rules["region"]
 
+    # These three end the cycle before agent_state.start, so without a line here
+    # pressing Run agent produces no visible effect at all — the reason it did
+    # nothing is exactly what the log exists to answer.
     if not rules["auto_apply_enabled"] and not force and not dry_run:
+        agent_state.log("run refused: auto-apply is off in Setup > Agent rules")
         return {"status": "disabled",
                 "message": "Auto-apply is off. Turn it on in Setup > Agent rules "
                            "(or set AUTO_APPLY_ENABLED), or call with dry_run/force."}
@@ -55,6 +59,7 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
     applied_today = await count_applications_today()
     budget = max(0, daily_cap - applied_today)
     if budget <= 0 and not dry_run:
+        agent_state.log(f"run refused: daily cap of {daily_cap} already reached")
         return {"status": "cap_reached", "applied_today": applied_today, "daily_cap": daily_cap,
                 "message": f"Daily cap of {daily_cap} already reached."}
 
@@ -62,6 +67,8 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
     candidates = await get_apply_candidates(min_score=min_score, region=region, limit=take,
                                             exclude_sources=list(APPLY_DISABLED))
     if not candidates:
+        agent_state.log(f"run refused: nothing scoring {min_score}%+ in '{region}' "
+                        f"is waiting on an apply-capable board")
         return {"status": "no_candidates",
                 "message": f"No 'new' jobs with score >= {min_score} in region '{region}' "
                            f"on an apply-capable board."}
@@ -70,6 +77,15 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
         preview = [{"title": j.get("title"), "company": j.get("company"),
                     "score": j.get("match_score"), "source": j.get("source")}
                    for j in candidates]
+        # A dry run's whole purpose is to be looked at, and until now its answer
+        # existed only in the response body of whoever called it.
+        agent_state.log(f"dry run: {len(preview)} posting(s) would be applied to "
+                        f"(cap {daily_cap}, {applied_today} used today)")
+        for p in preview[:10]:
+            agent_state.log(f"    would apply: {p['title']} @ {p['company']} "
+                            f"· {p['source']} · {p['score']}%")
+        if len(preview) > 10:
+            agent_state.log(f"    …and {len(preview) - 10} more")
         return {"status": "dry_run", "would_apply": len(preview), "jobs": preview,
                 "applied_today": applied_today, "daily_cap": daily_cap, "budget": budget}
 
@@ -100,19 +116,29 @@ async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:
     delay_min = _int("AUTO_APPLY_DELAY_MIN_SEC", 20)
     delay_max = _int("AUTO_APPLY_DELAY_MAX_SEC", 40)
 
-    for job in candidates:
+    total = len(candidates)
+    agent_state.log(f"{total} candidate(s) to work through")
+
+    for i, job in enumerate(candidates, 1):
         source = job.get("source", "")
         if source in login_needed:
             results["login_required"] = results.get("login_required", 0) + 1
             log.append({"job": job.get("title"), "result": "login_required",
                         "msg": f"{source} not signed in — use the Login button"})
+            agent_state.log(f"[{i}/{total}] skipped {job.get('title')} — {source} not signed in")
             continue
 
+        # The narration is per-job rather than per-run because that is the unit
+        # a watcher is waiting on: one posting can hold the browser for minutes,
+        # and "3 of 5" is the difference between patience and pulling the plug.
+        agent_state.log(f"[{i}/{total}] {job.get('title')} @ {job.get('company')} "
+                        f"· {source} · {job.get('match_score', '—')}%")
         result = await agent.apply(job)
         st = result.get("status", "error")
         results[st] = results.get(st, 0) + 1
         log.append({"job": f"{job.get('title')} @ {job.get('company')}",
                     "result": st, "msg": result.get("message", "")})
+        agent_state.log(f"    → {st}: {result.get('message', '')}")
         logger.info(f"AutoApply: [{st}] {job.get('title')} @ {job.get('company')} — {result.get('message','')}")
 
         if st == "deferred":
@@ -123,6 +149,7 @@ async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:
                         "msg": f"LLM quota exhausted — {result.get('message', '')} "
                                f"Remaining jobs left for the next run."})
             logger.warning("AutoApply halted: LLM quota exhausted, jobs deferred")
+            agent_state.log("halted: LLM quota exhausted — the rest wait for the next run")
             break
 
         if st == "login_required":
@@ -140,11 +167,18 @@ async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:
                             "msg": "2 consecutive applications needed manual review "
                                    "(likely an unattended CAPTCHA) — stopping cycle"})
                 logger.warning("AutoApply halted: 2 consecutive needs_review")
+                agent_state.log("halted: two applications in a row needed review "
+                                "(usually an unattended CAPTCHA)")
                 break
         else:
             stuck = 0
 
-        await asyncio.sleep(random.uniform(delay_min, delay_max))
+        # Say so, rather than going quiet for up to 40 seconds. An idle gap in a
+        # live log reads as a hang, and this one is deliberate pacing.
+        pause = random.uniform(delay_min, delay_max)
+        if i < total:
+            agent_state.log(f"    waiting {pause:.0f}s before the next posting")
+        await asyncio.sleep(pause)
 
     summary = {
         "status": "done",

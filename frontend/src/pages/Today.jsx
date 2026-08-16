@@ -19,6 +19,7 @@ import {
   platformLogin,
   errorMessage,
 } from '../api'
+import AgentLog from '../components/AgentLog'
 import { useToast } from '../components/Toast'
 import { useAgent } from '../hooks/useAgent'
 import { useReducedMotion, useReveal, stagger } from '../hooks/useMotion'
@@ -254,6 +255,11 @@ export default function Today() {
           </div>
         </div>
       )}
+
+      {/* Above the last-run summary deliberately: while a run is in flight this
+          is the only thing on the screen that is changing, and afterwards it is
+          the detail behind the counts below it. */}
+      <AgentLog />
 
       {agent.last_run && (
         <div className="mb-6 rounded border border-line px-[18px] py-3.5">

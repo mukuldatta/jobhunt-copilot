@@ -91,6 +91,9 @@ export const platformCheck = (platform) => api.post(`/auth/${platform}/check`, n
 export const runAutoApply = (data) => api.post('/auto-apply/run', data)
 
 export const getAgentState = () => api.get('/agent/state')
+// `since` is the seq of the last line already held, so a poll every couple of
+// seconds carries only what is new rather than the whole buffer each time.
+export const getAgentLog = (since = 0) => api.get('/agent/log', { params: { since } })
 export const getPlatforms = () => api.get('/platforms')
 export const getSettings = () => api.get('/settings')
 export const saveSettings = (data) => api.put('/settings', data)
