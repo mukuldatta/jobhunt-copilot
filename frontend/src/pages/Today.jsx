@@ -130,10 +130,12 @@ export default function Today() {
     }
   }
 
-  async function handleLogin(platform) {
+  async function handleLogin(platform, label) {
     try {
       await platformLogin(platform)
-      notify.ok(`Sign in to ${PLATFORM_LABELS[platform] || platform} in the browser window that just opened.`)
+      notify.ok(
+        `Sign in to ${label || PLATFORM_LABELS[platform] || platform} in the browser window that just opened.`
+      )
       pending.current.push(setTimeout(load, 8000), setTimeout(load, 30000))
     } catch (e) {
       notify.err(errorMessage(e, `Could not start the ${platform} sign-in.`))
@@ -161,10 +163,10 @@ export default function Today() {
     needs.push({
       key: `auth-${p.platform}`,
       Icon: SignIn,
-      title: `${PLATFORM_LABELS[p.platform] || p.platform} session expired`,
+      title: `${p.label || PLATFORM_LABELS[p.platform] || p.platform} session expired`,
       detail: 'a browser window opens — sign in once',
       action: 'Sign in',
-      onAction: () => handleLogin(p.platform),
+      onAction: () => handleLogin(p.platform, p.label),
     })
   })
   if (paused) {

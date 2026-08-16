@@ -14,7 +14,7 @@ from utils.resume_validator import validate_tailored_resume, clean_resume_text
 from services.alert_service import send_manual_action_alert, send_question_email
 from services import agent_state
 from llm_provider import RateLimited, is_rate_limited, cooldown_remaining
-from platforms import apply_supported, disabled_reason
+from platforms import apply_supported, disabled_reason, NAUKRI_SCRAPE_PROFILE
 from db.mongodb import (
     get_application_by_job_id, claim_job_for_apply, finish_job_apply, record_application,
     update_job, bump_apply_attempt, mark_question_emailed,
@@ -155,6 +155,7 @@ _LAST_ALERT: dict = {}
 # flow just detects whether that session is still valid.
 LOGIN = {
     "linkedin": {
+        "label": "LinkedIn",
         "home_url": "https://www.linkedin.com/feed/",
         "login_url": "https://www.linkedin.com/login",
         "logged_in_sel": "img.global-nav__me-photo, div.global-nav__me, button.global-nav__primary-link-me-menu-trigger",
@@ -162,19 +163,37 @@ LOGIN = {
         "home_is_private": True,   # feed redirects to /login when signed out
     },
     "naukri": {
+        "label": "Naukri (apply)",
         "home_url": "https://www.naukri.com/mnjuser/homepage",
         "login_url": "https://www.naukri.com/nlogin/login",
         "logged_in_sel": "a[href*='mnjuser/profile'], .nI-gNb-drawer__bars, .view-profile-wrapper",
         "fail_url_tokens": ["nlogin", "/login"],
         "home_is_private": True,   # homepage redirects to login when signed out
     },
+    # The scraper's Naukri profile. Same site, same checks — a different Chrome
+    # profile directory, which is the whole point: it is a second session that
+    # has to be signed in separately, and until it appeared here there was no
+    # way to sign it in at all. `applies_as` marks it as a sign-in target that
+    # is not itself a job source, so nothing tries to submit an application to
+    # "naukri_scrape" and it inherits Naukri's apply-support answer.
+    NAUKRI_SCRAPE_PROFILE: {
+        "label": "Naukri (scrape)",
+        "applies_as": "naukri",
+        "home_url": "https://www.naukri.com/mnjuser/homepage",
+        "login_url": "https://www.naukri.com/nlogin/login",
+        "logged_in_sel": "a[href*='mnjuser/profile'], .nI-gNb-drawer__bars, .view-profile-wrapper",
+        "fail_url_tokens": ["nlogin", "/login"],
+        "home_is_private": True,
+    },
     "indeed": {
+        "label": "Indeed",
         "home_url": "https://in.indeed.com/",
         "login_url": "https://secure.indeed.com/auth",
         "logged_in_sel": "[data-gnav-element-name='AccountMenu'], #gnav-main-AccountButton",
         "fail_url_tokens": ["account/login", "/auth", "signin"],
     },
     "dice": {
+        "label": "Dice",
         "home_url": "https://www.dice.com/dashboard/",
         "login_url": "https://www.dice.com/dashboard/login",
         "logged_in_sel": "[data-cy='nav-profile'], a[href*='dashboard']",
@@ -182,10 +201,17 @@ LOGIN = {
     },
 }
 
-# Boards worth offering a Login button for. A board we will never submit to has
-# no reason to ask you to fight its sign-in flow, so it drops off Setup > Job
-# boards along with the apply path.
-SUPPORTED_PLATFORMS = [p for p in LOGIN if apply_supported(p)]
+# Sessions worth offering a Login button for. A board we will never submit to
+# has no reason to ask you to fight its sign-in flow, so it drops off Setup >
+# Job boards along with the apply path — but a scrape-only profile of a board we
+# DO use is judged by the board it belongs to, not by its own name.
+SUPPORTED_PLATFORMS = [p for p, cfg in LOGIN.items()
+                       if apply_supported(cfg.get("applies_as", p))]
+
+
+def platform_label(platform: str) -> str:
+    """Display name for a sign-in target — two of them are the same site."""
+    return LOGIN.get(platform, {}).get("label") or platform.title()
 
 
 class ApplyAgent:
@@ -586,8 +612,18 @@ class ApplyAgent:
         try:
             await page.goto(cfg["home_url"], wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
-        except Exception:
-            pass
+        except Exception as e:
+            # Swallowing this used to mean the check ran against about:blank,
+            # which carries no fail-url token — so the private-home inference
+            # below concluded "signed in" from a page that had never loaded. A
+            # navigation we could not complete is not evidence of a session; it
+            # is evidence of nothing.
+            self._say(f"    could not reach {platform}: {type(e).__name__}")
+            return {"ok": False, "result": {
+                "status": "login_required",
+                "message": (f"Could not load {platform.title()} to check the session "
+                            f"({type(e).__name__}). Nothing was submitted."),
+            }}
         if await self._is_logged_in(page, cfg):
             return {"ok": True}
         return {"ok": False, "result": {
@@ -674,10 +710,18 @@ class ApplyAgent:
             except Exception:
                 pass
         # Auth-gated home pages (LinkedIn feed, Naukri homepage) redirect to login
-        # when signed out, so reaching one without a fail-token in the URL is proof
-        # of a live session even if the nav DOM hasn't rendered yet. Public home
-        # pages (Indeed/Dice) load for everyone, so there we require the selector.
-        return bool(cfg.get("home_is_private"))
+        # when signed out, so *still being on one* without a fail-token in the URL
+        # is proof of a live session even if the nav DOM hasn't rendered yet.
+        # Public home pages (Indeed/Dice) load for everyone, so there we require
+        # the selector.
+        #
+        # "Still being on one" is the part that was missing. The inference was
+        # drawn from the config alone, so it held for any URL without a fail
+        # token — about:blank included. Being somewhere else entirely is not the
+        # same as being on the page that only a signed-in session can reach.
+        if cfg.get("home_is_private"):
+            return url.startswith(cfg["home_url"].rstrip("/").lower())
+        return False
 
     # ── Shared helpers ───────────────────────────────────────────────────────
 

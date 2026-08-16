@@ -21,7 +21,12 @@ INDIA_QUERIES = [
 INDIA_LOCATIONS = ["Hyderabad", "Bangalore", "Pune"]
 
 # Persistent browser profiles keep Cloudflare/Akamai clearance cookies between
-# runs, so a bot check solved once isn't re-challenged on every scrape.
+# runs, so a bot check solved once isn't re-challenged on every scrape. The
+# Naukri one is a *different* profile from the apply agent's, and its name comes
+# from platforms so the two sides cannot disagree about which directory it is —
+# see the note there.
+from platforms import NAUKRI_SCRAPE_PROFILE
+
 PROFILE_ROOT = os.environ.get("BROWSER_PROFILE_DIR") or os.path.join(
     os.path.dirname(os.path.dirname(__file__)), ".browser_profiles"
 )
@@ -81,7 +86,7 @@ class ScraperAgent:
         blocked_streak = 0
         self._challenge_gave_up = False
         async with async_playwright() as pw:
-            context = await self._headed_context(pw, "naukri_scrape")
+            context = await self._headed_context(pw, NAUKRI_SCRAPE_PROFILE)
             if context is None:
                 return []
             page = context.pages[0] if context.pages else await context.new_page()

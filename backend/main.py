@@ -459,10 +459,15 @@ async def dismiss_pending_question(question: str = Query(...)):
 @app.get("/auth/status")
 async def auth_status():
     from db.mongodb import get_auth_states
-    from agents.apply_agent import SUPPORTED_PLATFORMS
+    from agents.apply_agent import SUPPORTED_PLATFORMS, platform_label
     states = await get_auth_states()
+    # `logged_in` is the record of a sign-in, not a live check — the cookie can
+    # have died any time since. logged_in_at is returned so the UI can say when
+    # it was last established rather than asserting it is true now; POST
+    # /auth/{platform}/check is the only thing here that actually knows.
     return {"platforms": [
-        {"platform": p, "logged_in_at": states.get(p), "logged_in": states.get(p) is not None}
+        {"platform": p, "label": platform_label(p),
+         "logged_in_at": states.get(p), "logged_in": states.get(p) is not None}
         for p in SUPPORTED_PLATFORMS
     ]}
 

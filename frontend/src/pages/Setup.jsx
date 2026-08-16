@@ -18,6 +18,7 @@ import {
 } from '../api'
 import { useReducedMotion } from '../hooks/useMotion'
 import { useToast } from '../components/Toast'
+import { agoLabel } from '../lib/format'
 
 const TABS = [
   { slug: 'you', label: 'You' },
@@ -480,7 +481,7 @@ export default function Setup() {
             <>
               <Header
                 title="Job boards"
-                blurb="Sign in once per board. A browser window opens on this machine — finish the login, including any 2FA or CAPTCHA, and the session is saved and reused when applying."
+                blurb="Sign in once per session. A browser window opens on this machine — finish the login, including any 2FA or CAPTCHA, and it is saved and reused. Naukri has two: scraping and applying use separate browser profiles, so each is signed in on its own. Check asks the site; the age beside it is only when you last signed in."
               />
               <div className="flex flex-col gap-2">
                 {platforms.length === 0 && (
@@ -502,9 +503,16 @@ export default function Setup() {
                           p.logged_in ? { boxShadow: '0 0 0 3px var(--accent-glow)' } : undefined
                         }
                       />
-                      <span className="text-base">{PLATFORM_LABELS[p.platform] || p.platform}</span>
+                      <span className="text-base">
+                        {p.label || PLATFORM_LABELS[p.platform] || p.platform}
+                      </span>
+                      {/* "signed in" on its own was a claim about now, made from
+                          a timestamp that could be weeks old and a cookie that
+                          died days ago. The age is the honest version of it. */}
                       <span className="text-xs+ text-neutral-600">
-                        {p.logged_in ? 'signed in' : 'not signed in'}
+                        {p.logged_in
+                          ? `signed in ${agoLabel(p.logged_in_at)}`
+                          : 'not signed in'}
                       </span>
                     </div>
                     <div className="flex gap-2">
