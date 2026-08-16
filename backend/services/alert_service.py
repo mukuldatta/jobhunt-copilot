@@ -88,7 +88,7 @@ def send_sms_alert(job: dict):
 
 
 def send_question_email(question: str, options: list = None, job_title: str = "",
-                        company: str = "", url: str = "") -> bool:
+                        company: str = "", url: str = "", hint: str = "") -> bool:
     """
     Ask you a screening question the profile and resume could not answer.
 
@@ -112,11 +112,18 @@ def send_question_email(question: str, options: list = None, job_title: str = ""
                      + "".join(f"<li>{o}</li>" for o in options) + "</ul>")
 
     context = " @ ".join(x for x in (job_title, company) if x)
+    # What the form said when it rejected our answer — "Enter a decimal number
+    # larger than 0.0" tells you to reply "0", not "Immediately". Shown here
+    # rather than folded into the question, which is the key the answer is
+    # stored and reused under.
+    hint_html = (f"<p style='color:#9E9E9E;margin:12px 0 0;'>The form rejected our answer with: "
+                 f"<em style='color:#E0E0E0;'>{hint}</em></p>") if hint else ""
     html = f"""
     <div style="font-family: Inter, sans-serif; background: #0F1117; color: #E0E0E0; padding: 24px; border-radius: 8px;">
         <h2 style="color: #4FC3F7;">A question I can't answer from your resume</h2>
         {f'<p style="color:#9E9E9E;">Came up on: {context}</p>' if context else ''}
         <p style="font-size:17px;margin:20px 0;"><strong>{question}</strong></p>
+        {hint_html}
         {opts_html}
         <p style="color:#9E9E9E;margin-top:20px;">
           <strong style="color:#E0E0E0;">Reply to this email</strong> with just the answer on

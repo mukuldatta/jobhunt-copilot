@@ -10,7 +10,9 @@ scheduler = AsyncIOScheduler()
 async def setup_scheduler():
     from agents.scraper_agent import ScraperAgent
     from services.alert_service import send_email_alert, send_sms_alert
-    from db.mongodb import get_high_match_jobs, delete_old_jobs, update_job
+    from db.mongodb import (
+        get_high_match_jobs, delete_old_jobs, update_job, release_stale_apply_claims,
+    )
 
     async def scrape_jobs():
         logger.info("Scheduler: starting job scrape...")
@@ -51,6 +53,17 @@ async def setup_scheduler():
     # happen; max_instances=1 + coalesce keep it from stacking up behind itself.
     common = {"replace_existing": True, "max_instances": 1,
               "coalesce": True, "misfire_grace_time": 300}
+
+    # A restart is the usual way a job ends up claimed but never finished: the
+    # process holding the run goes away and nothing moves it out of 'applying'.
+    # Startup is therefore the one moment we can be certain no run is in flight,
+    # which makes it the safest place to take those claims back.
+    try:
+        freed = await release_stale_apply_claims()
+        if freed:
+            logger.info(f"Startup: returned {freed} abandoned apply claim(s) to the queue")
+    except Exception as e:
+        logger.warning(f"Startup: could not release stale apply claims: {e}")
 
     scheduler.add_job(scrape_jobs, IntervalTrigger(minutes=30), id="scrape_jobs", **common)
     scheduler.add_job(score_new_jobs, IntervalTrigger(minutes=30), id="score_jobs", **common)

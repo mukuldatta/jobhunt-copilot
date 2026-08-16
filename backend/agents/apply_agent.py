@@ -135,6 +135,31 @@ def _js(body: str) -> str:
 # screening question.
 _DOC_NAME_RE = re.compile(r"\.(pdf|docx?|rtf)\b", re.I)
 
+# Questions whose answer LinkedIn will validate as a number even though the
+# input is a plain text box. The DOM hint (inputmode / pattern / type) is the
+# better signal and is checked first; this is the fallback for fields that
+# declare nothing, which is most of them.
+NUMERIC_QUESTION_HINTS = (
+    "in lakhs", "in days", "in years", "in months", "(in ",
+    "how many years", "number of years", "years of experience",
+    # Learned from the stalled screenshots: money and notice-period questions
+    # are numeric on LinkedIn and are almost never phrased with a unit.
+    "ctc", "salary", "compensation", "lpa",
+    "notice period", "how soon", "when can you join", "joining time",
+)
+
+# What LinkedIn says when it rejects a field. These are the exact strings from
+# the modal — "Enter a decimal number larger than 0.0", "Please enter a valid
+# answer" — and reading them is the only way to know what a field wanted, since
+# the page never declares it up front.
+_FIELD_ERROR_RE = re.compile(
+    r"please enter|please select|enter a (decimal|whole) number|"
+    r"valid answer|is required|must be a number",
+    re.I,
+)
+# The subset of those that mean "this wanted a number".
+_WANTS_NUMBER_RE = re.compile(r"decimal|whole number|number|numeric", re.I)
+
 NEXT_NAME = re.compile(r"(^next$|continue to next|^continue$)", re.I)
 REVIEW_NAME = re.compile(r"^review", re.I)
 # Deliberately anchored. This is the irreversible click, and a loose pattern
@@ -1074,8 +1099,18 @@ class ApplyAgent:
                     ? [...e.querySelectorAll('option')].map(o => (o.innerText || '').trim())
                           .filter(t => t && !/^select/i.test(t))
                     : [];
+                // Whether the FIELD wants a number, as opposed to whether the
+                // question sounds like it does. LinkedIn ships these as
+                // type=text with client-side validation, so type alone misses
+                // every one of them — "What is your expected CTC?" took "30
+                // LPA" and was rejected with "Enter a decimal number larger
+                // than 0.0".
+                const pat = e.getAttribute('pattern') || '';
+                const numericHint = type === 'number' ||
+                    ['numeric', 'decimal'].includes((e.inputMode || '').toLowerCase()) ||
+                    pat.indexOf('0-9') >= 0;
                 out.push({q, id: e.id || null, jh: e.getAttribute('data-jh-id'),
-                          tag: e.tagName.toLowerCase(), type,
+                          tag: e.tagName.toLowerCase(), type, numericHint,
                           hasValue: !!(e.value && e.value.trim()), options: opts});
             });
             return out;
@@ -1090,9 +1125,14 @@ class ApplyAgent:
                 continue  # handled as fieldset groups below
             if f["hasValue"]:
                 continue  # already filled (by LinkedIn or a previous pass)
-            numeric = f["type"] == "number" or any(
-                k in ql for k in ("in lakhs", "in days", "in years", "in months",
-                                  "how many years", "number of years", "(in ")
+            # The field's own declaration first, its wording second. Wording
+            # alone was the whole test, and it missed the two that actually
+            # turn up: "What is your expected CTC?" and "How soon can you
+            # join?" match none of these phrases, so "30 LPA" and "Immediately"
+            # were typed into fields that wanted a decimal — twenty-two stalled
+            # applications' worth, and every one of them opaque.
+            numeric = f.get("numericHint") or f["type"] == "number" or any(
+                k in ql for k in NUMERIC_QUESTION_HINTS
             )
             kind = "number" if numeric else ("select" if f["tag"] == "select" else "text")
             ans = await self.answers.answer(q, options=f.get("options") or None, kind=kind)
@@ -1403,11 +1443,24 @@ class ApplyAgent:
             }"""), LINKEDIN_MODAL_SEL)
             if sig == last_sig:
                 stalled += 1
+                # The step did not advance, which on LinkedIn means inline
+                # validation rejected something. Read what it objected to
+                # before concluding anything: on the evidence of the saved
+                # screenshots this is nearly always a field that wanted a
+                # number and got prose, which is fixable without asking.
+                if stalled == 1:
+                    repaired, unanswerable = await self._repair_rejected_fields(page)
+                    if unanswerable:
+                        return await self._defer_for_questions(page, unanswerable, job)
+                    if repaired:
+                        self._say(f"    repaired {repaired} rejected field(s) — retrying the step")
+                        stalled, last_sig = 0, None
+                        continue
                 if stalled >= 2:
                     await self._screenshot(page, "linkedin_stalled")
                     return {"status": "needs_review", "url": page.url,
-                            "message": ("Form stopped advancing — a field was rejected "
-                                        "(check the screenshot in backend/logs/apply).")}
+                            "message": ("Form stopped advancing and its errors named no field "
+                                        "we could fix (screenshot in backend/logs/apply).")}
             else:
                 stalled = 0
             last_sig = sig
@@ -1465,6 +1518,146 @@ class ApplyAgent:
         return {"status": "needs_review", "url": page.url,
                 "message": "Partially filled — could not reach final submit. Some questions need manual answers."}
 
+    async def _rejected_fields(self, page) -> list:
+        """
+        The fields LinkedIn is currently complaining about, and what it said.
+
+        The stall was always diagnosable — the modal renders "Enter a decimal
+        number larger than 0.0" directly under the offending box — but nothing
+        read it, so a rejected field and a genuinely stuck form were the same
+        event: the step didn't advance, twice, and the run ended with "a field
+        was rejected" and a screenshot for a human to interpret.
+        """
+        return await page.evaluate(_js("""(MODAL_SEL) => {
+            __DEEP_QUERY__
+            const root = deepQuery(MODAL_SEL);
+            if (!root) return [];
+            const ERR = /please enter|please select|enter a (decimal|whole) number|valid answer|is required|must be a number/i;
+            const esc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : s;
+            // Read the error ELEMENT rather than the container's text. Scraping
+            // text and hunting for an error-shaped line means every field in a
+            // shared ancestor inherits its neighbours' complaints — on a modal
+            // with four errors that reported every field as rejected, including
+            // the two that were filled correctly.
+            const errText = (el) => {
+                if (!el) return '';
+                const t = ((el.innerText || el.textContent || '')).trim();
+                return ERR.test(t) ? t : '';
+            };
+            const out = [];
+            let n = 0;
+            root.querySelectorAll('input, select, textarea').forEach(e => {
+                const type = (e.getAttribute('type') || '').toLowerCase();
+                if (type === 'hidden' || type === 'file') return;
+
+                // What the field itself points at, first: aria-describedby is
+                // how the message is tied to the box for a screen reader, and
+                // it is unambiguous where proximity is not.
+                let err = '';
+                const desc = e.getAttribute('aria-describedby') || '';
+                for (const id of desc.split(' ')) {
+                    if (id && !err) err = errText(root.querySelector('#' + esc(id)));
+                }
+                // Otherwise the nearest container that holds THIS field alone.
+                // The moment a container holds two controls it is a section
+                // rather than a field, and its errors belong to someone else.
+                let node = e.parentElement, depth = 0;
+                while (!err && node && node !== root && depth < 4) {
+                    if (node.querySelectorAll('input, select, textarea').length > 1) break;
+                    err = errText(node.querySelector(
+                        '[class*="error" i], [class*="feedback" i], [role="alert"]'));
+                    if (!err) {
+                        // Class names are the thing that drifts; the sentence
+                        // is not. Reading the text is only safe because this
+                        // container holds a single field — otherwise a message
+                        // found here could belong to the box next door.
+                        const lines = (node.innerText || '').split('\\n').map(s => s.trim());
+                        err = lines.find(s => ERR.test(s)) || '';
+                    }
+                    node = node.parentElement;
+                    depth++;
+                }
+                if (!err && e.getAttribute('aria-invalid') !== 'true') return;
+
+                let q = '';
+                if (e.id) {
+                    const l = root.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]');
+                    if (l) q = (l.innerText || '').trim();
+                }
+                if (!q) q = (e.getAttribute('aria-label') || '').trim();
+                if (!q) {
+                    let p = e.parentElement;
+                    for (let i = 0; i < 4 && p && !q; i++, p = p.parentElement) {
+                        const lines = (p.innerText || '').split('\\n')
+                            .map(s => s.trim()).filter(s => s && !ERR.test(s));
+                        q = lines.find(s => s.endsWith('?')) || lines[0] || '';
+                    }
+                }
+                const mark = 'jhv' + (n++);
+                e.setAttribute('data-jh-verr', mark);
+                const opts = e.tagName.toLowerCase() === 'select'
+                    ? [...e.querySelectorAll('option')].map(o => (o.innerText || '').trim())
+                          .filter(t => t && !/^select/i.test(t))
+                    : [];
+                out.push({mark, q, tag: e.tagName.toLowerCase(),
+                          value: (e.value || '').trim(), error: err, options: opts});
+            });
+            return out;
+        }"""), LINKEDIN_MODAL_SEL)
+
+    async def _repair_rejected_fields(self, page) -> tuple:
+        """
+        Try to satisfy what the form objected to. Returns (fixed, unanswerable).
+
+        Only two outcomes are allowed. Either we can turn our own answer into
+        the thing the field asked for — "30 LPA" into "30" when it wanted a
+        decimal — or the question goes to you, with the error text as part of
+        it. Inventing a value to clear a validation message would be the same
+        fabrication the whole apply path is built to avoid: a number typed into
+        "expected CTC" to make a form move is a number you did not choose.
+        """
+        try:
+            rejected = await self._rejected_fields(page)
+        except Exception as e:
+            self._say(f"    could not read the form's errors: {type(e).__name__}")
+            return 0, []
+
+        fixed, unanswerable = 0, []
+        for r in rejected:
+            q, val, err = r.get("q", ""), r.get("value", ""), r.get("error", "")
+            self._say(f"    [rejected] {q[:52]} = {val[:24]!r} -> {err[:44]}")
+
+            if _WANTS_NUMBER_RE.search(err):
+                # First from what we already answered, then by asking again as
+                # an explicitly numeric question — the resolver's own answer for
+                # "notice period" is "Immediately" until it is told otherwise.
+                coerced = self._numeric_only(val)
+                if coerced is None:
+                    ans = await self.answers.answer(q, kind="number")
+                    coerced = self._numeric_only(ans) if ans is not None else None
+                if coerced is not None:
+                    try:
+                        await page.locator(f'[data-jh-verr="{r["mark"]}"]').fill(str(coerced))
+                        self._say(f"    [fix] {q[:46]} -> {coerced}")
+                        fixed += 1
+                        continue
+                    except Exception as e:
+                        self._say(f"    [!] could not refill '{q[:36]}': {str(e)[:50]}")
+
+            # A required select still sitting on its placeholder, or a text
+            # answer we cannot make numeric. Ask, with the options included so
+            # the reply can be one of them.
+            #
+            # The error goes in `hint`, not into the question. The question text
+            # is the key a learned answer is stored and matched under, so
+            # folding "(Enter a decimal number larger than 0.0)" into it would
+            # mint a new question every time the wording changed and quietly
+            # undo the reuse the whole answering path is built on.
+            unanswerable.append({"question": q,
+                                 "options": r.get("options") or [],
+                                 "hint": err})
+        return fixed, unanswerable
+
     async def _defer_for_questions(self, page, unknown: list, job: dict = None) -> dict:
         """
         Email the questions we couldn't answer and release the job.
@@ -1492,6 +1685,7 @@ class ApplyAgent:
                         send_question_email,
                         question, item.get("options") or [],
                         job.get("title", ""), job.get("company", ""), job.get("url", ""),
+                        item.get("hint", ""),
                     )
                     asked.append(question)
             except Exception as e:

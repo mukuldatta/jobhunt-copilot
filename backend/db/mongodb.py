@@ -398,6 +398,49 @@ async def claim_job_for_apply(job_id: str) -> bool:
     return res is not None
 
 
+async def release_stale_apply_claims(older_than_minutes: int = 60) -> int:
+    """
+    Return jobs abandoned mid-apply to the queue. Returns how many were freed.
+
+    claim_job_for_apply moves a job to 'applying' and finish_job_apply moves it
+    out. Nothing moved it if the process died in between — a crash, or simply
+    restarting the backend during a run — and the job then sits in 'applying'
+    forever: excluded from the apply queue, which wants 'new', and from every
+    other view that reasons about real states. Three jobs were in exactly that
+    position, invisible to everything.
+
+    Two guards, because releasing a claim is what makes a double application
+    possible:
+
+    - The age. An apply that is genuinely still running can take a while — a
+      CAPTCHA wait plus a sign-in wait is twelve minutes before any tailoring —
+      so the default is an hour, far outside any legitimate single job.
+    - The application record. If one exists the job was submitted and the crash
+      happened after the irreversible part, so it is completed rather than
+      released. Only a job with no record goes back in the queue.
+    """
+    from datetime import datetime, timedelta
+    db = get_db()
+    cutoff = datetime.utcnow() - timedelta(minutes=older_than_minutes)
+    freed = 0
+    query = {"status": "applying",
+             "$or": [{"apply_started_at": {"$lt": cutoff}},
+                     # Claimed before apply_started_at was stamped at all.
+                     {"apply_started_at": {"$exists": False}}]}
+    async for job in db.jobs.find(query, {"job_id": 1, "title": 1, "_id": 0}):
+        job_id = job.get("job_id")
+        if not job_id:
+            continue
+        applied = await db.applications.find_one({"job_id": job_id}, {"_id": 1})
+        await db.jobs.update_one(
+            {"job_id": job_id, "status": "applying"},
+            {"$set": {"status": "applied" if applied else "new",
+                      "apply_finished_at": datetime.utcnow()}},
+        )
+        freed += 1
+    return freed
+
+
 async def finish_job_apply(job_id: str, status: str) -> bool:
     """Set the terminal job status after an apply attempt."""
     from datetime import datetime

@@ -23,7 +23,10 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 
-from db.mongodb import get_apply_candidates, count_applications_today, record_run
+from db.mongodb import (
+    get_apply_candidates, count_applications_today, record_run,
+    release_stale_apply_claims,
+)
 from platforms import APPLY_DISABLED
 from services import agent_state
 from services.settings_service import get_agent_rules
@@ -55,6 +58,16 @@ async def run_auto_apply_cycle(max_apply: int = None, dry_run: bool = False,
         return {"status": "disabled",
                 "message": "Auto-apply is off. Turn it on in Setup > Agent rules "
                            "(or set AUTO_APPLY_ENABLED), or call with dry_run/force."}
+
+    # Before choosing candidates, take back anything a previous run claimed and
+    # never finished — otherwise a backend restart mid-apply quietly removes a
+    # job from the pipeline permanently.
+    try:
+        freed = await release_stale_apply_claims()
+        if freed:
+            agent_state.log(f"returned {freed} abandoned claim(s) to the queue")
+    except Exception as e:
+        logger.warning(f"Could not release stale apply claims: {e}")
 
     applied_today = await count_applications_today()
     budget = max(0, daily_cap - applied_today)
