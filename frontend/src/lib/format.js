@@ -5,18 +5,48 @@ const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Frida
 
 export const weekday = (d = new Date()) => WEEKDAYS[d.getDay()]
 
-export function clockTime(value) {
+/**
+ * Parse a timestamp the backend produced.
+ *
+ * Everything server-side is datetime.utcnow(), which serialises with no zone
+ * at all — and JavaScript reads a zoneless date-time as LOCAL. So every clock
+ * in the app was showing UTC labelled as your time: a scrape at 06:37 IST read
+ * "1:07 AM", five and a half hours in the past, which is exactly the sort of
+ * wrongness you trust rather than notice.
+ *
+ * A few values do carry a zone (next_run_at comes from APScheduler with a real
+ * offset), so the marker is only added when there is none to begin with.
+ */
+export function parseServerTime(value) {
   if (!value) return null
-  const d = new Date(value)
-  if (Number.isNaN(d.getTime())) return null
+  const s = String(value)
+  const zoned = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(s)
+  const d = new Date(zoned ? s : `${s}Z`)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+export function clockTime(value) {
+  const d = parseServerTime(value)
+  if (!d) return null
   return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+}
+
+/** Seconds matter in the agent log: consecutive steps share a minute. */
+export function logTime(value) {
+  const d = parseServerTime(value)
+  if (!d) return ''
+  return d.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
 }
 
 /** Compact age: "2h", "5h", "1d", "2d". Used in the Review list. */
 export function age(value) {
-  if (!value) return ''
-  const then = new Date(value)
-  if (Number.isNaN(then.getTime())) return ''
+  const then = parseServerTime(value)
+  if (!then) return ''
   const mins = Math.max(0, Math.round((Date.now() - then.getTime()) / 60000))
   if (mins < 60) return `${mins}m`
   const hours = Math.round(mins / 60)
