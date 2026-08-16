@@ -638,6 +638,48 @@ async def record_pending_question(question: str, source: str = "", job_title: st
     )
 
 
+async def mark_question_emailed(question: str, reask_after_days: int = 7) -> bool:
+    """
+    Claim the right to email this question, returning False if it was already
+    sent recently.
+
+    The claim is the same update that records it, so two runs hitting the same
+    question at once cannot both email it: only one update matches. Without
+    that, every cycle that re-encounters an unanswered question would send
+    another copy, and the questions that recur most are exactly the ones that go
+    unanswered longest.
+
+    After reask_after_days it becomes claimable again — a question you never got
+    round to should resurface eventually, just not daily.
+    """
+    from datetime import datetime, timedelta
+    db = get_db()
+    q_norm = " ".join(question.lower().split())
+    cutoff = datetime.utcnow() - timedelta(days=reask_after_days)
+    res = await db.pending_questions.update_one(
+        {"question_norm": q_norm,
+         "$or": [{"emailed_at": {"$exists": False}},
+                 {"emailed_at": None},
+                 {"emailed_at": {"$lt": cutoff}}]},
+        {"$set": {"emailed_at": datetime.utcnow()}},
+    )
+    if res.matched_count == 0:
+        # No such pending question — AnswerResolver's own record failed. Create
+        # it here rather than dropping the question on the floor.
+        exists = await db.pending_questions.find_one({"question_norm": q_norm}, {"_id": 1})
+        if not exists:
+            await db.pending_questions.update_one(
+                {"question_norm": q_norm},
+                {"$set": {"question": question, "question_norm": q_norm,
+                          "emailed_at": datetime.utcnow(),
+                          "last_seen_at": datetime.utcnow()},
+                 "$inc": {"times_seen": 1}},
+                upsert=True,
+            )
+            return True
+    return res.modified_count > 0
+
+
 async def get_pending_questions() -> list:
     db = get_db()
     out = []

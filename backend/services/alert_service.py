@@ -87,6 +87,66 @@ def send_sms_alert(job: dict):
         print(f"SMS alert failed: {e}")
 
 
+def send_question_email(question: str, options: list = None, job_title: str = "",
+                        company: str = "", url: str = "") -> bool:
+    """
+    Ask you a screening question the profile and resume could not answer.
+
+    One email per question, because the reply has to be attributable to exactly
+    one question: the token in the subject is what services.inbox_service reads
+    to file your answer against the right one. Batching several into one email
+    would leave a one-line reply ambiguous.
+
+    Answer either by replying to this email (if IMAP polling is configured) or
+    from Setup > Saved answers. Either way the answer is learned and reused, so
+    each question is only ever asked once.
+    """
+    from services.answer_service import question_token
+
+    token = question_token(question)
+    app_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+    opts_html = ""
+    if options:
+        opts_html = ("<p style='color:#9E9E9E;margin:16px 0 4px;'>Allowed answers — "
+                     "reply with exactly one:</p><ul style='color:#E0E0E0;'>"
+                     + "".join(f"<li>{o}</li>" for o in options) + "</ul>")
+
+    context = " @ ".join(x for x in (job_title, company) if x)
+    html = f"""
+    <div style="font-family: Inter, sans-serif; background: #0F1117; color: #E0E0E0; padding: 24px; border-radius: 8px;">
+        <h2 style="color: #4FC3F7;">A question I can't answer from your resume</h2>
+        {f'<p style="color:#9E9E9E;">Came up on: {context}</p>' if context else ''}
+        <p style="font-size:17px;margin:20px 0;"><strong>{question}</strong></p>
+        {opts_html}
+        <p style="color:#9E9E9E;margin-top:20px;">
+          <strong style="color:#E0E0E0;">Reply to this email</strong> with just the answer on
+          the first line. Keep the subject line as-is — the code in it is how I know
+          which question you're answering.
+        </p>
+        <p style="color:#9E9E9E;">Or answer it in the app:
+          <a href="{app_url}/setup" style="color:#4FC3F7;">Setup &rsaquo; Saved answers</a></p>
+        {f'<p style="color:#9E9E9E;">Posting: <a href="{url}" style="color:#4FC3F7;">{url}</a></p>' if url else ''}
+        <p style="color:#5A5F73;font-size:12px;margin-top:24px;">
+          I won't apply to this one until it's answered, and I'll never guess. Once you
+          answer, it's reused for every posting that asks the same thing.</p>
+    </div>
+    """
+    message = Mail(
+        from_email=os.environ.get("SENDGRID_FROM_EMAIL"),
+        to_emails=os.environ.get("MY_EMAIL"),
+        subject=f"[JHQ:{token}] {question[:110]}",
+        html_content=html,
+    )
+    try:
+        sg = SendGridAPIClient(os.environ.get("SENDGRID_API_KEY"))
+        sg.send(message)
+        print(f"    Question emailed [{token}]: {question[:60]}")
+        return True
+    except Exception as e:
+        print(f"    Question email failed: {e}")
+        return False
+
+
 def send_manual_action_alert(platform: str, reason: str, url: str = ""):
     """
     Fired when the headed apply browser hits a CAPTCHA / 2FA / verification step

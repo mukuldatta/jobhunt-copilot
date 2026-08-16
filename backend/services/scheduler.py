@@ -57,6 +57,25 @@ async def setup_scheduler():
     scheduler.add_job(send_alerts, IntervalTrigger(minutes=30), id="send_alerts", **common)
     scheduler.add_job(cleanup_old_jobs, IntervalTrigger(hours=24), id="cleanup_jobs", **common)
 
+    # Reading your replies to screening questions. Registered only when IMAP
+    # credentials exist, so the default install polls nothing and the emailed
+    # link into Setup > Saved answers stays the way to answer.
+    from services import inbox_service
+    if inbox_service.configured():
+        import os as _os
+
+        async def poll_question_replies():
+            saved = await inbox_service.poll_answers()
+            if saved:
+                logger.info(f"Inbox: learned {saved} answer(s) from email replies")
+
+        minutes = max(1, int(_os.environ.get("IMAP_POLL_MINUTES", "5") or 5))
+        scheduler.add_job(poll_question_replies, IntervalTrigger(minutes=minutes),
+                          id="poll_question_replies", **common)
+        logger.info(f"Question-reply inbox polling every {minutes} minutes")
+    else:
+        logger.info("Question-reply inbox polling off (no IMAP_* credentials)")
+
     # Autonomous apply is opt-in: it opens a real browser window and submits
     # applications, so it only runs on a schedule when it has been turned on in
     # Setup > Agent rules (or via AUTO_APPLY_ENABLED).
