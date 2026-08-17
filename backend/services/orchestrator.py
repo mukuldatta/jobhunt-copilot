@@ -140,6 +140,12 @@ async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:
     # rate cannot get past them. Raise AUTO_APPLY_STUCK_LIMIT to look further;
     # the default stays where it was.
     stuck_limit = max(1, _int("AUTO_APPLY_STUCK_LIMIT", 2))
+    # The backstop for everything else: if this many postings in a row submit
+    # nothing, something is probably wrong with the session or the boards rather
+    # than with the postings. Deliberately loose — a batch of deferrals and
+    # hand-offs is normal, and the old guard's value of 2 was strangling runs.
+    barren = 0
+    barren_limit = max(2, _int("AUTO_APPLY_BARREN_LIMIT", 8))
     delay_min = _int("AUTO_APPLY_DELAY_MIN_SEC", 20)
     delay_max = _int("AUTO_APPLY_DELAY_MAX_SEC", 40)
 
@@ -184,10 +190,28 @@ async def _apply_all(agent, candidates: list, daily_cap: int) -> dict:
             login_needed.add(source)
             continue
 
-        # Repeated needs_review usually means an unattended bot check: each one
-        # burns a full APPLY_HUMAN_TIMEOUT wait and fires an alert, so stop the
-        # cycle rather than pausing on every remaining job.
-        if st == "needs_review":
+        # Nothing was submitted. Two different reasons, and only one of them is
+        # evidence that continuing is pointless.
+        if st != "applied":
+            barren += 1
+            if barren >= barren_limit:
+                log.append({"result": "halted",
+                            "msg": f"{barren} postings in a row submitted nothing — "
+                                   f"stopping in case something is broken"})
+                logger.warning(f"AutoApply halted: {barren} consecutive non-submissions")
+                agent_state.log(f"halted: {barren} postings in a row submitted nothing")
+                break
+        else:
+            barren = 0
+
+        # An unattended bot check is the one worth stopping for: it burns a full
+        # APPLY_HUMAN_TIMEOUT per job and nobody is there to clear the next one
+        # either. A deterministic refusal is not that — the resume guard
+        # declining a modal with no upload field costs a second and tells us
+        # nothing about the rest of the batch. Counting those halted two whole
+        # cycles over two harmless refusals, never reaching the 25 fresh
+        # candidates queued behind them.
+        if st == "needs_review" and result.get("unattended"):
             stuck += 1
             if stuck >= stuck_limit:
                 log.append({"result": "halted",

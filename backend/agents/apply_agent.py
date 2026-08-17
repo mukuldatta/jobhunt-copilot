@@ -1771,6 +1771,7 @@ class ApplyAgent:
             last_sig = sig
             if not await self._guard_captcha(page, "linkedin"):
                 return {"status": "needs_review", "url": page.url,
+                        "unattended": True,
                         "message": "CAPTCHA not cleared during LinkedIn apply."}
 
             # Footer buttons carry only text, so match by accessible name — scoped
@@ -2030,7 +2031,8 @@ class ApplyAgent:
         await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
         await asyncio.sleep(2)
         if not await self._guard_captcha(page, "naukri"):
-            return {"status": "needs_review", "url": page.url, "message": "CAPTCHA not cleared on Naukri."}
+            return {"status": "needs_review", "url": page.url, "unattended": True,
+                    "message": "CAPTCHA not cleared on Naukri."}
 
         # Shared constant, not a second copy: the LinkedIn selector was
         # duplicated exactly like this and the two halves drifted apart, so
@@ -2117,7 +2119,8 @@ class ApplyAgent:
         await apply_btn.click()
         await asyncio.sleep(3)
         if not await self._guard_captcha(page, "indeed"):
-            return {"status": "needs_review", "url": page.url, "message": "CAPTCHA not cleared on Indeed."}
+            return {"status": "needs_review", "url": page.url, "unattended": True,
+                    "message": "CAPTCHA not cleared on Indeed."}
 
         if pdf_path:
             upload = await page.query_selector('input[type="file"][accept*="pdf"], input[type="file"]')
@@ -2169,7 +2172,8 @@ class ApplyAgent:
         await apply_btn.click()
         await asyncio.sleep(3)
         if not await self._guard_captcha(page, "dice"):
-            return {"status": "needs_review", "url": page.url, "message": "CAPTCHA not cleared on Dice."}
+            return {"status": "needs_review", "url": page.url, "unattended": True,
+                    "message": "CAPTCHA not cleared on Dice."}
 
         if pdf_path:
             upload = await page.query_selector('input[type="file"]')

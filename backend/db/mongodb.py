@@ -338,7 +338,14 @@ async def get_apply_candidates(min_score: int = 70, region: str = "india", limit
         # 0 = known good, 1 = unknown, 2 = probably a hand-off
         tier = 0 if confirmed == "in_platform" else (2 if hint == "external" else
                                                      0 if hint == "in_platform" else 1)
-        return (tier, -(job.get("match_score") or 0))
+        # A posting that has already been tried goes behind one that has not,
+        # whatever it scores. Three high-scoring jobs that could not succeed —
+        # one deferred on a question, two refused by the resume guard — kept
+        # returning to the queue, sorted straight back to the top on score, and
+        # occupied two entire cycles while 25 untried candidates waited behind
+        # them. The retry still happens; it just stops being first in line.
+        attempts = job.get("apply_attempts") or 0
+        return (tier, attempts, -(job.get("match_score") or 0))
 
     rows.sort(key=rank)
     return rows[:limit]
