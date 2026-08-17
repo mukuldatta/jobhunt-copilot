@@ -14,7 +14,9 @@ from utils.resume_validator import validate_tailored_resume, clean_resume_text
 from services.alert_service import send_manual_action_alert, send_question_email
 from services import agent_state
 from llm_provider import RateLimited, is_rate_limited, cooldown_remaining
-from platforms import apply_supported, disabled_reason, NAUKRI_SCRAPE_PROFILE
+from platforms import (
+    apply_supported, disabled_reason, company_excluded, NAUKRI_SCRAPE_PROFILE,
+)
 from db.mongodb import (
     get_application_by_job_id, claim_job_for_apply, finish_job_apply, record_application,
     update_job, bump_apply_attempt, mark_question_emailed,
@@ -308,6 +310,14 @@ class ApplyAgent:
                     "message": f"LLM quota exhausted — deferring this job for "
                                f"{cooldown_remaining():.0f}s rather than applying "
                                f"with an untailored resume."}
+
+        # Checked here as well as in the candidate query, because a single-job
+        # apply from Review or the API never goes through that query.
+        if company_excluded(job.get("company", "")):
+            self._say(f"    skipped: {job.get('company')} is on your do-not-apply list")
+            return {"status": "manual_required", "url": job.get("url", ""),
+                    "message": (f"{job.get('company')} is excluded from automated "
+                                f"applications. Apply by hand if you want this one.")}
 
         if not apply_supported(source):
             # Known board, deliberately not submitted to. Hand it back before

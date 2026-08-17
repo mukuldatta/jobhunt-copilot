@@ -294,6 +294,13 @@ async def get_apply_candidates(min_score: int = 70, region: str = "india", limit
         ]}]
     if exclude_sources:
         query["source"] = {"$nin": list(exclude_sources)}
+
+    # Employers you have excluded. Filtered here rather than only at apply time
+    # so they never take a slot in a capped batch either.
+    from platforms import excluded_company_pattern
+    blocked = excluded_company_pattern()
+    if blocked:
+        query["company"] = {"$not": {"$regex": blocked, "$options": "i"}}
     if region == "india":
         query["$or"] = [
             {"region": "india"},

@@ -1,5 +1,5 @@
 """
-Which boards the agent will submit applications to.
+Which boards — and which employers — the agent will submit applications to.
 
 Kept separate from ApplyAgent so the orchestrator can consult it without
 importing Playwright — a dry-run preview should never pay for a browser stack.
@@ -8,6 +8,48 @@ Scraping is unaffected by anything here. A board on this list is still scraped,
 scored, ranked and shown in Review; it just never gets an automated submission,
 and its jobs come back to you to finish by hand.
 """
+
+import os
+import re
+
+# Employers the agent never applies to on your behalf, whatever the score.
+#
+# Not a quality judgement the code is entitled to make — it is yours, and the
+# only place it can be honoured is before an application is spent. Scraping,
+# scoring and Review are untouched: an excluded employer's postings still show
+# up to read, they simply never get an automated submission.
+#
+# Override the whole list with APPLY_EXCLUDE_COMPANIES (comma-separated).
+EXCLUDED_COMPANIES = [
+    c.strip() for c in os.environ.get(
+        "APPLY_EXCLUDE_COMPANIES", "Tata Consultancy Services, TCS").split(",")
+    if c.strip()
+]
+
+
+def excluded_company_pattern() -> str:
+    """
+    A regex matching any excluded employer, for the candidate query.
+
+    Short names are anchored to word boundaries — "TCS" must not match
+    "TCSion" or a company whose name merely contains those letters, while
+    "Tata Consultancy Services" is distinctive enough to match as a substring
+    and so survives the board writing it as "Tata Consultancy Services Ltd".
+    """
+    parts = []
+    for name in EXCLUDED_COMPANIES:
+        esc = re.escape(name)
+        parts.append(rf"\b{esc}\b" if len(name) <= 5 else esc)
+    return "|".join(parts)
+
+
+def company_excluded(company: str) -> bool:
+    """Is this employer on the do-not-apply list?"""
+    pattern = excluded_company_pattern()
+    if not pattern or not company:
+        return False
+    return re.search(pattern, str(company), re.I) is not None
+
 
 # Indeed serves a bot challenge that cannot be cleared from an automated
 # session — it fingerprints the automation channel itself, so the CAPTCHA is a
