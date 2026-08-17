@@ -258,9 +258,27 @@ async def get_apply_candidates(min_score: int = 70, region: str = "india", limit
     # batch safe on its own. A score from a superseded scorer is not a weaker
     # signal, it is an untrusted one — and this queue spends irreversible
     # applications strictly in score order. Stale jobs re-enter once re-scored.
+    # Only postings we can actually submit to: LinkedIn Easy Apply and Naukri's
+    # own apply. A hand-off to the employer's careers site is not a weaker
+    # candidate, it is a different task — one for a human — and offering it here
+    # spends a browser launch and a slot in a capped batch to rediscover
+    # something already recorded. Two of a 20-job batch went that way.
+    #
+    # "Submittable" means either a run confirmed it, or the scrape saw the
+    # board's own marker. The hint has agreed with the confirmed answer on every
+    # job where both exist — 34 external, 20 in-platform, no disagreements — so
+    # it is trusted to exclude, not merely to reorder. A job with neither is not
+    # offered; services.classify_service settles those without applying.
     query = {"status": "new", "match_score": {"$gte": min_score},
              "scorer_version": SCORER_VERSION,
              "apply_type": {"$nin": ["external", "expired"]}}
+    # In $and, not $or: the region filter below assigns query["$or"] outright
+    # and would silently drop this one.
+    query["$and"] = query.get("$and", []) + [{"$or": [
+        {"apply_type": "in_platform"},
+        {"apply_type": None, "apply_type_hint": "in_platform"},
+        {"apply_type": {"$exists": False}, "apply_type_hint": "in_platform"},
+    ]}]
 
     # A role years beyond the candidate's experience is not a near miss to be
     # settled by score — it is somebody else's job, and an application spent on

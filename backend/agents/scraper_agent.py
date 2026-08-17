@@ -189,6 +189,20 @@ class ScraperAgent:
             try:
                 await page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
                 await asyncio.sleep(random.uniform(1.5, 2.5))
+
+                # Free while the posting is already open: whether Naukri takes
+                # the application itself or hands off to the employer's site.
+                # LinkedIn has had this since its guest API told us; Naukri had
+                # nothing, so every Naukri hand-off was rediscovered by a browser
+                # launch inside a capped apply batch.
+                try:
+                    offsite = await page.query_selector(
+                        '#company-site-button, button:has-text("Apply on company site"), '
+                        'a:has-text("Apply on company site")')
+                    job["apply_type_hint"] = "external" if offsite else "in_platform"
+                except Exception:
+                    pass
+
                 text = ""
                 for sel in self.NAUKRI_JD_SELECTORS:
                     el = await page.query_selector(sel)

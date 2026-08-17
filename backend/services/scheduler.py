@@ -42,6 +42,22 @@ async def setup_scheduler():
             await update_job(job["job_id"], {"alerted_at": datetime.utcnow()})
         logger.info(f"Scheduler: sent alerts for {len(high_match)} jobs")
 
+    async def classify_apply_types():
+        """
+        Settle whether unknown postings can be submitted to at all.
+
+        The apply queue only offers jobs known to take an in-platform
+        application, so an unclassified job is invisible to it. Doing this on
+        its own schedule keeps that from being a slow leak: newly scraped jobs
+        get the answer from the scrape, and anything the scrape could not tell
+        is settled here rather than inside a capped apply batch.
+        """
+        from services.classify_service import run_classification
+        summary = await run_classification(limit=40)
+        if summary.get("classified"):
+            logger.info(f"Scheduler: classified {summary['classified']} posting(s), "
+                        f"{summary.get('remaining', 0)} left")
+
     async def cleanup_old_jobs():
         deleted = await delete_old_jobs(days=7)
         logger.info(f"Scheduler: cleaned up {deleted} old jobs")
@@ -69,6 +85,9 @@ async def setup_scheduler():
     scheduler.add_job(score_new_jobs, IntervalTrigger(minutes=30), id="score_jobs", **common)
     scheduler.add_job(send_alerts, IntervalTrigger(minutes=30), id="send_alerts", **common)
     scheduler.add_job(cleanup_old_jobs, IntervalTrigger(hours=24), id="cleanup_jobs", **common)
+    # Offset from the scrape so the two are not driving headed Chrome at once.
+    scheduler.add_job(classify_apply_types, IntervalTrigger(minutes=45),
+                      id="classify_apply_types", **common)
 
     # Reading your replies to screening questions. Registered only when IMAP
     # credentials exist, so the default install polls nothing and the emailed
