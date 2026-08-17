@@ -734,7 +734,19 @@ class ApplyAgent:
                 "notes": "Reconciled: the board reported an existing application.",
             })
         else:  # error
-            await finish_job_apply(job_id, "apply_failed")
+            # An exception is not a verdict on the posting. A detached element,
+            # a navigation that lost a race, a browser that went away — none of
+            # them say anything about whether this job can be applied to, and
+            # filing them terminally removed three good postings from the queue
+            # for good. Same bounded retry as needs_review; after the budget it
+            # becomes yours to finish by hand rather than disappearing.
+            attempts = await bump_apply_attempt(job_id)
+            if attempts < self.max_apply_attempts:
+                await finish_job_apply(job_id, "new")
+                self._say(f"    error was retryable: attempt {attempts}/"
+                          f"{self.max_apply_attempts}, returned to the queue")
+            else:
+                await finish_job_apply(job_id, "manual_required")
 
     async def _do_apply(self, job: dict) -> dict:
         source = job["source"]
@@ -1620,7 +1632,14 @@ class ApplyAgent:
         if not easy_apply:
             return await self._no_apply_control(page, job, "linkedin")
 
-        await easy_apply.click()
+        # page.click re-resolves the selector and waits for actionability.
+        # ElementHandle.click holds a node LinkedIn's re-render can detach
+        # underneath it — "Element is not attached to the DOM" cost three
+        # postings at 91%, 81% and 76% before this was fixed on both boards.
+        try:
+            await page.click(self.APPLY_CONTROL["linkedin"], timeout=15000)
+        except Exception:
+            await easy_apply.click()
 
         # The dialog element appears within a few seconds of the click.
         try:
