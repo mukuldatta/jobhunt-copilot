@@ -70,7 +70,7 @@ _SYNONYMS = {
     "yrs": "years", "yr": "years", "year": "years",
     "exp": "experience", "experiance": "experience",
     "proficient": "proficiency", "fluent": "proficiency", "fluency": "proficiency",
-    "ctc": "ctc", "salary": "ctc", "compensation": "ctc", "package": "ctc",
+    "salary": "ctc", "compensation": "ctc", "package": "ctc",
 }
 
 _TOKEN_RE = re.compile(r"[a-z0-9+.#]+")

@@ -32,7 +32,6 @@ const APPLY_MODE = {
   linkedin: 'Easy Apply on LinkedIn — pauses if a CAPTCHA appears',
   naukri: 'Naukri application form — pauses if a CAPTCHA appears',
   indeed: 'Indeed application form — pauses if a CAPTCHA appears',
-  dice: 'Dice application form — pauses if a CAPTCHA appears',
 }
 
 function Section({ label, children }) {

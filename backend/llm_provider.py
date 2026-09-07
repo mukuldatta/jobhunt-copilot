@@ -22,8 +22,6 @@ GEMINI_MODELS = [m.strip() for m in os.getenv(
     "GEMINI_MODELS", "gemini-flash-latest,gemini-flash-lite-latest"
 ).split(",") if m.strip()]
 
-GEMINI_MODEL = GEMINI_MODELS[0]          # back-compat for existing imports
-
 ANTHROPIC_MODELS = ["claude-haiku-4-5-20251001"]
 
 # No client here set a timeout, so a provider that accepted the connection and

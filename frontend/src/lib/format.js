@@ -66,9 +66,6 @@ export function shortLocation(location) {
 
 export const titleCase = (s) => (s ? s.replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase()) : '')
 
-/** A job's own status is worth a chip only once it has left "new". */
-export const isApplied = (job) => job?.status === 'applied'
-
 /**
  * Score colour is one accent hue at two weights — no red/amber/green. 75%+ of
  * the available points reads as accent; below that it steps back to a dimmer

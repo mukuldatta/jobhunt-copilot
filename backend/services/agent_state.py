@@ -21,7 +21,7 @@ the backend is started detached, nobody is watching at all.
 
 import sys
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # "idle" | "running" | "paused" — paused means a run is up but blocked on a human.
 _state = {
@@ -105,11 +105,6 @@ def set_job(name: str):
 def start(phase: str = "applying"):
     _state.update(state="running", phase=phase, started_at=datetime.utcnow())
     log(f"—— {phase} run started ——")
-
-
-def set_phase(phase: str):
-    if _state["state"] == "running":
-        _state["phase"] = phase
 
 
 def finish():

@@ -66,10 +66,6 @@ EXTERNAL_MARKERS = {
         'a[data-testid="applyButtonLinkContainer"]',
         ':text("Apply on company site")',
     ),
-    "dice": (
-        ':text("Apply on company site")',
-        'a[data-cy="external-apply"]',
-    ),
 }
 
 # LinkedIn's Easy Apply modal was a native <dialog open>, and everything that
@@ -224,13 +220,6 @@ LOGIN = {
         "logged_in_sel": "[data-gnav-element-name='AccountMenu'], #gnav-main-AccountButton",
         "fail_url_tokens": ["account/login", "/auth", "signin"],
     },
-    "dice": {
-        "label": "Dice",
-        "home_url": "https://www.dice.com/dashboard/",
-        "login_url": "https://www.dice.com/dashboard/login",
-        "logged_in_sel": "[data-cy='nav-profile'], a[href*='dashboard']",
-        "fail_url_tokens": ["/login", "signin"],
-    },
 }
 
 # Sessions worth offering a Login button for. A board we will never submit to
@@ -372,8 +361,6 @@ class ApplyAgent:
         "linkedin": ('a[aria-label*="Easy Apply" i], button[aria-label*="Easy Apply" i], '
                      '.jobs-apply-button, .jobs-s-apply button'),
         "naukri": 'button#apply-button, a#apply-button, button.apply-button, button[title*="Apply"]',
-        "dice": ('apply-button-wc, button[data-cy="apply-button"], '
-                 'a[data-cy="apply-button"], button[id*="apply"]'),
     }
 
     async def _preflight(self, page, job: dict, source: str):
@@ -438,7 +425,6 @@ class ApplyAgent:
         "linkedin": ("application submitted", "you've applied", "you applied"),
         "naukri": ("you have already applied", "already applied", "application sent"),
         "indeed": ("application submitted", "you've applied"),
-        "dice": ("application submitted", "you have applied"),
     }
 
     # ── Naukri's post-Apply questionnaire drawer ─────────────────────────────
@@ -1035,7 +1021,7 @@ class ApplyAgent:
         # Auth-gated home pages (LinkedIn feed, Naukri homepage) redirect to login
         # when signed out, so *still being on one* without a fail-token in the URL
         # is proof of a live session even if the nav DOM hasn't rendered yet.
-        # Public home pages (Indeed/Dice) load for everyone, so there we require
+        # Public home pages (Indeed) load for everyone, so there we require
         # the selector.
         #
         # "Still being on one" is the part that was missing. The inference was
@@ -2173,54 +2159,3 @@ class ApplyAgent:
 
         return {"status": "needs_review", "url": page.url,
                 "message": "Clicked Apply on Indeed — may need additional steps."}
-
-    # ── Dice Apply ───────────────────────────────────────────────────────────
-
-    async def _apply_dice(self, page, job: dict, pdf_path: str = None, cover_letter: str = None) -> dict:
-        await page.goto(job["url"], wait_until="domcontentloaded", timeout=20000)
-        await asyncio.sleep(2)
-
-        apply_btn = await self._await_apply_control(
-            page,
-            'apply-button-wc, button[data-cy="apply-button"], '
-            'a[data-cy="apply-button"], button[id*="apply"]',
-        )
-        if not apply_btn:
-            return await self._no_apply_control(page, job, "dice")
-
-        await apply_btn.click()
-        await asyncio.sleep(3)
-        if not await self._guard_captcha(page, "dice"):
-            return {"status": "needs_review", "url": page.url, "unattended": True,
-                    "message": "CAPTCHA not cleared on Dice."}
-
-        if pdf_path:
-            upload = await page.query_selector('input[type="file"]')
-            if upload:
-                try:
-                    await upload.set_input_files(pdf_path)
-                    await asyncio.sleep(1)
-                except Exception:
-                    pass
-
-        if self.user_phone:
-            for sel in ['input[name*="phone"]', 'input[type="tel"]']:
-                el = await page.query_selector(sel)
-                if el and not await el.input_value():
-                    await el.fill(self.user_phone)
-                    break
-
-        await self._fill_cover_letter(page, cover_letter)
-
-        submit = await page.query_selector('button[data-cy="submit-application"], button[type="submit"]')
-        if submit:
-            if self.dry_run:
-                return await self._dry_stop(page, "dice", "Submit")
-            await submit.click()
-            confirmed = await self._verify_submission(page)
-            if confirmed:
-                return confirmed
-            return {"status": "applied", "message": "Application submitted via Dice Easy Apply."}
-
-        return {"status": "needs_review", "url": page.url,
-                "message": "Clicked Apply on Dice — may need additional steps."}

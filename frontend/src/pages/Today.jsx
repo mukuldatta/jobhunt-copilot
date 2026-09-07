@@ -25,7 +25,7 @@ import { useAgent } from '../hooks/useAgent'
 import { useReducedMotion, useReveal, stagger } from '../hooks/useMotion'
 import { clockTime, scoreFill, scoreText, shortLocation, weekday } from '../lib/format'
 
-const PLATFORM_LABELS = { naukri: 'Naukri', linkedin: 'LinkedIn', indeed: 'Indeed', dice: 'Dice' }
+const PLATFORM_LABELS = { naukri: 'Naukri', linkedin: 'LinkedIn', indeed: 'Indeed' }
 
 function StatCell({ label, value, accent }) {
   return (

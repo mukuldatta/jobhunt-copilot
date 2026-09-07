@@ -28,7 +28,7 @@ const TABS = [
   { slug: 'answers', label: 'Saved answers' },
 ]
 
-const PLATFORM_LABELS = { naukri: 'Naukri', linkedin: 'LinkedIn', indeed: 'Indeed', dice: 'Dice' }
+const PLATFORM_LABELS = { naukri: 'Naukri', linkedin: 'LinkedIn', indeed: 'Indeed' }
 
 let fieldSeq = 0
 

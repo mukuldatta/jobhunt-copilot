@@ -60,13 +60,13 @@ class TestPrivateHomePages:
 
 
 class TestPublicHomePages:
-    """Indeed and Dice load for everyone, so only the account marker counts."""
+    """Indeed's home page loads for everyone, so only the account marker counts."""
 
     def test_the_marker_is_required(self):
-        assert verdict("https://www.dice.com/dashboard/", "dice") is False
+        assert verdict("https://in.indeed.com/", "indeed") is False
 
     def test_the_marker_is_sufficient(self):
-        assert verdict("https://www.dice.com/dashboard/", "dice", has_marker=True) is True
+        assert verdict("https://in.indeed.com/", "indeed", has_marker=True) is True
 
 
 class TestSignInTargets:

@@ -51,7 +51,6 @@ export const errorMessage = (e, fallback = 'Something went wrong.') =>
   e?.userMessage || e?.response?.data?.detail || e?.message || fallback
 
 export const getJobs = (params) => api.get('/jobs', { params })
-export const getJob = (jobId) => api.get(`/jobs/${jobId}`)
 export const tailorResume = (jobId) => api.post(`/jobs/${jobId}/tailor`)
 export const generateCoverLetter = (jobId) => api.post(`/jobs/${jobId}/cover-letter`)
 export const generateOutreach = (jobId) => api.post(`/jobs/${jobId}/outreach`)
@@ -77,7 +76,6 @@ export const autoApply = (jobId) => api.post(`/jobs/${jobId}/auto-apply`)
 
 export const getStats = () => api.get('/stats')
 export const triggerScrape = (data) => api.post('/scrape/trigger', data)
-export const triggerScoring = () => api.post('/score/trigger')
 
 export const getProfile = () => api.get('/profile')
 export const saveProfile = (data) => api.put('/profile', data)

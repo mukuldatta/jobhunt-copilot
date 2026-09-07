@@ -548,15 +548,6 @@ async def record_application(job_id: str, doc: dict) -> str:
     return str(existing["_id"]) if existing else ""
 
 
-async def get_application(application_id: str) -> dict:
-    from bson import ObjectId
-    db = get_db()
-    app = await db.applications.find_one({"_id": ObjectId(application_id)})
-    if app:
-        app["id"] = str(app.pop("_id"))
-    return app
-
-
 async def update_application(application_id: str, updates: dict) -> bool:
     """
     True when the application exists, whether or not the write changed it.

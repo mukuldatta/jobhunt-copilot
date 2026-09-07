@@ -36,7 +36,6 @@ const SOURCE = [
   { label: 'LinkedIn', value: 'linkedin' },
   { label: 'Naukri', value: 'naukri' },
   { label: 'Indeed', value: 'indeed' },
-  { label: 'Dice', value: 'dice' },
 ]
 const REGION = [
   { label: 'All regions', value: '' },
