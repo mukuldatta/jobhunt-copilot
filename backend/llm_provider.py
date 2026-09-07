@@ -97,7 +97,11 @@ def _retry_after(err: Exception, default: float = 30.0) -> float:
 
 
 class LLMProvider:
-    def __init__(self, provider="groq"):
+    def __init__(self, provider: str = None):
+        # Resolved here, not at the call sites: five of them repeated this same
+        # getenv, so LLM_PROVIDER was five chances to disagree with itself and
+        # a sixth caller that forgot would have silently pinned Groq.
+        provider = provider or os.getenv("LLM_PROVIDER", "groq")
         self.client = None
         self.model = None
         self._switch(provider)

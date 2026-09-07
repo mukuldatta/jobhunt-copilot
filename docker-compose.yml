@@ -1,6 +1,11 @@
-# In practice only the `mongo` service is used: the scraper and the apply agent
-# both need a headed real Chrome on a residential Indian IP, so the backend runs
-# locally under uvicorn rather than in a container. See README.
+# Mongo only, deliberately.
+#
+# The scraper, the apply agent and classify_service all launch Chrome itself
+# (channel="chrome", headless=False) on a residential Indian IP, so the backend
+# runs locally under uvicorn and the frontend under vite. A backend and a
+# frontend service used to sit here; neither was ever built or started, and
+# .env points at localhost:27017 rather than mongo:27017 because of it.
+# See README, which only ever documents `docker compose up -d mongo`.
 
 services:
   mongo:
@@ -16,40 +21,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
-  backend:
-    build: .
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      # Inside compose the backend reaches Mongo by service name, overriding .env.
-      # NOTE: headed scraping/apply needs a display + Chrome, so in practice you
-      # run the backend locally (uvicorn) and only use the mongo service here.
-      - MONGODB_URI=mongodb://mongo:27017/jobhunt
-    volumes:
-      - ./resume:/app/resume:ro
-    depends_on:
-      mongo:
-        condition: service_healthy
-    restart: unless-stopped
-
-  frontend:
-    image: node:20-alpine
-    working_dir: /app
-    volumes:
-      - ./frontend:/app
-      # Anonymous volume masking the bind mount: the host's node_modules is
-      # Windows-built, and esbuild/rollup ship platform-specific binaries that
-      # fail under alpine/musl.
-      - /app/node_modules
-    ports:
-      - "3000:3000"
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
-    environment:
-      - VITE_API_URL=http://localhost:8000
-    restart: unless-stopped
 
 volumes:
   mongo-data:

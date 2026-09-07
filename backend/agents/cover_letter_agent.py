@@ -1,4 +1,3 @@
-import os
 import asyncio
 from llm_provider import LLMProvider
 from db.mongodb import get_resume
@@ -10,7 +9,7 @@ load_dotenv()
 
 class CoverLetterAgent:
     def __init__(self):
-        self.llm = LLMProvider(provider=os.getenv("LLM_PROVIDER", "groq"))
+        self.llm = LLMProvider()
 
     async def generate(self, job: dict) -> str:
         resume = await get_resume()

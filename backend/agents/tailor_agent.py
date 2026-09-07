@@ -1,4 +1,3 @@
-import os
 import asyncio
 from llm_provider import LLMProvider
 from db.mongodb import get_resume
@@ -11,7 +10,7 @@ load_dotenv()
 
 class TailorAgent:
     def __init__(self):
-        self.llm = LLMProvider(provider=os.getenv("LLM_PROVIDER", "groq"))
+        self.llm = LLMProvider()
 
     async def tailor(self, job: dict, avoid: list = None) -> str:
         """

@@ -26,7 +26,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks, Depends
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.background import BackgroundTask
@@ -167,26 +167,28 @@ async def list_jobs(
     return {"jobs": jobs, "count": len(jobs), "total": total}
 
 
-@app.get("/jobs/{job_id}")
-async def get_job_route(job_id: str):
+async def job_or_404(job_id: str) -> dict:
+    """The job named in the path, or a 404. Eight routes spelled this out
+    verbatim; FastAPI resolves it once, before any of them runs."""
     job = await get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
 
 
+@app.get("/jobs/{job_id}")
+async def get_job_route(job: dict = Depends(job_or_404)):
+    return job
+
+
 @app.post("/jobs/{job_id}/tailor")
-async def tailor_resume(job_id: str, force: bool = Query(False)):
+async def tailor_resume(force: bool = Query(False), job: dict = Depends(job_or_404)):
     """
     The tailored resume for this job — the same one the PDF download and the
     apply run use. Previously each of the three tailored independently, so the
     document you previewed was not the one that got submitted. Pass force=true
     to deliberately re-roll.
     """
-    job = await get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
     from services.resume_service import build_tailored_resume
     built = await build_tailored_resume(
         job, force=force,
@@ -205,10 +207,7 @@ async def tailor_resume(job_id: str, force: bool = Query(False)):
 
 
 @app.get("/jobs/{job_id}/tailor-pdf")
-async def download_tailored_pdf(job_id: str):
-    job = await get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+async def download_tailored_pdf(job: dict = Depends(job_or_404)):
     # Same artefact as the preview and the apply run — see /jobs/{id}/tailor.
     from services.resume_service import build_tailored_resume
     built = await build_tailored_resume(
@@ -242,11 +241,7 @@ async def download_tailored_pdf(job_id: str):
 
 
 @app.post("/jobs/{job_id}/auto-apply")
-async def auto_apply(job_id: str, background_tasks: BackgroundTasks):
-    job = await get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
+async def auto_apply(background_tasks: BackgroundTasks, job: dict = Depends(job_or_404)):
     async def _run_apply():
         # ApplyAgent.apply() now owns dedup, job-status transitions, and
         # recording the application — so we just kick it off and log.
@@ -264,46 +259,35 @@ async def auto_apply(job_id: str, background_tasks: BackgroundTasks):
 
 
 @app.post("/jobs/{job_id}/cover-letter")
-async def generate_cover_letter(job_id: str):
-    job = await get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+async def generate_cover_letter(job: dict = Depends(job_or_404)):
     agent = CoverLetterAgent()
     letter = await agent.generate(job)
     return {"cover_letter": letter}
 
 
 @app.post("/jobs/{job_id}/outreach")
-async def generate_outreach(job_id: str):
-    job = await get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+async def generate_outreach(job: dict = Depends(job_or_404)):
     agent = OutreachAgent()
     message = await agent.generate(job)
     return {"outreach_message": message}
 
 
 @app.patch("/jobs/{job_id}/status")
-async def set_job_status(job_id: str, body: JobStatusUpdate):
+async def set_job_status(body: JobStatusUpdate, job: dict = Depends(job_or_404)):
     """Move a job through new / reviewed / skipped without applying to it."""
-    job = await get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    await update_job(job_id, {"status": body.status})
+    await update_job(job["job_id"], {"status": body.status})
     return {"message": f"Job marked {body.status}", "status": body.status}
 
 
 @app.post("/jobs/{job_id}/apply")
-async def mark_applied(job_id: str):
-    job = await get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+async def mark_applied(job: dict = Depends(job_or_404)):
     from datetime import datetime
-    await update_job(job_id, {"status": "applied"})
+    await update_job(job["job_id"], {"status": "applied"})
     # Idempotent upsert, like the auto-apply path: a plain insert meant a second
     # click on "mark applied" created a second application row, which then
     # double-counted in the pipeline and in /stats.
-    app_id = await record_application(job_id, {"status": "applied", "applied_at": datetime.utcnow()})
+    app_id = await record_application(job["job_id"],
+                                      {"status": "applied", "applied_at": datetime.utcnow()})
     return {"message": "Marked as applied", "application_id": app_id}
 
 

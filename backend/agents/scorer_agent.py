@@ -35,7 +35,7 @@ def _dedupe(gaps: list) -> list:
 
 class ScorerAgent:
     def __init__(self):
-        self.llm = LLMProvider(provider=os.getenv("LLM_PROVIDER", "groq"))
+        self.llm = LLMProvider()
         self._resume_cache = None
         self._years_cache = None
         self.last_retry_after = None   # seconds hinted by the provider, if any

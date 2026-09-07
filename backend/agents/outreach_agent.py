@@ -1,4 +1,3 @@
-import os
 from llm_provider import LLMProvider
 from db.mongodb import get_resume
 from dotenv import load_dotenv
@@ -8,7 +7,7 @@ load_dotenv()
 
 class OutreachAgent:
     def __init__(self):
-        self.llm = LLMProvider(provider=os.getenv("LLM_PROVIDER", "groq"))
+        self.llm = LLMProvider()
 
     async def generate(self, job: dict) -> str:
         resume = await get_resume()

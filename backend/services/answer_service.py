@@ -13,7 +13,6 @@ Resolution order (cheapest and most certain first):
 Never guesses: an unresolved question makes the apply flow pause for a human.
 """
 
-import os
 import re
 import json
 import hashlib
@@ -240,7 +239,7 @@ class AnswerResolver:
     @property
     def llm(self):
         if self._llm is None:
-            self._llm = LLMProvider(provider=os.getenv("LLM_PROVIDER", "groq"))
+            self._llm = LLMProvider()
         return self._llm
 
     # ── public ───────────────────────────────────────────────────────────────
