@@ -13,4 +13,8 @@ echo Installing dependencies...
 echo.
 echo Starting backend on http://localhost:8000 ...
 cd backend
-%PYTHON% -m uvicorn main:app --reload --port 8000
+REM No --reload: on Windows uvicorn drops to SelectorEventLoop whenever it
+REM needs a subprocess (reload/workers), and that loop cannot spawn one --
+REM so Playwright's browser launch raises NotImplementedError and the
+REM Sign in / Check buttons do nothing. Restart by hand after code edits.
+%PYTHON% -m uvicorn main:app --port 8000

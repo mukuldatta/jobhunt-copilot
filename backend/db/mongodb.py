@@ -580,8 +580,16 @@ async def update_application(application_id: str, updates: dict) -> bool:
 # --- Resume ---
 
 async def save_resume(resume: dict):
+    from datetime import datetime, timezone
     db = get_db()
-    await db.resume.replace_one({}, resume, upsert=True)
+    # Stamped here rather than by the caller, because this is the single write
+    # and a caller that forgets costs more than a missing field: it is what
+    # `resume_service._resume_version` keys the tailored-resume cache on, and
+    # without it that key falls back to len(parsed_text). Two resumes of the
+    # same length would then share a key, and every tailored resume already
+    # stored would be served against the new document without re-tailoring.
+    await db.resume.replace_one(
+        {}, {**resume, "uploaded_at": datetime.now(timezone.utc)}, upsert=True)
 
 
 async def get_resume() -> dict:

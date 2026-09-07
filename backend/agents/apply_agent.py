@@ -842,7 +842,7 @@ class ApplyAgent:
             company = re.sub(r"[^A-Za-z0-9]+", "_", job.get("company", "")).strip("_")
             name = f"{safe}_{company}.pdf" if company else f"{safe}.pdf"
             path = os.path.join(tempfile.mkdtemp(prefix="jobhunt_"), name)
-            generate_resume_pdf(final_text, path)
+            generate_resume_pdf(final_text, path, built["links"])
             return path, final_text
         except Exception as e:
             self._say(f"ApplyAgent: PDF generation failed: {e}")

@@ -229,7 +229,7 @@ async def download_tailored_pdf(job_id: str):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.close()
     # fpdf2 is synchronous CPU work — same reasoning as the upload route.
-    await asyncio.to_thread(generate_resume_pdf, tailored_text, tmp.name)
+    await asyncio.to_thread(generate_resume_pdf, tailored_text, tmp.name, built["links"])
     # The company name reaches a Content-Disposition header, so keep it to
     # characters that cannot break out of the filename.
     safe_company = re.sub(r"[^A-Za-z0-9]+", "_", job.get("company") or "job").strip("_")
